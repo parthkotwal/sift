@@ -1,0 +1,43 @@
+[project]
+name = "sift"
+version = "0.0.0"
+description = "Two-stage retrieval and ranking service over the Yelp Open Dataset."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.34",
+]
+
+[dependency-groups]
+# Dev tooling. Runtime ML deps (lightgbm, implicit, faiss/hnswlib, redis, ...)
+# are added at the build step that first needs them — every dep pays rent.
+dev = [
+    "ruff>=0.9",
+    "mypy>=1.14",
+    "pytest>=8.3",
+    "httpx>=0.28",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/sift"]
+
+[tool.ruff]
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+# Sensible, non-noisy default set; expand deliberately, not reflexively.
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+files = ["src", "tests"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

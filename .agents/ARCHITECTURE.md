@@ -1,0 +1,116 @@
+# ARCHITECTURE.md — what Sift is and how it's built
+
+## One line
+
+A two-stage retrieval and ranking service over the Yelp Open Dataset: given a user id, return ten businesses they'll like, chosen from every business in the metro, in under 100ms p99.
+
+## Why it's a system and not a model
+
+Scoring 150K businesses with a good model takes seconds. The work is therefore split into stages with different jobs, different models, and different metrics — a funnel that spends compute where it matters. That staged architecture is the mechanism; everything else (the feature store, the offline path, the eval harness) exists to serve it.
+
+**The tells that the framing is right:**
+
+- Every stage is inspectable — a candidate list you can eyeball, a feature row you can print, a latency histogram per stage. Any component that can't be explained out loud doesn't belong in the build.
+- Models pay rent. Nothing lands without beating the thing it replaces on the frozen eval. The retrieval model, the ranker — each is swappable behind its interface, and the dumb baseline it displaced remains runnable.
+
+What it is *not*: a model-experimentation project (no tuning sprints, no ablations), a batch-platform project (that framing was superseded — see `DECISIONS.md` D10), or a product (UI stays trivial).
+
+## Serving path (the funnel)
+
+```
+request: user_id, location
+    │
+    ▼
+ RETRIEVAL    150K → ~500    ANN search over embeddings,          metric: recall@500
+    │                        unioned with cheap heuristics
+    │                        (popular nearby, category match)
+    ▼
+ RANKING      500 → 50       LightGBM over rich user×item         metric: NDCG@10
+    │                        features from the online store
+    ▼
+ RERANK       50 → 10        hard filters (open now, already      metric: eyeballable
+    │                        reviewed) + diversity
+    ▼
+response: 10 businesses      end-to-end p99 < 100ms
+```
+
+**Retrieval** narrows the full catalog to ~500 candidates: approximate-nearest-neighbor search (FAISS or hnswlib) over item embeddings against the user's embedding, unioned with heuristic sources — popular-nearby and category-match-on-history. The union matters: each source's *marginal* contribution is measured (what fraction of eventual hits came only from that source), so no source rides for free.
+
+**Ranking** scores those ~500 with a gradient-boosted model over features the retrieval stage can't afford: distance, category affinity, review velocity, rating trend, price match, plus which retrieval source produced the candidate. Cuts to 50.
+
+**Rerank** applies hard filters — `is_open` *now* (a serving-time filter, deliberately never a training feature — see the skew section), already-reviewed — and a simple diversity pass to reach the final 10.
+
+**Latency budget** (initial allocation, to be revised against measurement): retrieval ≤ 30ms, online feature lookup ≤ 20ms, ranker inference ≤ 30ms, rerank + overhead ≤ 20ms. Instrumented per stage from day one; an end-to-end number with no breakdown is a footgun (`AGENTS.md`).
+
+## Offline path
+
+A batch job (plain scheduled scripts — no orchestrator, a deliberate cut, `DECISIONS.md` D10) that:
+
+1. Builds training examples from the review log with **point-in-time-correct** features (positives from real events, negatives sampled — see below).
+2. Trains the retrieval embedding model and the LightGBM ranker on a temporal split (train before date T, evaluate after) that is **frozen in build step 1 and never touched again**.
+3. Exports item embeddings and rebuilds the ANN index.
+4. Materializes features to both stores (historical → Parquet, current → Redis).
+
+Raw-data hygiene from the earlier framing survives underneath: raw JSON lands immutably as date-partitioned Parquet, and one canonical event table (`user_id, entity_id, event_type, ts, payload` — `DECISIONS.md` D2) feeds all feature computation. Offline jobs are partition-wise and idempotent (re-run = identical output).
+
+## The feature store
+
+One feature **definition**, materialized two ways:
+
+- **Historical:** values as-of every needed past timestamp → Parquet, for training.
+- **Online:** current values → Redis, keyed by entity id, for serving.
+
+Hand-built (definitions module, materialization job, lookup client), not Feast — ownership is the point (`DECISIONS.md` D9). The problem it exists to solve is **training/serving skew**: the failure mode where the offline and online computations of "the same" feature silently disagree, and model quality degrades with no error surfaced. One definition, two materializations, is the cure — plus a recurring check that compares Redis values against Parquet as-of-now for sampled entities and alerts on mismatch.
+
+**Definitions are the seam.** A definition declares name, entity type, dtype/shape, as-of semantics, version, and a compute function. A windowed count is a definition whose compute is an aggregation; **an embedding is a definition whose compute is a versioned model artifact** (`item_embedding_behavioral_v1`). The stores serve bytes and don't care. This is the extension seam: a new embedding — a stronger behavioral model, or a content/semantic vector produced elsewhere — registers as another definition (`item_embedding_semantic_v1`) alongside the first, consumed by the index or ranker via config, no refactor (`DECISIONS.md` D12). Consumers reference definitions by name+version only; nothing computes features inline.
+
+## The spine: point-in-time correctness (and its sibling, skew)
+
+Every feature attached to a training row is computed only from events **strictly before** the row's timestamp. The canonical failure: attach a business's average rating to a 2019 training row, computed over all of history — it contains the very review being predicted. Nothing crashes; offline metrics inflate; the model is garbage.
+
+Enforcement is structural — four chokepoints, not discipline:
+
+1. **Sandboxed compute.** A definition's compute function never touches raw tables; the framework hands it a pre-filtered view of events `< cutoff`. A definition physically cannot see the future.
+2. **One read path.** Training assembly obtains features only via `store.get_asof(entity, name, ts)` (right-exclusive); a test asserts training modules import no raw readers. The as-of join exists in exactly one place.
+3. **Future-invariance property test.** Compute features as-of `t` on synthetic events; mutate only events after `t`; recompute — every value must be identical. **The leak test:** CI registers a deliberately leaking definition (full-history aggregate) and asserts this test fails it. It is never weakened to make a build pass.
+4. **Snapshot blocklist.** No feature may source from the dump-time snapshot columns (`business.stars`, `review_count`, user lifetime stats, vote counts — full list in `DATA.md`); asserted by a schema test. And `is_open` is a rerank filter, never a model feature — the cleanest example of a signal that's legitimate online and unconstructible historically (`DECISIONS.md` D13).
+
+## Ranker features (v1 plan)
+
+As-of `t`, right-exclusive windows. Hazard taxonomy lives in `DATA.md`.
+
+- **User:** reviews in 30/90d and to-date; days since last review; mean stars given to-date; category-affinity shares; price-tier mix; activity centroid.
+- **Item:** reviews in 7/30/90d; review velocity (30d vs prior 30d); mean stars received to-date; rating trend (30d − lifetime, both to-date); check-ins and tips 90d; catalog age; category; price tier.
+- **User×item:** centroid-to-business distance; affinity·category dot; price match; reviewed-before; retrieval source.
+
+## Retrieval training and eval
+
+- **Step one is ALS, not a neural net** (`DECISIONS.md` D11): ALS factors are a two-tower without the towers — user/item vectors whose dot product predicts interaction — so the whole serving path (index, union, eval) gets built on a model the author fully owns. The learned two-tower is an *upgrade* that must beat ALS at recall@500 to land; if it doesn't, ALS ships and the system is unchanged.
+- **Two-tower, when attempted:** small MLPs per side over store-served features, dim ~64, in-batch negatives with sampled-softmax loss. Known flaw to correct or accept knowingly: in-batch negatives oversample popular items (fix: logQ correction, or mix in uniform random negatives). No hard-negative mining — that's model experimentation.
+- **Retrieval is evaluated against the full catalog** (did the ~500 contain the user's actual future interaction?), never with sampled negatives — retrieval's job is the catalog, and eval choice flips conclusions (a lesson learned the hard way). Report popularity vs. ALS vs. two-tower, plus per-source marginal contribution and index latency.
+
+## Build order — backwards, one stage at a time
+
+Each step ends with something that runs end to end; nothing lands without beating the thing before it.
+
+1. **Dumb path:** FastAPI endpoint; retrieval = most-reviewed businesses in the city; no ML, no store. The temporal split (train < T, eval ≥ T) is defined here and frozen forever.
+2. **Eval harness:** recall@k and NDCG@10 against the holdout + per-stage latency measurement. Every later change is judged against this.
+3. **Ranking stage:** hand-computed features + LightGBM, reading features straight from Parquet at request time — deliberately wrong, to isolate whether ranking helps before adding storage.
+4. **Feature store:** pull features behind definitions; materialize to Parquet and Redis; swap the service to Redis reads; land the leak test and the future-invariance test.
+5. **Retrieval stage:** 5a — ALS embeddings → ANN index, replace popularity retrieval, measure recall@500. 5b — two-tower, lands only if it beats 5a.
+6. **Rerank:** filters + diversity.
+7. **Scale:** all metros; Spark for training-example generation **if and only if** candidate-pair volume warrants it (measured, not assumed).
+
+## Stack
+
+Python · PyTorch (two-tower, step 5b only) · LightGBM · `implicit` ALS · FAISS or hnswlib · Redis (online features) · Postgres (metadata) · FastAPI · Parquet + DuckDB (offline, inspection) · Docker Compose. Deliberately small — every tool must be explainable out loud.
+
+## Scope
+
+**In:** staged retrieval/ranking, hand-built feature store with point-in-time correctness and a leakage test, staged offline eval, per-stage latency instrumentation, reproducible local deploy (`docker compose up`).
+
+**Out:** UI beyond trivial, model experimentation/ablations, A/B infrastructure, streaming features, orchestrators, the social/people-matching layer.
+
+## Extensibility: the embedding seam
+
+Sift is standalone. Its one deliberate extension point is the feature-definition registry (D12): because embeddings are just definitions, any externally-produced vector — a stronger behavioral model, or a content/semantic embedding — registers as `item_embedding_semantic_v1` alongside the behavioral one and plugs into the same index/ranker sockets by config, no refactor. Nothing is built for that today; the seam simply costs nothing to keep open.

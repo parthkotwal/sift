@@ -1,0 +1,15 @@
+# Yelp Open Dataset — license prohibits redistribution. Never commit data.
+data/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Notebooks / scratch
+.ipynb_checkpoints/
+scratch/
+
+# OS / editor
+.DS_Store
