@@ -4,7 +4,9 @@ Mandatory reading before writing any ingestion or transform code. Facts below we
 
 ## What it is
 
-Yelp's public research dump: a compressed TAR (~4.35 GB, ~8.65 GB uncompressed) of **5 JSON-lines files** plus a PDF of the terms. Official figures: **150,346 businesses**, **6,990,280 reviews**, **11 metropolitan areas**. Tip/check-in/user record counts are not stated officially — **VERIFY ON LOAD**. (A separate photos ZIP exists; Sift doesn't use it.)
+Yelp's public research dump: a compressed TAR (~4.35 GB, ~8.65 GB uncompressed) of **5 JSON-lines files** plus a PDF of the terms. Official figures: **150,346 businesses**, **6,990,280 reviews**, **11 metropolitan areas**. Tip/check-in/user record counts are not stated officially and Yelp's ToS restricts publishing dataset-derived metrics — the exact loaded counts, date ranges, and per-metro/per-year distributions are recorded in the gitignored `data/PROFILE.md`, not here. (A separate photos ZIP exists; Sift doesn't use it.)
+
+**Loaded dump:** the **January 2022** release (files dated 2022-01-19; bundled ToS is the Feb 2022 version). Business/review counts match the official figures above. Details in `data/PROFILE.md`.
 
 Download from [yelp.com/dataset](https://www.yelp.com/dataset) (redirects to business.yelp.com/data/resources/open-dataset): agree to the terms, download the TAR. A Kaggle mirror exists but may lag the official release — prefer the official download.
 
@@ -86,10 +88,12 @@ data/                    # gitignored
   bronze/ silver/ gold/  # pipeline-managed Parquet (paths configurable)
 ```
 
-## First-load checklist (do this once, record results here)
+## First-load checklist (done 2026-07-22 — results in gitignored `data/PROFILE.md`)
 
-- [ ] Verify record counts per file; record them above.
-- [ ] Record actual min/max event dates (reviews, tips, check-ins separately).
-- [ ] Tabulate events per day and per metro → picks the initial metro for build step 1 and the frozen split date T.
-- [ ] Confirm `checkin.json` shape and exploded row count.
-- [ ] Note dump version/date downloaded and the 12-month license clock.
+- [x] Verify record counts per file — all five confirmed; business/review match official figures.
+- [x] Record actual min/max event dates (reviews, tips, check-ins separately).
+- [x] Tabulate events per metro and per year → **metro = Philadelphia, PA**, **frozen split T = 2019-01-01** (`DECISIONS.md` D17).
+- [x] Confirm `checkin.json` shape and exploded row count — 131,930 rows → ~13.4M exploded events (~101/row).
+- [x] Note dump version/date and the 12-month license clock — January 2022 dump; license clock runs from download.
+
+Profiler: `scratch/profile_raw.py` (read-only, pure stdlib, streaming; rerun on any new dump).
