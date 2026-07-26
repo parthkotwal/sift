@@ -14,6 +14,7 @@ from sift.config import sql_path
 from sift.offline.dim_business import build_dim_business
 from sift.offline.ingest import build_events
 from sift.offline.training_set import build_training_set, sample_negatives
+from sift.store.materialize import materialize_historical
 
 # ---------- sample_negatives (pure) ----------
 
@@ -76,9 +77,15 @@ def _write_ndjson(path: Path, rows: list[dict[str, object]]) -> None:
     path.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
 
 
-def _synthetic_events(tmp_path: Path) -> tuple[Path, Path]:
-    """Build the events table and the business dimension from one synthetic dump.
-    Returns (events_dir, dim_file)."""
+def _synthetic_events(tmp_path: Path) -> tuple[Path, Path, Path]:
+    """Build the events table, the business dimension, and the materialised store
+    from one synthetic dump. Returns (events_dir, dim_file, store_dir).
+
+    The store is built here rather than left to default because
+    `build_training_set` would otherwise fall back to the real Philadelphia
+    artifact: synthetic ids would miss every join, the ui_* features would be
+    silently NULL, and these tests would pass for the wrong reason (ISSUES.md I1,
+    which this is the second instance of)."""
     business = tmp_path / "business.json"
     review = tmp_path / "review.json"
     events = tmp_path / "events"
@@ -113,14 +120,17 @@ def _synthetic_events(tmp_path: Path) -> tuple[Path, Path]:
         business_json=business, out_file=dim,
         metro_city="Philadelphia", metro_state="PA",
     )
-    return events, dim
+    store = tmp_path / "historical"
+    materialize_historical(events_dir=events, dim_file=dim, out_dir=store)
+    return events, dim, store
 
 
 def test_assembly_has_one_positive_per_group_and_valid_negatives(tmp_path: Path) -> None:
-    events, dim = _synthetic_events(tmp_path)
+    events, dim, store = _synthetic_events(tmp_path)
     out = tmp_path / "training_set.parquet"
     n = build_training_set(
-        events_dir=events, dim_file=dim, split_t=T, pool_size=6, k=2, seed=1, out_file=out,
+        events_dir=events, dim_file=dim, store_dir=store, split_t=T,
+        pool_size=6, k=2, seed=1, out_file=out,
     )
     con = duckdb.connect()
     glob = sql_path(out)
@@ -149,10 +159,11 @@ def test_positives_are_restricted_to_the_candidate_pool(tmp_path: Path) -> None:
     """D20: the ranker only reorders retrieval's output, so every training positive
     must be a business retrieval can actually return. Pre-T counts are b0=2, b1=2,
     b2=1, b3=1, so pool_size=3 admits {b0, b1, b2} and drops u2's review of b3."""
-    events, dim = _synthetic_events(tmp_path)
+    events, dim, store = _synthetic_events(tmp_path)
     out = tmp_path / "training_set.parquet"
     build_training_set(
-        events_dir=events, dim_file=dim, split_t=T, pool_size=3, k=2, seed=1, out_file=out,
+        events_dir=events, dim_file=dim, store_dir=store, split_t=T,
+        pool_size=3, k=2, seed=1, out_file=out,
     )
     con = duckdb.connect()
     glob = sql_path(out)
@@ -173,10 +184,11 @@ def test_row_order_within_a_group_does_not_encode_the_label(tmp_path: Path) -> N
     rank 1 for free, inflating validation NDCG for the *least*-trained model and
     making early stopping choose a stump. Order within a group must therefore be
     label-independent (and still deterministic, for idempotency)."""
-    events, dim = _synthetic_events(tmp_path)
+    events, dim, store = _synthetic_events(tmp_path)
     out = tmp_path / "training_set.parquet"
     build_training_set(
-        events_dir=events, dim_file=dim, split_t=T, pool_size=6, k=2, seed=1, out_file=out,
+        events_dir=events, dim_file=dim, store_dir=store, split_t=T,
+        pool_size=6, k=2, seed=1, out_file=out,
     )
     con = duckdb.connect()
     con.execute("SET threads TO 1")  # single-threaded scan preserves file order
@@ -198,9 +210,9 @@ def test_row_order_within_a_group_does_not_encode_the_label(tmp_path: Path) -> N
 
 
 def test_assembly_is_idempotent(tmp_path: Path) -> None:
-    events, dim = _synthetic_events(tmp_path)
+    events, dim, store = _synthetic_events(tmp_path)
     out = tmp_path / "training_set.parquet"
-    kw = dict(events_dir=events, dim_file=dim, split_t=T, pool_size=6, k=2, seed=1,
+    kw = dict(events_dir=events, dim_file=dim, store_dir=store, split_t=T, pool_size=6, k=2, seed=1,
               out_file=out)
     first = build_training_set(**kw)  # type: ignore[arg-type]
     first_bytes = out.read_bytes()

@@ -17,10 +17,9 @@ import pytest
 
 from sift.config import sql_path
 from sift.features import definitions as defs
-from sift.features.pit import compute as pit_compute
 from sift.offline.dim_business import build_dim_business
 from sift.offline.ingest import build_events
-from sift.store.materialize import materialize_historical
+from sift.store.materialize import materialize_historical, materialize_into
 from sift.store.read import asof_feature_query, attach_store, get_asof, read_features
 
 _BUSINESSES: list[dict[str, Any]] = [
@@ -54,8 +53,9 @@ _QUERIES: list[tuple[int, str, str, str]] = [
 ]
 
 
-@pytest.fixture
-def con(tmp_path: Path) -> duckdb.DuckDBPyConnection:
+def _write_dump(tmp_path: Path) -> tuple[Path, Path]:
+    """Synthetic dump -> (events_dir, dim_file)."""
+    tmp_path.mkdir(parents=True, exist_ok=True)
     business = tmp_path / "business.json"
     review = tmp_path / "review.json"
     business.write_text("\n".join(json.dumps(r) for r in _BUSINESSES) + "\n")
@@ -67,47 +67,74 @@ def con(tmp_path: Path) -> duckdb.DuckDBPyConnection:
         ) + "\n"
     )
     events, dim = tmp_path / "events", tmp_path / "dim_business.parquet"
-    historical = tmp_path / "historical"
     build_events(business_json=business, review_json=review, out_dir=events,
                  metro_city="Philadelphia", metro_state="PA")
     build_dim_business(business_json=business, out_file=dim,
                        metro_city="Philadelphia", metro_state="PA")
-    materialize_historical(events_dir=events, dim_file=dim, out_dir=historical)
+    return events, dim
 
-    connection = duckdb.connect()
-    # Raw sources for the inline path...
+
+def _attach_raw(connection: duckdb.DuckDBPyConnection, events: Path, dim: Path) -> None:
     glob = sql_path(events / "**" / "*.parquet")
     connection.execute(
         f"CREATE VIEW events AS SELECT * FROM read_parquet({glob}, hive_partitioning=true)"
     )
-    # ...and the materialised store for the read path. Both in one connection so the
-    # two can be compared row for row.
-    attach_store(connection, historical_dir=historical, dim_file=dim)
+    connection.execute(
+        f"CREATE VIEW dim_business AS SELECT * FROM read_parquet({sql_path(dim)})"
+    )
+
+
+def _add_queries(connection: duckdb.DuckDBPyConnection) -> None:
     connection.execute(
         "CREATE TABLE queries(query_id BIGINT, user_id VARCHAR, "
         "business_id VARCHAR, ts TIMESTAMP)"
     )
     connection.executemany("INSERT INTO queries VALUES (?, ?, ?, ?)", _QUERIES)
+
+
+@pytest.fixture
+def con(tmp_path: Path) -> duckdb.DuckDBPyConnection:
+    events, dim = _write_dump(tmp_path)
+    historical = tmp_path / "historical"
+    materialize_historical(events_dir=events, dim_file=dim, out_dir=historical)
+
+    connection = duckdb.connect()
+    attach_store(connection, historical_dir=historical, dim_file=dim)
+    _add_queries(connection)
     return connection
 
 
-def test_store_read_equals_inline_computation(con: duckdb.DuckDBPyConnection) -> None:
-    """The headline property. Exact equality, not approximate: both paths divide the
-    same integer state with the same arithmetic, so any difference is a real defect,
-    not floating-point noise."""
-    inline = pit_compute(con)
-    stored = read_features(con)
-    assert stored == inline
+def test_both_materialisation_routes_read_identically(
+    con: duckdb.DuckDBPyConnection, tmp_path: Path
+) -> None:
+    """`materialize_historical` writes Parquet with COPY; `materialize_into` builds
+    tables in a connection. They share `state_query`, but they are two sinks, and a
+    divergence between them would be a store that answers differently depending on
+    how it was built. Exact equality, not approximate — same integer state, same
+    arithmetic, so any difference is a defect rather than float noise."""
+    events, dim = _write_dump(tmp_path / "second")
+    other = duckdb.connect()
+    _attach_raw(other, events, dim)
+    materialize_into(other)
+    _add_queries(other)
+    assert read_features(other) == read_features(con)
 
 
-def test_equality_holds_feature_by_feature(con: duckdb.DuckDBPyConnection) -> None:
+def test_equality_holds_feature_by_feature(
+    con: duckdb.DuckDBPyConnection, tmp_path: Path
+) -> None:
     """Same property, reported per feature — a whole-row assertion says 'something
     differs', this says which."""
-    inline = {row[0]: row[1:] for row in pit_compute(con)}
+    events, dim = _write_dump(tmp_path / "second")
+    other = duckdb.connect()
+    _attach_raw(other, events, dim)
+    materialize_into(other)
+    _add_queries(other)
+    parquet = {row[0]: row[1:] for row in read_features(con)}
     for index, name in enumerate(defs.feature_names()):
-        stored = {row[0]: row[1] for row in read_features(con, [name])}
-        expected = {qid: values[index] for qid, values in inline.items()}
-        assert stored == expected, f"{name} differs between the store and inline paths"
+        in_memory = {row[0]: row[1] for row in read_features(other, [name])}
+        expected = {qid: values[index] for qid, values in parquet.items()}
+        assert in_memory == expected, f"{name} differs between materialisation routes"
 
 
 def test_boundary_is_right_exclusive_through_the_store(

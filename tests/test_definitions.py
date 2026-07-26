@@ -13,14 +13,15 @@ import duckdb
 import pytest
 
 from sift.features import definitions as defs
-from sift.features.pit import FEATURE_COLUMNS
 
 
-def test_registry_matches_the_ranker_feature_order() -> None:
-    """The ranker builds its matrix positionally. If the registry and the current
-    inline feature list disagree on names or order, the model is fed a permuted
-    matrix and nothing raises."""
-    assert defs.feature_names() == FEATURE_COLUMNS
+def test_registry_is_ordered_and_unique() -> None:
+    """The ranker builds its matrix positionally from this order, so duplicates or a
+    name/key mismatch would feed the model a permuted or truncated matrix silently.
+    (Read-side order is asserted against the registry in test_spine.py.)"""
+    names = defs.feature_names()
+    assert len(names) == len(set(names))
+    assert all(defs.get(n).name == n for n in names)
 
 
 def test_every_definition_states_a_leakage_argument() -> None:

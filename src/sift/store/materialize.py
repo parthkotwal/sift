@@ -1,7 +1,7 @@
 """Historical materialisation: persist the entity state groups to Parquet (D23).
 
 This is the offline half of "one definition, two materialisations". It runs the
-state SQL from `sift.features.state` — the same text `sift.features.pit` inlines —
+state SQL from `sift.features.state` — the same text `sift.store.read` reads back —
 and writes one Parquet file per group. The online half (current values → Redis)
 comes next and reads the last row per entity from these same tables.
 
@@ -16,7 +16,7 @@ query at any future "now" without rebuilding.
 That means the artifact contains post-T state rows, and those rows encode holdout
 events. They are unreachable through the read path — a query as-of T selects only
 rows strictly before T — but the safety property lives in the ASOF join, so it is
-the join that is tested (`test_pit_features.py`, `test_store_read.py`), not this job.
+the join that is tested (`test_spine.py`, `test_store_read.py`), not this job.
 
 ## Idempotency
 
@@ -44,6 +44,8 @@ from sift.config import DATA_DIR, sql_path
 from sift.features.state import GEO_SCALE, TIMELINE_GROUPS, state_query
 from sift.offline.dim_business import DIM_BUSINESS
 from sift.offline.ingest import EVENTS_DIR
+
+DIM_RELATION = "dim_business"
 
 STORE_DIR = DATA_DIR / "store"
 HISTORICAL_DIR = STORE_DIR / "historical"
@@ -95,6 +97,26 @@ def materialize_historical(
     finally:
         con.close()
     return counts
+
+
+def materialize_into(
+    con: duckdb.DuckDBPyConnection,
+    *,
+    events: str = "events",
+    dim: str = DIM_RELATION,
+) -> None:
+    """Materialise the state groups as tables inside an existing connection.
+
+    The in-memory sibling of `materialize_historical`: same `state_query` text, same
+    resulting tables, no Parquet round trip. Exists so tests can materialise from
+    synthetic relations and then read through the real read path — the alternative
+    would be property tests that exercise a path production never takes.
+    """
+    for group in TIMELINE_GROUPS:
+        con.execute(
+            f"CREATE OR REPLACE TABLE {group}_state AS "
+            f"{state_query(group, events, dim)}"
+        )
 
 
 def main() -> None:

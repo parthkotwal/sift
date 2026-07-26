@@ -7,7 +7,7 @@ whose positive is unretrievable trains it on a question it is never asked, and �
 D20 documents — lets it separate the classes by pool membership instead of by taste.
 Negatives: NEG_RATIO presumed-negatives per positive (label 0), sampled from the same
 pool, never a business the user actually reviewed. Features: point-in-time, as-of each
-row's ts, from `sift.features.pit` — the definition the invariance/leak tests guard.
+row's ts, read from the feature store — the path the invariance/leak tests guard.
 
 Each positive and its negatives share a `group_id`: the ranker learns to order
 the real pick above its sampled alternatives within that group (LightGBM's query
@@ -33,9 +33,11 @@ from pathlib import Path
 import duckdb
 
 from sift.config import DERIVED_DIR, SPLIT_T, sql_path
-from sift.features.pit import FEATURE_COLUMNS, feature_query
+from sift.features.definitions import feature_names
 from sift.offline.dim_business import DIM_BUSINESS
 from sift.offline.ingest import EVENTS_DIR
+from sift.store.materialize import HISTORICAL_DIR
+from sift.store.read import asof_feature_query, attach_store
 
 NEG_RATIO = 4  # negatives per positive (D19); un-tuned, standard starting point
 POOL_SIZE = 500  # negatives drawn from the top-500, matching retrieval's output
@@ -80,6 +82,7 @@ def build_training_set(
     *,
     events_dir: Path = EVENTS_DIR,
     dim_file: Path = DIM_BUSINESS,
+    store_dir: Path = HISTORICAL_DIR,
     split_t: date = SPLIT_T,
     pool_size: int = POOL_SIZE,
     k: int = NEG_RATIO,
@@ -94,9 +97,8 @@ def build_training_set(
         con.execute(
             f"CREATE VIEW events AS SELECT * FROM read_parquet({glob}, hive_partitioning=true)"
         )
-        con.execute(
-            f"CREATE VIEW dim_business AS SELECT * FROM read_parquet({sql_path(dim_file)})"
-        )
+        # Features come from the store, never recomputed here (chokepoint 2).
+        attach_store(con, historical_dir=store_dir, dim_file=dim_file)
         # The candidate pool, built first because it now scopes the positives too:
         # this is the set retrieval serves, so it defines the ranker's whole world.
         con.execute(
@@ -174,10 +176,10 @@ def build_training_set(
             """
         )
 
-        feat = feature_query(events="events", queries="candidates", dim="dim_business")
-        # Projected from FEATURE_COLUMNS rather than spelled out, so a feature added
+        feat = asof_feature_query(queries="candidates")
+        # Projected from the registry rather than spelled out, so a feature added
         # to the definition cannot silently fail to reach the training artifact.
-        feat_cols = ", ".join(f"f.{name}" for name in FEATURE_COLUMNS)
+        feat_cols = ", ".join(f"f.{name}" for name in feature_names())
         out_file.parent.mkdir(parents=True, exist_ok=True)
         out_file.unlink(missing_ok=True)
         con.execute(
@@ -220,7 +222,7 @@ def main() -> None:
         print(f"training rows: {n:,}  (positives {pos:,}, negatives {neg:,})")
         print(f"groups: {groups:,}   avg rows/group: {n / groups:.2f}")
         print("\nfeature coverage (non-null fraction):")
-        for col in FEATURE_COLUMNS:
+        for col in feature_names():
             row = con.execute(
                 f"SELECT avg(CASE WHEN {col} IS NOT NULL THEN 1 ELSE 0 END) "
                 f"FROM read_parquet({glob})"

@@ -2,8 +2,9 @@
 
 Serving path for the dumb+ranker funnel: popularity retrieves the top-500, then
 the LightGBM ranker reorders those 500 by predicted score. Features are computed
-point-in-time as of T (serving "now" = the split point), through the same
-`sift.features.pit` definition used in training — one definition, no skew.
+point-in-time as of T (serving "now" = the split point) by reading the feature
+store — the same definitions and the same as-of read path training used, so the
+two cannot disagree.
 
 Because the ranker only reorders retrieval's 500, recall@500 is identical to
 popularity's (a sanity check); what can move is the ordering — recall@{10,50,100}
@@ -23,7 +24,7 @@ So the cross product goes through the *same* SQL, in user batches to bound memor
 one definition, one code path, ~13M rows instead of 26.5k. Batching slices the
 input, never the definition. Offline eval has no latency budget; the online path
 will read materialized values from the store (build step 4) rather than either of
-these routes.
+these routes; this module already reads it, just from Parquet rather than Redis.
 
 Run: python -m sift.ranking.rank
 """
@@ -36,14 +37,14 @@ import duckdb
 import lightgbm as lgb
 import numpy as np
 
-from sift.config import SPLIT_T, sql_path
+from sift.config import SPLIT_T
 from sift.eval.holdout import load_ground_truth
 from sift.eval.run import Recommender, evaluate, popularity_recommender
-from sift.features.pit import FEATURE_COLUMNS, feature_query
+from sift.features.definitions import feature_names
 from sift.offline.dim_business import DIM_BUSINESS
-from sift.offline.ingest import EVENTS_DIR
 from sift.offline.popularity import load_ranking
 from sift.ranking.train import RANKER_MODEL, to_float
+from sift.store.read import asof_feature_query, attach_store
 
 SERVING_POOL = 500  # retrieval returns the top-500; the ranker reorders them
 USER_BATCH = 2000  # 2000 x 500 = 1M feature rows per batch
@@ -63,19 +64,15 @@ def reranked_lists(
     progress: bool = False,
 ) -> dict[str, list[str]]:
     """Return user_id -> the pool reordered by ranker score (best first)."""
-    events = sql_path(EVENTS_DIR / "**" / "*.parquet")
     n_cand = len(pool)
-    feat_cols = ", ".join(f"f.{name}" for name in FEATURE_COLUMNS)
+    feat_cols = ", ".join(f"f.{name}" for name in feature_names())
     lists: dict[str, list[str]] = {}
 
     con = duckdb.connect()
     try:
-        con.execute(
-            f"CREATE VIEW events AS SELECT * FROM read_parquet({events}, hive_partitioning=true)"
-        )
-        con.execute(
-            f"CREATE VIEW dim_business AS SELECT * FROM read_parquet({sql_path(DIM_BUSINESS)})"
-        )
+        # The serving path touches the store and nothing else — no event log is
+        # opened here at all, which is chokepoint 2 made visible rather than argued.
+        attach_store(con, dim_file=DIM_BUSINESS)
         con.execute("CREATE TABLE pool_t(idx BIGINT, business_id VARCHAR)")
         con.executemany(
             "INSERT INTO pool_t VALUES (?, ?)", list(enumerate(pool))
@@ -94,7 +91,7 @@ def reranked_lists(
                 FROM ub u CROSS JOIN pool_t p
                 """
             )
-            feat = feature_query(events="events", queries="candidates", dim="dim_business")
+            feat = asof_feature_query(queries="candidates")
             data = con.execute(
                 f"""
                 SELECT {feat_cols}
@@ -102,7 +99,7 @@ def reranked_lists(
                 ORDER BY c.query_id
                 """
             ).fetchnumpy()
-            x = np.column_stack([to_float(data[name]) for name in FEATURE_COLUMNS])
+            x = np.column_stack([to_float(data[name]) for name in feature_names()])
             assert x.shape[0] == len(batch) * n_cand, "feature rows lost in the join"
             scores = np.asarray(model.predict(x), dtype=np.float64).reshape(
                 len(batch), n_cand

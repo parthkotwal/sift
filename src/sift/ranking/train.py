@@ -21,10 +21,10 @@ import numpy as np
 from numpy.typing import NDArray
 
 from sift.config import DERIVED_DIR, SPLIT_T, sql_path
-from sift.features.pit import FEATURE_COLUMNS
+from sift.features.definitions import feature_names
 from sift.offline.training_set import TRAINING_SET
 
-FEATURES: list[str] = list(FEATURE_COLUMNS)
+FEATURES: list[str] = list(feature_names())
 VAL_START = date(2018, 1, 1)  # groups in [VAL_START, T) are validation
 RANKER_MODEL = DERIVED_DIR / "ranker.txt"
 

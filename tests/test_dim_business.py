@@ -119,11 +119,11 @@ def test_is_open_is_never_read_as_a_model_feature() -> None:
     """D13: `is_open` is legitimate as a rerank filter and leakage as a feature, so
     it is the one snapshot column presence cannot protect. Assert no feature module
     references it."""
-    from sift.features import pit
+    from sift.features import definitions as defs
 
-    source = Path(pit.__file__).read_text()
-    assert "is_open" not in source
-    assert "is_open" not in " ".join(pit.FEATURE_COLUMNS)
+    for name, definition in defs.REGISTRY.items():
+        assert "is_open" not in definition.expr, f"{name} sources is_open"
+        assert "is_open" not in name
 
 
 def test_build_is_idempotent(tmp_path: Path) -> None:

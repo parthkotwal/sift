@@ -28,7 +28,7 @@ join in the read path. Storing inclusive state and reading exclusively is what l
 one materialisation serve every possible query timestamp.
 
 These strings are the single source: both `sift.store.materialize` (which persists
-them) and `sift.features.pit` (which inlines them) format the same text.
+them) and `sift.store.read` (which joins them as-of) build on the same text.
 """
 
 from __future__ import annotations
