@@ -35,6 +35,8 @@ from __future__ import annotations
 
 import duckdb
 
+from sift.features.state import GEO_SCALE, state_query
+
 # Order matters: the ranker's feature matrix is built in exactly this order.
 FEATURE_COLUMNS: tuple[str, ...] = (
     "u_reviews_to_date",
@@ -64,58 +66,14 @@ WITH
 dim_cat AS (
     SELECT business_id, unnest(categories) AS category FROM {dim}
 ),
--- Reviews enriched with the business's static attributes. The enrichment is a
--- plain join on identity; the time filtering all happens in the ASOF joins below.
-ev AS (
-    SELECT e.user_id, e.business_id, e.ts, e.stars,
-           d.latitude, d.longitude, d.price_tier
-    FROM {events} e
-    LEFT JOIN {dim} d ON e.business_id = d.business_id
-    WHERE e.event_type = 'review'
-),
--- Deduplicate ties on (entity, ts) first, so cumulative sums are unambiguous
--- when an entity has multiple events at the same instant.
-user_per_ts AS (
-    SELECT user_id, ts, count(*) AS n, sum(stars) AS s,
-           sum(latitude) AS lat_s, sum(longitude) AS lng_s, count(latitude) AS geo_n,
-           sum(price_tier) AS price_s, count(price_tier) AS price_n
-    FROM ev GROUP BY user_id, ts
-),
-user_tl AS (
-    SELECT user_id, ts,
-        sum(n) OVER w AS cum_count,
-        sum(s) OVER w AS cum_sum,
-        sum(lat_s) OVER w AS cum_lat,
-        sum(lng_s) OVER w AS cum_lng,
-        sum(geo_n) OVER w AS cum_geo_n,
-        sum(price_s) OVER w AS cum_price,
-        sum(price_n) OVER w AS cum_price_n
-    FROM user_per_ts
-    WINDOW w AS (PARTITION BY user_id ORDER BY ts ROWS UNBOUNDED PRECEDING)
-),
-item_per_ts AS (
-    SELECT business_id, ts, count(*) AS n, sum(stars) AS s
-    FROM ev GROUP BY business_id, ts
-),
-item_tl AS (
-    SELECT business_id, ts,
-        sum(n) OVER w AS cum_count,
-        sum(s) OVER w AS cum_sum
-    FROM item_per_ts
-    WINDOW w AS (PARTITION BY business_id ORDER BY ts ROWS UNBOUNDED PRECEDING)
-),
--- One cumulative timeline per (user, category): the user's taste vector, as-of any t.
-user_cat_per_ts AS (
-    SELECT e.user_id, c.category, e.ts, count(*) AS n
-    FROM ev e JOIN dim_cat c ON e.business_id = c.business_id
-    GROUP BY 1, 2, 3
-),
-user_cat_tl AS (
-    SELECT user_id, category, ts,
-        sum(n) OVER (PARTITION BY user_id, category ORDER BY ts ROWS UNBOUNDED PRECEDING)
-            AS cum_count
-    FROM user_cat_per_ts
-),
+-- The three cumulative state groups, inlined from `sift.features.state` — the
+-- identical SQL text the store materialises to Parquet (D23). Inlining it here
+-- rather than keeping a second copy is what makes "one definition" structural:
+-- the recomputed path and the persisted path cannot drift, because there is only
+-- one string.
+user_tl AS ({user_state}),
+item_tl AS ({item_state}),
+user_cat_tl AS ({user_cat_state}),
 -- Explode each query by its business's categories, look each one up as-of t, and
 -- sum: the dot product of the user's share vector with the business's indicator.
 query_cat AS (
@@ -134,17 +92,12 @@ with_user AS (
         COALESCE(ut.cum_count, 0)                AS u_reviews_to_date,
         ut.cum_sum / ut.cum_count                AS u_mean_stars_to_date,
         date_diff('day', ut.ts, q.ts)            AS u_days_since_last,
-        -- Rounded to make the artifact byte-reproducible (ISSUES.md I18). These are
-        -- the only float SUMS in the feature set, and float addition is not
-        -- associative, so DuckDB's parallel aggregation reorders the additions and
-        -- the last mantissa bits move between runs. Every other feature sums
-        -- integers (counts, stars, price tiers) and is already bit-stable.
-        -- 6dp is ~0.11 m of latitude; the observed run-to-run noise is ~1e-15
-        -- degrees, nine orders of magnitude below the rounding quantum, so no value
-        -- lands near enough to a boundary to flip. Precision far finer than any
-        -- centroid deserves, and the whole quantity feeds a distance in km.
-        round(ut.cum_lat / NULLIF(ut.cum_geo_n, 0), 6) AS u_lat,
-        round(ut.cum_lng / NULLIF(ut.cum_geo_n, 0), 6) AS u_lng,
+        -- Fixed-point sums divided down (state.GEO_SCALE). Integer state means this
+        -- is one exact operation on exact inputs, so no rounding is needed to keep
+        -- it deterministic (ISSUES.md I18). Must stay textually equivalent to
+        -- definitions._U_LAT / _U_LNG — the store-read equivalence test enforces it.
+        ut.cum_lat_e7 / ({geo_scale}.0 * NULLIF(ut.cum_geo_n, 0)) AS u_lat,
+        ut.cum_lng_e7 / ({geo_scale}.0 * NULLIF(ut.cum_geo_n, 0)) AS u_lng,
         ut.cum_price / NULLIF(ut.cum_price_n, 0) AS u_price
     FROM {queries} q
     ASOF LEFT JOIN user_tl ut
@@ -173,7 +126,13 @@ def feature_query(
 ) -> str:
     """The point-in-time feature SQL over the named events/queries/dim relations."""
     return _SQL.format(
-        events=events, queries=queries, dim=dim, haversine=_HAVERSINE.strip()
+        queries=queries,
+        dim=dim,
+        haversine=_HAVERSINE.strip(),
+        geo_scale=GEO_SCALE,
+        user_state=state_query("user", events, dim),
+        item_state=state_query("item", events, dim),
+        user_cat_state=state_query("user_category", events, dim),
     )
 
 

@@ -97,6 +97,37 @@ the magnitudes are less forgiving.
 rather than row counts, so it would have caught this — and it also pins row order,
 which D22 made load-bearing.
 
+**Second manifestation, in the store's own artifacts (2026-07-26, open).** The same
+cause reappears one layer down, and materialising the state groups isolated it
+perfectly: across two runs on the real dump, `item_state.parquet` and
+`user_category_state.parquet` are **byte-identical** (their state is integer counts
+and star sums), while `user_state.parquet` is **not** — it is the only group carrying
+`cum_lat` / `cum_lng`. Derived feature values are unaffected, because the centroid is
+rounded to 6dp in the definition's expression before it reaches a feature.
+
+**Caveat on the test that "covers" this:** `test_materialization_is_idempotent`
+passes, but only because the synthetic fixture sums two or three values per user —
+too few for DuckDB to parallelise, so the reordering never occurs. It is green for
+the wrong reason. This is the I8 class again, found in a test I had just written: a
+fixture too small to exhibit the failure it is meant to catch.
+
+**Resolved (2026-07-26) by option (b): fixed-point.** `cum_lat_e7` / `cum_lng_e7` are
+now BIGINTs scaled by `state.GEO_SCALE` (1e7, ~1.1 cm). Integer addition is
+associative, so the sum is bit-exact whatever order the aggregation runs in — all
+three state groups are byte-identical across runs on the real dump, and the property
+is now *provable* from the encoding rather than observed and hoped for.
+
+**The rounding is gone, not moved.** With integer state the centroid is one exact
+division on exact inputs, so `round(..., 6)` is no longer needed anywhere — the
+earlier fix masked the drift, this one removes it. Every column in every state group
+is now an integer, which also dropped the user group from 34.0 MB to 29.4 MB (BIGINT
+rather than the HUGEINT DuckDB widens `sum()` to).
+
+**Lesson worth keeping:** the two defensible fixes were not equally good. Rounding
+was one line and probabilistically safe; changing the *encoding* so the failure
+cannot occur is the same size and categorically safe. Prefer removing a failure mode
+to sizing a tolerance against it.
+
 ### I1 — Synthetic training-set tests silently read the real `dim_business`   [fixed]
 
 `build_training_set` defaults `dim_file=DIM_BUSINESS`, so for a window the synthetic

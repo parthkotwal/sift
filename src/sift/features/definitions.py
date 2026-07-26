@@ -1,0 +1,185 @@
+"""The feature definition registry — the seam consumers bind to (D12, D23).
+
+A definition is *metadata plus an expression over materialised state*. The store
+persists entity-keyed state (the cumulative timelines in `sift.store.materialize`);
+a definition says how to project one feature out of it. That single shape covers
+both cases the v1 feature set contains:
+
+  u_reviews_to_date     one expression over one entity's state
+  ui_distance_km        one expression over two entities' state
+
+which is why `user x item` features are not an exception to "one definition, two
+materialisations" (D23). Their *inputs* are stored per entity; the combining
+expression is the definition, and the same expression text serves the offline
+as-of read and the online lookup. Nothing computes a feature anywhere else.
+
+## Expression aliases
+
+An expression is SQL over these relation aliases, which the read path guarantees:
+
+  q   the query row              (query_id, user_id, business_id, ts)
+  u   user state, as-of q.ts     right-exclusive ASOF join, NULL if no history
+  i   item state, as-of q.ts     right-exclusive ASOF join, NULL if no history
+  uc  user-category aggregate    the taste-vector dot product, as-of q.ts
+  b   business static attributes plain join on identity — no time axis (D21)
+
+`u` and `i` are NULL for an entity with no prior events, so every expression must
+survive NULL inputs: a cold-start user yields NULL features, which LightGBM
+consumes as native missing values rather than a fabricated zero.
+
+## The leakage field is not documentation
+
+AGENTS.md requires a one-line "why can't this value contain the future?" for every
+feature. Here it is a non-defaulted field, so a definition cannot be registered
+without one, and `test_definitions.py` asserts none are blank. A rule that lived in
+prose now fails the build.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+from sift.features.state import GEO_SCALE
+
+# Centroid of the businesses the user has reviewed so far. The state stores the
+# lat/long sums as fixed-point integers (see state.GEO_SCALE), so dividing them down
+# is a single exact operation on exact inputs — deterministic without any rounding.
+# The earlier float sums needed a 6dp round to hide their last-bit drift (I18); the
+# integer encoding removes the drift instead of masking it.
+_U_LAT = f"(u.cum_lat_e7 / ({GEO_SCALE}.0 * NULLIF(u.cum_geo_n, 0)))"
+_U_LNG = f"(u.cum_lng_e7 / ({GEO_SCALE}.0 * NULLIF(u.cum_geo_n, 0)))"
+_U_PRICE = "u.cum_price / NULLIF(u.cum_price_n, 0)"
+
+# Great-circle km from the user's centroid to the business.
+_HAVERSINE = f"""2 * 6371.0 * asin(sqrt(
+        pow(sin(radians(b.latitude - {_U_LAT}) / 2), 2)
+        + cos(radians({_U_LAT})) * cos(radians(b.latitude))
+          * pow(sin(radians(b.longitude - {_U_LNG}) / 2), 2)
+    ))"""
+
+
+@dataclass(frozen=True)
+class FeatureDefinition:
+    """One feature: what it is, where its inputs live, and why it can't see ahead."""
+
+    name: str
+    entity: str          # 'user' | 'item' | 'user x item' — what the value describes
+    dtype: str           # DuckDB type of the projected value
+    version: int         # bump when the expression's meaning changes, never in place
+    reads: tuple[str, ...]  # state groups consumed: user | item | user_category | business
+    expr: str            # SQL over the aliases documented above
+    leakage: str         # required: why this cannot contain the future
+
+
+_DEFINITIONS: tuple[FeatureDefinition, ...] = (
+    FeatureDefinition(
+        name="u_reviews_to_date",
+        entity="user",
+        dtype="BIGINT",
+        version=1,
+        reads=("user",),
+        expr="COALESCE(u.cum_count, 0)",
+        leakage="Cumulative count read as-of q.ts by a right-exclusive ASOF join, so "
+                "only the user's strictly-earlier events are summed.",
+    ),
+    FeatureDefinition(
+        name="u_mean_stars_to_date",
+        entity="user",
+        dtype="DOUBLE",
+        version=1,
+        reads=("user",),
+        expr="u.cum_sum / u.cum_count",
+        leakage="Both operands come from the same as-of state row, so the mean spans "
+                "exactly the events before q.ts and cannot include the label's stars.",
+    ),
+    FeatureDefinition(
+        name="u_days_since_last",
+        entity="user",
+        dtype="BIGINT",
+        version=1,
+        reads=("user",),
+        expr="date_diff('day', u.ts, q.ts)",
+        leakage="u.ts is the timestamp of the last event strictly before q.ts, so the "
+                "gap is measured backwards from the query and never spans forward.",
+    ),
+    FeatureDefinition(
+        name="i_reviews_to_date",
+        entity="item",
+        dtype="BIGINT",
+        version=1,
+        reads=("item",),
+        expr="COALESCE(i.cum_count, 0)",
+        leakage="Same right-exclusive as-of read on the item's timeline; the review "
+                "being predicted is at q.ts and is therefore excluded.",
+    ),
+    FeatureDefinition(
+        name="i_mean_stars_to_date",
+        entity="item",
+        dtype="DOUBLE",
+        version=1,
+        reads=("item",),
+        expr="i.cum_sum / i.cum_count",
+        leakage="As-of state row only. This is the canonical leak (ARCHITECTURE: a "
+                "business's average rating containing the very review predicted) and "
+                "the right-exclusive boundary is exactly what prevents it.",
+    ),
+    FeatureDefinition(
+        name="ui_distance_km",
+        entity="user x item",
+        dtype="DOUBLE",
+        version=1,
+        reads=("user", "business"),
+        expr=_HAVERSINE,
+        leakage="The centroid is an as-of aggregate over prior events; the business's "
+                "coordinates are fixed when it opens and cannot vary with the review "
+                "being predicted (D21).",
+    ),
+    FeatureDefinition(
+        name="ui_category_affinity",
+        entity="user x item",
+        dtype="DOUBLE",
+        version=1,
+        reads=("user", "user_category", "business"),
+        expr="uc.matched / NULLIF(COALESCE(u.cum_count, 0), 0)",
+        leakage="Numerator is a per-category as-of count over prior events; "
+                "denominator is the same as-of total. The business's category list is "
+                "set at listing time and is independent of any later review (D21).",
+    ),
+    FeatureDefinition(
+        name="ui_price_delta",
+        entity="user x item",
+        dtype="DOUBLE",
+        version=1,
+        reads=("user", "business"),
+        expr=f"abs(b.price_tier - {_U_PRICE})",
+        leakage="User's mean price tier is an as-of aggregate; the business's tier is a "
+                "quasi-static attribute (D21, the weakest of the three static claims — "
+                "a venue can change band over years).",
+    ),
+)
+
+# Insertion order is the ranker's feature-matrix order; do not reorder casually.
+REGISTRY: dict[str, FeatureDefinition] = {d.name: d for d in _DEFINITIONS}
+
+STATE_GROUPS: tuple[str, ...] = ("user", "item", "user_category", "business")
+
+
+def feature_names() -> tuple[str, ...]:
+    """Registered feature names, in matrix order."""
+    return tuple(REGISTRY)
+
+
+def get(name: str) -> FeatureDefinition:
+    """Look a definition up by name. Consumers bind by name, never by expression."""
+    try:
+        return REGISTRY[name]
+    except KeyError:
+        raise KeyError(
+            f"unknown feature {name!r}; registered: {', '.join(REGISTRY)}"
+        ) from None
+
+
+def required_groups(names: tuple[str, ...] | None = None) -> set[str]:
+    """The state groups needed to serve these features — what the read path must join."""
+    chosen = feature_names() if names is None else names
+    return {group for name in chosen for group in get(name).reads}
