@@ -36,6 +36,14 @@ A living study guide. Each entry: what the idea is, why Sift needs it, and the q
 
 **Own it:** *Why do uniform negatives make the model popularity-biased, and why do in-batch negatives have the opposite bias?*
 
+## Candidate-conditioned training (train on the serving distribution)
+
+**What:** A ranker in a funnel never sees the catalog — it sees whatever retrieval handed it. Its real job is the *conditional* question "given these k candidates, which does the user pick," so its training rows must be drawn from that same conditional. The classic failure is subtler than "different data": if positives and negatives come from different populations, the model can separate them by a property of the *sampling scheme* instead of by user preference, and that property may point the opposite way at serving time. The tell is a feature whose learned response is confident in a range the serving inputs never occupy.
+
+**Here:** D19 paired positives (any pre-T review) with negatives from the popularity top-500 — 39% vs 100% pool membership, so in 72.5% of groups the positive was the *less* popular item and the model learned popularity inverted. D20 restricts positives to the pool, making the training question identical to the serving question. Note the contrast with the negative *pool* being frozen as-of T (D19), which is fine: a sampling distribution is not a model input, so it cannot leak. Which side of that line a choice falls on is the thing to get right.
+
+**Own it:** *Your ranker scores below the baseline it reorders. Name two distinct causes — one in the sampled data, one in the feature set — and the measurement that separates them.*
+
 ## Point-in-time correctness / leakage
 
 **What:** Features attached to a training row must reflect only what was knowable before that row's timestamp. Violating this — leakage — lets the model peek at the future, often at the very label it predicts. Nothing errors; offline metrics inflate; production collapses.
@@ -75,6 +83,22 @@ A living study guide. Each entry: what the idea is, why Sift needs it, and the q
 **Here:** The split (train < T, eval ≥ T) is frozen in build step 1 and never touched — changing it invalidates the entire eval history. Retrieval is evaluated **against the full catalog**, never sampled negatives: eval choice flips conclusions (learned the hard way), and the catalog is retrieval's actual job.
 
 **Own it:** *Why is a random split a leak in disguise, and why does retrieval get recall@500 while ranking gets NDCG@10?*
+
+## Ties, and why row order is part of your metric
+
+**What:** Every ranking metric needs a total order, but models produce tied scores — massively so when under-trained, since a shallow tree ensemble maps many inputs to the same leaf. The evaluator must therefore break ties *somehow*, and the usual answer is "whatever order the rows arrived in." That makes physical data layout a silent input to your metric. If the layout correlates with the label, the metric is measuring your sort order.
+
+**Here:** The training artifact was written `ORDER BY group_id, label DESC, ...`, putting the positive first in every group. Ties resolved in its favour, so validation NDCG was *highest* for the least-trained model, and early stopping selected a single tree — three ranker evaluations were run on a stump before anyone looked (D22). The fix is a label-independent but still deterministic order. The same hazard has a serving-side twin: `argsort` on tied scores returns an arbitrary permutation, so a tied ranker can score below the baseline it reorders purely through tie-breaking.
+
+**Own it:** *Your validation metric peaks at iteration 1 and then falls, on the training set too. Why is "it's overfitting" the wrong answer, and what would you check first?*
+
+## Covariate shift (and why scale-free features resist it)
+
+**What:** The input distribution moves between training and serving even though the relationship being learned is stable. Distinct from concept drift (where the relationship itself changes) and from leakage (which is a correctness bug, not a distribution one). Trees are especially exposed: they cannot extrapolate past their highest split, so serving inputs beyond the training range collapse into one terminal bin.
+
+**Here:** Cumulative count features drift by construction — history only accumulates, so `i_reviews_to_date` runs p10/p50/p90 = 0/221/596 on pre-2018 training rows but 313/452/983 at serving. The `ui_*` features barely move (distance p50 1.855 → 1.967), because a ratio or a distance is scale-free in a way a running total is not. The general lever: define features as ranks, ratios, or distances rather than raw accumulating counts.
+
+**Own it:** *Which of Sift's features drift with calendar time and which don't — and what does that imply about preferring "rank within the candidate pool" over "review count"?*
 
 ## Latency percentiles and budgets
 

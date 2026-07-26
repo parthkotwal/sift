@@ -1,0 +1,185 @@
+"""The spine's property tests: exact correctness, right-exclusivity, future-
+invariance, and a leak test proving the invariance check has teeth.
+
+All synthetic (Yelp license). The event stream is small and hand-checkable.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Sequence
+
+import duckdb
+import pytest
+
+from sift.features.pit import FEATURE_COLUMNS, compute, feature_query
+
+# Base history, all strictly before the queries below.
+#   u1: reviews b1@Jan(5 stars), b2@Mar(3 stars)   -> 2 reviews, mean 4.0
+#   b1: reviewed by u1@Jan(5), by u9@Feb(4)         -> 2 reviews, mean 4.5
+_BASE_EVENTS: list[tuple[object, ...]] = [
+    ("u1", "b1", "review", "2018-01-01 00:00:00", 5),
+    ("u9", "b1", "review", "2018-02-01 00:00:00", 4),
+    ("u1", "b2", "review", "2018-03-01 00:00:00", 3),
+]
+# Events strictly AFTER the query instant — the "future" the features must ignore.
+# These are chosen to MOVE every feature if the boundary leaked; an invariance test
+# whose future cannot perturb the value under test passes vacuously. The b2 event is
+# there specifically for category affinity: b3 is a Coffee venue that shares no
+# category with the b1 queried below, so on its own it leaves affinity unchanged
+# whether the code leaks or not.
+_FUTURE_EVENTS: list[tuple[object, ...]] = [
+    ("u1", "b3", "review", "2019-01-01 00:00:00", 1),  # u1 reviews more, later
+    ("u5", "b1", "review", "2018-12-01 00:00:00", 2),  # b1 gets more reviews, later
+    ("u1", "b2", "review", "2018-11-01 00:00:00", 4),  # shares 'Restaurants' with b1
+]
+# b2 sits exactly 0.05 degrees of latitude north of b1 (~5.56 km); b3 is co-located
+# with b1. Round numbers so every expectation below can be checked by hand.
+_DIM: list[tuple[object, ...]] = [
+    ("b1", 39.95, -75.16, 2, ["Restaurants", "Pizza"]),
+    ("b2", 40.00, -75.16, 1, ["Restaurants", "Bars"]),
+    ("b3", 39.95, -75.16, 4, ["Coffee"]),
+]
+
+
+def _con(
+    events: Sequence[tuple[object, ...]],
+    queries: Sequence[tuple[object, ...]],
+    dim: Sequence[tuple[object, ...]] = tuple(_DIM),
+) -> duckdb.DuckDBPyConnection:
+    con = duckdb.connect()
+    con.execute(
+        "CREATE TABLE events(user_id VARCHAR, business_id VARCHAR, "
+        "event_type VARCHAR, ts TIMESTAMP, stars SMALLINT)"
+    )
+    con.executemany("INSERT INTO events VALUES (?, ?, ?, ?, ?)", events)
+    con.execute(
+        "CREATE TABLE queries(query_id INTEGER, user_id VARCHAR, "
+        "business_id VARCHAR, ts TIMESTAMP)"
+    )
+    con.executemany("INSERT INTO queries VALUES (?, ?, ?, ?)", queries)
+    con.execute(
+        "CREATE TABLE dim_business(business_id VARCHAR, latitude DOUBLE, "
+        "longitude DOUBLE, price_tier SMALLINT, categories VARCHAR[])"
+    )
+    con.executemany("INSERT INTO dim_business VALUES (?, ?, ?, ?, ?)", dim)
+    return con
+
+
+def test_features_match_hand_computed_values() -> None:
+    # q1: u1 x b1 as of 2018-06-01.
+    #   user: 2 reviews, mean 4.0, 92d since Mar-01;  item(b1): 2 reviews, mean 4.5
+    #   centroid = midpoint of b1,b2 = (39.975, -75.16) -> 0.025 deg from b1 ~ 2.78km
+    #   affinity: Restaurants seen 2x, Pizza 1x -> matched 3 / 2 reviews = 1.5
+    #   price:   user mean (2+1)/2 = 1.5; b1 = 2 -> delta 0.5
+    con = _con(_BASE_EVENTS, [(1, "u1", "b1", "2018-06-01 00:00:00")])
+    (row,) = compute(con)
+    assert row[:6] == (1, 2, 4.0, 92, 2, 4.5)
+    assert row[6] == pytest.approx(2.7799, abs=1e-3)  # ui_distance_km
+    assert row[7] == pytest.approx(1.5)               # ui_category_affinity
+    assert row[8] == pytest.approx(0.5)               # ui_price_delta
+
+
+def test_boundary_is_right_exclusive() -> None:
+    # q at exactly b2's timestamp: u1's Mar-01 review must NOT count yet.
+    #   -> user: 1 review (only Jan-01 @ b1), mean 5.0, 59d; item(b2): 0, NULL
+    #   centroid is b1 alone -> full 0.05 deg to b2 ~ 5.56km
+    #   affinity: Restaurants 1, Bars 0 -> 1 / 1 review = 1.0
+    #   price:   user mean = 2 (b1 only); b2 = 1 -> delta 1.0
+    con = _con(_BASE_EVENTS, [(1, "u1", "b2", "2018-03-01 00:00:00")])
+    (row,) = compute(con)
+    assert row[:6] == (1, 1, 5.0, 59, 0, None)
+    assert row[6] == pytest.approx(5.5598, abs=1e-3)
+    assert row[7] == pytest.approx(1.0)
+    assert row[8] == pytest.approx(1.0)
+
+
+def test_cold_start_query_yields_zero_and_nulls() -> None:
+    con = _con(_BASE_EVENTS, [(1, "u_new", "b1", "2018-06-01 00:00:00")])
+    (row,) = compute(con)
+    # No history -> no centroid, no taste vector, no price mix: every ui_* is NULL,
+    # which LightGBM consumes as a native missing value rather than a fake zero.
+    assert row == (1, 0, None, None, 2, 4.5, None, None, None)
+
+
+def test_business_absent_from_the_dimension_yields_null_not_a_crash() -> None:
+    con = _con(_BASE_EVENTS, [(1, "u1", "b_unknown", "2018-06-01 00:00:00")])
+    (row,) = compute(con)
+    assert row[6] is None and row[7] is None and row[8] is None
+
+
+def test_future_invariance() -> None:
+    """Mutating only post-query events must not change any feature value."""
+    query = [(1, "u1", "b1", "2018-06-01 00:00:00")]
+    before = compute(_con(_BASE_EVENTS, query))
+    after = compute(_con(_BASE_EVENTS + _FUTURE_EVENTS, query))
+    assert before == after
+
+
+def test_future_invariance_covers_the_user_x_item_features() -> None:
+    """The ui_* features must be invariant for the same reason the others are —
+    and the future events chosen here would move all three if the boundary leaked:
+    b3 is a Coffee venue at a different price tier, so it would shift the user's
+    centroid, taste vector, and price mean at once."""
+    query = [(1, "u1", "b1", "2018-06-01 00:00:00")]
+    (before,) = compute(_con(_BASE_EVENTS, query))
+    (after,) = compute(_con(_BASE_EVENTS + _FUTURE_EVENTS, query))
+    ui = slice(6, 9)
+    assert before[ui] == after[ui]
+    assert all(v is not None for v in before[ui])  # invariance is not vacuous here
+
+
+def test_leak_test_has_teeth() -> None:
+    """A deliberately leaking feature (all-history count, no < t bound) MUST be
+    caught by the same future-invariance comparison — else the test is vacuous.
+    """
+    query: list[tuple[object, ...]] = [(1, "u1", "b1", "2018-06-01 00:00:00")]
+    # No `< query_ts` bound: counts the user's entire history, future included.
+    leaky_sql = (
+        "SELECT q.query_id, "
+        "(SELECT count(*) FROM events e WHERE e.user_id = q.user_id) "
+        "AS u_reviews_all_history "
+        "FROM queries q ORDER BY q.query_id"
+    )
+
+    def run_leaky(events: Sequence[tuple[object, ...]]) -> list[tuple[object, ...]]:
+        return _con(events, query).execute(leaky_sql).fetchall()
+
+    before = run_leaky(_BASE_EVENTS)                  # u1 all-history = 2
+    after = run_leaky(_BASE_EVENTS + _FUTURE_EVENTS)  # u1 all-history = 3 (future leaked in)
+    assert before != after  # invariance check correctly flags the leak
+
+
+def test_leaky_category_affinity_is_caught() -> None:
+    """The same teeth check, aimed at the new machinery: an affinity computed over
+    the user's whole history (no as-of bound) must be flagged by invariance."""
+    query: list[tuple[object, ...]] = [(1, "u1", "b1", "2018-06-01 00:00:00")]
+    leaky_sql = """
+        SELECT q.query_id, count(*) AS affinity_all_history
+        FROM queries q
+        JOIN events e ON e.user_id = q.user_id
+        JOIN (SELECT business_id, unnest(categories) AS category FROM dim_business) c
+             ON c.business_id = e.business_id
+        JOIN (SELECT business_id, unnest(categories) AS category FROM dim_business) qc
+             ON qc.business_id = q.business_id AND qc.category = c.category
+        GROUP BY q.query_id ORDER BY q.query_id
+    """
+
+    def run_leaky(events: Sequence[tuple[object, ...]]) -> list[tuple[object, ...]]:
+        return _con(events, query).execute(leaky_sql).fetchall()
+
+    assert run_leaky(_BASE_EVENTS) != run_leaky(_BASE_EVENTS + _FUTURE_EVENTS)
+
+
+def test_feature_query_is_stable_sql() -> None:
+    # Guards against accidental relation-name interpolation drift.
+    assert "ASOF LEFT JOIN" in feature_query()
+    assert feature_query(events="ev", queries="qs").count("ev") >= 1
+    assert feature_query(dim="db").count("db") >= 1
+
+
+def test_select_list_matches_feature_columns() -> None:
+    """The ranker builds its matrix positionally from FEATURE_COLUMNS, so a column
+    added to the SQL but not the tuple (or vice versa) would silently misalign."""
+    con = _con(_BASE_EVENTS, [(1, "u1", "b1", "2018-06-01 00:00:00")])
+    names = [d[0] for d in con.execute(feature_query()).description]
+    assert names == ["query_id", *FEATURE_COLUMNS]

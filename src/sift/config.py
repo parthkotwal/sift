@@ -25,6 +25,11 @@ DATA_DIR = Path("data")
 RAW_DIR = DATA_DIR / "raw"
 DERIVED_DIR = DATA_DIR / "derived"  # small offline artifacts (rankings, indexes)
 
+def sql_path(path: Path) -> str:
+    """Single-quote a trusted path for inlining into DuckDB SQL (no user input)."""
+    return "'" + str(path).replace("'", "''") + "'"
+
+
 BUSINESS_JSON = RAW_DIR / "yelp_academic_dataset_business.json"
 REVIEW_JSON = RAW_DIR / "yelp_academic_dataset_review.json"
 TIP_JSON = RAW_DIR / "yelp_academic_dataset_tip.json"
