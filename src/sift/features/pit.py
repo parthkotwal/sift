@@ -134,8 +134,17 @@ with_user AS (
         COALESCE(ut.cum_count, 0)                AS u_reviews_to_date,
         ut.cum_sum / ut.cum_count                AS u_mean_stars_to_date,
         date_diff('day', ut.ts, q.ts)            AS u_days_since_last,
-        ut.cum_lat / NULLIF(ut.cum_geo_n, 0)     AS u_lat,
-        ut.cum_lng / NULLIF(ut.cum_geo_n, 0)     AS u_lng,
+        -- Rounded to make the artifact byte-reproducible (ISSUES.md I18). These are
+        -- the only float SUMS in the feature set, and float addition is not
+        -- associative, so DuckDB's parallel aggregation reorders the additions and
+        -- the last mantissa bits move between runs. Every other feature sums
+        -- integers (counts, stars, price tiers) and is already bit-stable.
+        -- 6dp is ~0.11 m of latitude; the observed run-to-run noise is ~1e-15
+        -- degrees, nine orders of magnitude below the rounding quantum, so no value
+        -- lands near enough to a boundary to flip. Precision far finer than any
+        -- centroid deserves, and the whole quantity feeds a distance in km.
+        round(ut.cum_lat / NULLIF(ut.cum_geo_n, 0), 6) AS u_lat,
+        round(ut.cum_lng / NULLIF(ut.cum_geo_n, 0), 6) AS u_lng,
         ut.cum_price / NULLIF(ut.cum_price_n, 0) AS u_price
     FROM {queries} q
     ASOF LEFT JOIN user_tl ut

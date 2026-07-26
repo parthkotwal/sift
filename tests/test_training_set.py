@@ -203,5 +203,11 @@ def test_assembly_is_idempotent(tmp_path: Path) -> None:
     kw = dict(events_dir=events, dim_file=dim, split_t=T, pool_size=6, k=2, seed=1,
               out_file=out)
     first = build_training_set(**kw)  # type: ignore[arg-type]
+    first_bytes = out.read_bytes()
     second = build_training_set(**kw)  # type: ignore[arg-type]
     assert first == second
+    # Bytes, not row counts. Comparing cardinality would pass while every feature
+    # value drifted; it is how the float-sum non-determinism of I18 went unnoticed
+    # through several rebuilds. Byte equality also pins the row ORDER, which D22
+    # made load-bearing.
+    assert out.read_bytes() == first_bytes

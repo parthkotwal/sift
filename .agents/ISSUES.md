@@ -26,33 +26,6 @@ the popularity baseline are currently meaningless.
 cached answer. Matters because "measure latency per stage" is a stated project rule
 and the <100ms p99 budget is a headline claim.
 
-### I15 — The training artifact is not byte-reproducible (float-sum association)   [open]
-
-Two consecutive runs of `training_set.py` on identical input produce different
-bytes. Content is *almost* identical: 130 rows of 1.49M differ, all of them only in
-`ui_distance_km`, max absolute difference **2.09e-12 km** — two picometres.
-
-**Cause, and it is exact:** `ui_distance_km` is the only feature derived from a
-**float** sum (`sum(latitude)`/`sum(longitude)` for the user's activity centroid).
-Floating-point addition is not associative, and DuckDB parallelises the aggregation,
-so thread scheduling changes the summation order and the last mantissa bits move.
-Every other feature sums integers — review counts, star ratings, price tiers — and
-is bit-stable. Verified: zero rows differ in any other float column.
-
-**Impact:** numerically nil. Retraining on a rebuilt artifact reproduced 579
-iterations, identical feature gains, and identical eval metrics to four decimal
-places. But `AGENTS.md` requires "re-running a job produces identical output", and
-this quietly does not.
-
-**Compounding test weakness:** `test_assembly_is_idempotent` compares only *row
-counts* between two builds, so it cannot catch this — or drift orders of magnitude
-larger. Compare content (or a fingerprint), not cardinality. Same family as I8: an
-assertion too weak to fail is an assertion that reports safety it hasn't checked.
-
-**Options:** (a) round the centroid to fixed precision before the haversine — one
-line, ~0.1mm at 9dp, restores byte-reproducibility; (b) accept and downgrade the
-docstring's claim to "logically deterministic". Not resolved — needs a decision.
-
 ### I4 — `libomp` is an uncaptured system dependency   [open]
 
 LightGBM needs `brew install libomp` on macOS. Not expressible in `pyproject`/
@@ -82,6 +55,47 @@ signal. Revisit once the ranker has real score resolution.
 ---
 
 ## Fixed — kept because the failure mode recurs
+
+### I18 — The training artifact was not byte-reproducible (float-sum association)   [fixed]
+
+Two consecutive runs of `training_set.py` on identical input produce different
+bytes. Content is *almost* identical: 130 rows of 1.49M differ, all of them only in
+`ui_distance_km`, max absolute difference **2.09e-12 km** — two picometres.
+
+**Cause, and it is exact:** `ui_distance_km` is the only feature derived from a
+**float** sum (`sum(latitude)`/`sum(longitude)` for the user's activity centroid).
+Floating-point addition is not associative, and DuckDB parallelises the aggregation,
+so thread scheduling changes the summation order and the last mantissa bits move.
+Every other feature sums integers — review counts, star ratings, price tiers — and
+is bit-stable. Verified: zero rows differ in any other float column.
+
+**Impact:** numerically nil. Retraining on a rebuilt artifact reproduced 579
+iterations, identical feature gains, and identical eval metrics to four decimal
+places. But `AGENTS.md` requires "re-running a job produces identical output", and
+this quietly does not.
+
+**Compounding test weakness:** `test_assembly_is_idempotent` compares only *row
+counts* between two builds, so it cannot catch this — or drift orders of magnitude
+larger. Compare content (or a fingerprint), not cardinality. Same family as I8: an
+assertion too weak to fail is an assertion that reports safety it hasn't checked.
+
+**Fixed** by rounding the centroid to 6 decimal degrees (~0.11 m) in `pit.py` before
+the haversine. Two consecutive rebuilds of the real artifact are now byte-identical.
+Retraining on the rounded artifact moved nothing that matters: recall@10 0.0224 →
+0.0223, NDCG@10 0.0173 → 0.0175, and the ranker still lands.
+
+**Honest limit of the fix:** rounding makes this *almost surely* deterministic, not
+provably so — a value sitting within the noise of a rounding boundary could still
+flip. 6dp was chosen so that argument is safe by a wide margin: the noise is ~1e-15
+degrees against a 1e-6 quantum, nine orders of magnitude of headroom. The *provable*
+alternative is to sum fixed-point integers (scaled lat/long as BIGINT) because
+integer addition is associative regardless of order; not taken, because the rounding
+is one line and reads plainly. Revisit only if a future feature sums floats where
+the magnitudes are less forgiving.
+
+**Test strengthened alongside:** `test_assembly_is_idempotent` now compares bytes
+rather than row counts, so it would have caught this — and it also pins row order,
+which D22 made load-bearing.
 
 ### I1 — Synthetic training-set tests silently read the real `dim_business`   [fixed]
 
