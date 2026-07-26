@@ -6,6 +6,7 @@ This file is the entry point for every agent (Claude, Codex, anything else) and 
 2. `DATA.md` — the dataset, its schemas, and its traps. Mandatory before writing any ingestion, feature, or transform code.
 3. `CONCEPTS.md` — the ideas behind the design. Skim so you know what's in it; link to it instead of re-explaining.
 4. `DECISIONS.md` — what's been decided and what's still open. Never re-litigate an accepted decision silently; never quietly resolve an open one.
+5. `ISSUES.md` — known defects, dataset traps, and deliberately deferred fixes. Check it before debugging anything: the bug may already be logged, and several entries are *classes* of failure this project keeps re-encountering. Add an entry when you find a real problem you aren't fixing on the spot — and when you do fix one, keep the entry if the failure mode could recur.
 
 ## The collaboration model (read this twice)
 
