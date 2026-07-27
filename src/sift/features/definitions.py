@@ -38,8 +38,16 @@ prose now fails the build.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 
+from sift.config import DERIVED_DIR
 from sift.features.state import GEO_SCALE
+
+BEHAVIORAL_EMBEDDING_DIM = 64
+USER_BEHAVIORAL_EMBEDDING = "user_embedding_behavioral_v1"
+ITEM_BEHAVIORAL_EMBEDDING = "item_embedding_behavioral_v1"
+USER_TWO_TOWER_EMBEDDING = "user_embedding_two_tower_v1"
+ITEM_TWO_TOWER_EMBEDDING = "item_embedding_two_tower_v1"
 
 # Centroid of the businesses the user has reviewed so far. The state stores the
 # lat/long sums as fixed-point integers (see state.GEO_SCALE), so dividing them down
@@ -63,12 +71,25 @@ class FeatureDefinition:
     """One feature: what it is, where its inputs live, and why it can't see ahead."""
 
     name: str
-    entity: str          # 'user' | 'item' | 'user x item' — what the value describes
-    dtype: str           # DuckDB type of the projected value
-    version: int         # bump when the expression's meaning changes, never in place
+    entity: str  # 'user' | 'item' | 'user x item' — what the value describes
+    dtype: str  # DuckDB type of the projected value
+    version: int  # bump when the expression's meaning changes, never in place
     reads: tuple[str, ...]  # state groups consumed: user | item | user_category | business
-    expr: str            # SQL over the aliases documented above
-    leakage: str         # required: why this cannot contain the future
+    expr: str  # SQL over the aliases documented above
+    leakage: str  # required: why this cannot contain the future
+
+
+@dataclass(frozen=True)
+class EmbeddingDefinition:
+    """A model-produced vector feature whose artifact is its compute function."""
+
+    name: str
+    entity: str
+    dtype: str
+    shape: tuple[int, ...]
+    version: int
+    artifact: Path
+    leakage: str
 
 
 _DEFINITIONS: tuple[FeatureDefinition, ...] = (
@@ -80,7 +101,7 @@ _DEFINITIONS: tuple[FeatureDefinition, ...] = (
         reads=("user",),
         expr="COALESCE(u.cum_count, 0)",
         leakage="Cumulative count read as-of q.ts by a right-exclusive ASOF join, so "
-                "only the user's strictly-earlier events are summed.",
+        "only the user's strictly-earlier events are summed.",
     ),
     FeatureDefinition(
         name="u_mean_stars_to_date",
@@ -90,7 +111,7 @@ _DEFINITIONS: tuple[FeatureDefinition, ...] = (
         reads=("user",),
         expr="u.cum_sum / u.cum_count",
         leakage="Both operands come from the same as-of state row, so the mean spans "
-                "exactly the events before q.ts and cannot include the label's stars.",
+        "exactly the events before q.ts and cannot include the label's stars.",
     ),
     FeatureDefinition(
         name="u_days_since_last",
@@ -100,7 +121,7 @@ _DEFINITIONS: tuple[FeatureDefinition, ...] = (
         reads=("user",),
         expr="date_diff('day', u.ts, q.ts)",
         leakage="u.ts is the timestamp of the last event strictly before q.ts, so the "
-                "gap is measured backwards from the query and never spans forward.",
+        "gap is measured backwards from the query and never spans forward.",
     ),
     FeatureDefinition(
         name="i_reviews_to_date",
@@ -110,7 +131,7 @@ _DEFINITIONS: tuple[FeatureDefinition, ...] = (
         reads=("item",),
         expr="COALESCE(i.cum_count, 0)",
         leakage="Same right-exclusive as-of read on the item's timeline; the review "
-                "being predicted is at q.ts and is therefore excluded.",
+        "being predicted is at q.ts and is therefore excluded.",
     ),
     FeatureDefinition(
         name="i_mean_stars_to_date",
@@ -120,8 +141,8 @@ _DEFINITIONS: tuple[FeatureDefinition, ...] = (
         reads=("item",),
         expr="i.cum_sum / i.cum_count",
         leakage="As-of state row only. This is the canonical leak (ARCHITECTURE: a "
-                "business's average rating containing the very review predicted) and "
-                "the right-exclusive boundary is exactly what prevents it.",
+        "business's average rating containing the very review predicted) and "
+        "the right-exclusive boundary is exactly what prevents it.",
     ),
     FeatureDefinition(
         name="ui_distance_km",
@@ -131,8 +152,8 @@ _DEFINITIONS: tuple[FeatureDefinition, ...] = (
         reads=("user", "business"),
         expr=_HAVERSINE,
         leakage="The centroid is an as-of aggregate over prior events; the business's "
-                "coordinates are fixed when it opens and cannot vary with the review "
-                "being predicted (D21).",
+        "coordinates are fixed when it opens and cannot vary with the review "
+        "being predicted (D21).",
     ),
     FeatureDefinition(
         name="ui_category_affinity",
@@ -142,8 +163,8 @@ _DEFINITIONS: tuple[FeatureDefinition, ...] = (
         reads=("user", "user_category", "business"),
         expr="uc.matched / NULLIF(COALESCE(u.cum_count, 0), 0)",
         leakage="Numerator is a per-category as-of count over prior events; "
-                "denominator is the same as-of total. The business's category list is "
-                "set at listing time and is independent of any later review (D21).",
+        "denominator is the same as-of total. The business's category list is "
+        "set at listing time and is independent of any later review (D21).",
     ),
     FeatureDefinition(
         name="ui_price_delta",
@@ -153,13 +174,58 @@ _DEFINITIONS: tuple[FeatureDefinition, ...] = (
         reads=("user", "business"),
         expr=f"abs(b.price_tier - {_U_PRICE})",
         leakage="User's mean price tier is an as-of aggregate; the business's tier is a "
-                "quasi-static attribute (D21, the weakest of the three static claims — "
-                "a venue can change band over years).",
+        "quasi-static attribute (D21, the weakest of the three static claims — "
+        "a venue can change band over years).",
     ),
 )
 
 # Insertion order is the ranker's feature-matrix order; do not reorder casually.
 REGISTRY: dict[str, FeatureDefinition] = {d.name: d for d in _DEFINITIONS}
+
+_EMBEDDINGS: tuple[EmbeddingDefinition, ...] = (
+    EmbeddingDefinition(
+        name=USER_BEHAVIORAL_EMBEDDING,
+        entity="user",
+        dtype="FLOAT32",
+        shape=(BEHAVIORAL_EMBEDDING_DIM,),
+        version=1,
+        artifact=DERIVED_DIR / "als" / "user_embedding_behavioral_v1.parquet",
+        leakage="ALS is fit only to review events strictly before the frozen split T; "
+        "the exported vector cannot contain a post-T interaction.",
+    ),
+    EmbeddingDefinition(
+        name=ITEM_BEHAVIORAL_EMBEDDING,
+        entity="item",
+        dtype="FLOAT32",
+        shape=(BEHAVIORAL_EMBEDDING_DIM,),
+        version=1,
+        artifact=DERIVED_DIR / "als" / "item_embedding_behavioral_v1.parquet",
+        leakage="ALS is fit only to the pre-T interaction matrix; catalog-only items "
+        "with no history receive a zero vector rather than future state.",
+    ),
+    EmbeddingDefinition(
+        name=USER_TWO_TOWER_EMBEDDING,
+        entity="user",
+        dtype="FLOAT32",
+        shape=(BEHAVIORAL_EMBEDDING_DIM,),
+        version=1,
+        artifact=DERIVED_DIR / "two_tower" / "user_embedding_two_tower_v1.parquet",
+        leakage="The model sees only pre-T labels; exported user inputs are read "
+        "right-exclusively as-of frozen T through the historical store.",
+    ),
+    EmbeddingDefinition(
+        name=ITEM_TWO_TOWER_EMBEDDING,
+        entity="item",
+        dtype="FLOAT32",
+        shape=(BEHAVIORAL_EMBEDDING_DIM,),
+        version=1,
+        artifact=DERIVED_DIR / "two_tower" / "item_embedding_two_tower_v1.parquet",
+        leakage="The model sees only pre-T labels and item-side inputs are D21's "
+        "quasi-static identity attributes, never accumulating snapshot counters.",
+    ),
+)
+
+EMBEDDING_REGISTRY: dict[str, EmbeddingDefinition] = {d.name: d for d in _EMBEDDINGS}
 
 STATE_GROUPS: tuple[str, ...] = ("user", "item", "user_category", "business")
 
@@ -174,8 +240,15 @@ def get(name: str) -> FeatureDefinition:
     try:
         return REGISTRY[name]
     except KeyError:
+        raise KeyError(f"unknown feature {name!r}; registered: {', '.join(REGISTRY)}") from None
+
+
+def get_embedding(name: str) -> EmbeddingDefinition:
+    try:
+        return EMBEDDING_REGISTRY[name]
+    except KeyError:
         raise KeyError(
-            f"unknown feature {name!r}; registered: {', '.join(REGISTRY)}"
+            f"unknown embedding {name!r}; registered: {', '.join(EMBEDDING_REGISTRY)}"
         ) from None
 
 

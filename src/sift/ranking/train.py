@@ -14,6 +14,7 @@ Run: python -m sift.ranking.train
 from __future__ import annotations
 
 from datetime import date
+from pathlib import Path
 
 import duckdb
 import lightgbm as lgb
@@ -27,6 +28,7 @@ from sift.offline.training_set import TRAINING_SET
 FEATURES: list[str] = list(feature_names())
 VAL_START = date(2018, 1, 1)  # groups in [VAL_START, T) are validation
 RANKER_MODEL = DERIVED_DIR / "ranker.txt"
+ALS_RANKER_MODEL = DERIVED_DIR / "ranker_als.txt"
 
 
 def to_float(array: object) -> NDArray[np.float64]:
@@ -61,8 +63,12 @@ def _load_split(
     return x, y, sizes
 
 
-def train() -> lgb.Booster:
-    glob = sql_path(TRAINING_SET)
+def train(
+    *,
+    training_set: Path = TRAINING_SET,
+    model_file: Path = RANKER_MODEL,
+) -> lgb.Booster:
+    glob = sql_path(training_set)
     con = duckdb.connect()
     try:
         x_tr, y_tr, g_tr = _load_split(con, glob, f"ts < TIMESTAMP '{VAL_START}'")
@@ -72,8 +78,10 @@ def train() -> lgb.Booster:
     finally:
         con.close()
 
-    print(f"train: {len(y_tr):,} rows / {len(g_tr):,} groups   "
-          f"val: {len(y_val):,} rows / {len(g_val):,} groups")
+    print(
+        f"train: {len(y_tr):,} rows / {len(g_tr):,} groups   "
+        f"val: {len(y_val):,} rows / {len(g_val):,} groups"
+    )
 
     train_ds = lgb.Dataset(x_tr, label=y_tr, group=g_tr, feature_name=FEATURES)
     val_ds = lgb.Dataset(x_val, label=y_val, group=g_val, reference=train_ds)
@@ -96,8 +104,8 @@ def train() -> lgb.Booster:
         valid_names=["val"],
         callbacks=[lgb.early_stopping(50), lgb.log_evaluation(50)],
     )
-    RANKER_MODEL.parent.mkdir(parents=True, exist_ok=True)
-    model.save_model(str(RANKER_MODEL), num_iteration=model.best_iteration)
+    model_file.parent.mkdir(parents=True, exist_ok=True)
+    model.save_model(str(model_file), num_iteration=model.best_iteration)
     return model
 
 

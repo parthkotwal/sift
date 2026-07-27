@@ -1,7 +1,7 @@
-"""Real serving path: popularity retrieval -> Redis features -> LightGBM ranking.
+"""Runnable displaced path: popularity retrieval -> Redis features -> LightGBM.
 
-The candidate source remains the accepted popularity baseline until retrieval step
-5 replaces it with ALS. What changes here is the expensive middle: each request
+This remains the accepted build-step-4 baseline after ALS replaces it in the API.
+Its expensive middle reads current state per request:
 fetches current state from Redis and scores the 500 candidates, rather than reading
 Parquet or returning a precomputed per-user list. Timings cover where work actually
 happens, closing ISSUES.md I3's misleading cached-lookup measurement.

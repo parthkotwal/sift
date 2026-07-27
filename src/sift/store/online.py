@@ -31,7 +31,14 @@ from redis import Redis
 from redis.exceptions import RedisError
 from redis.typing import EncodableT
 
-from sift.features.definitions import feature_names, get
+from sift.config import sql_path
+from sift.features.definitions import (
+    EMBEDDING_REGISTRY,
+    USER_BEHAVIORAL_EMBEDDING,
+    feature_names,
+    get,
+    get_embedding,
+)
 from sift.offline.dim_business import DIM_BUSINESS
 from sift.store.materialize import HISTORICAL_DIR
 from sift.store.read import attach_store, read_current_features
@@ -40,7 +47,7 @@ DEFAULT_REDIS_URL = "redis://localhost:6379/0"
 KEY_PREFIX = "sift:online"
 ACTIVE_GENERATION_KEY = f"{KEY_PREFIX}:active"
 GENERATION_INDEX_KEY = f"{KEY_PREFIX}:generations"
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 PIPELINE_SIZE = 1_000
 OLD_GENERATION_TTL_SECONDS = 3_600
 
@@ -64,6 +71,8 @@ class OnlineManifest:
     items: int
     user_categories: int
     businesses: int
+    user_embeddings: int = 0
+    embeddings: tuple[tuple[str, int], ...] = ()
 
 
 def redis_client(url: str | None = None) -> Redis:
@@ -169,6 +178,8 @@ def materialize_online(
     client: Redis | None = None,
     historical_dir: Path = HISTORICAL_DIR,
     dim_file: Path = DIM_BUSINESS,
+    user_embedding_file: Path | None = None,
+    user_embedding_name: str = USER_BEHAVIORAL_EMBEDDING,
 ) -> OnlineManifest:
     """Write latest entity state to a fresh Redis generation, then activate it."""
     store = client or redis_client()
@@ -180,7 +191,13 @@ def materialize_online(
     generation = uuid4().hex
     index_key = _keys_key(generation)
     con = duckdb.connect()
-    counts = {"users": 0, "items": 0, "user_categories": 0, "businesses": 0}
+    counts = {
+        "users": 0,
+        "items": 0,
+        "user_categories": 0,
+        "businesses": 0,
+        "user_embeddings": 0,
+    }
     pipe = store.pipeline(transaction=False)
     pending = 0
     published = False
@@ -274,6 +291,26 @@ def materialize_online(
                 write_record(_key(generation, "business", str(business_id)), values)
                 counts["businesses"] += 1
 
+        if user_embedding_file is not None:
+            definition = get_embedding(user_embedding_name)
+            embedding_rows = con.execute(
+                f"SELECT user_id, value FROM read_parquet({sql_path(user_embedding_file)}) "
+                "ORDER BY user_id"
+            )
+            while batch := embedding_rows.fetchmany(PIPELINE_SIZE):
+                for user_id, value in batch:
+                    vector = [float(component) for component in value]
+                    if len(vector) != definition.shape[0]:
+                        raise ValueError(
+                            f"{definition.name} has {len(vector)} values, expected "
+                            f"{definition.shape[0]}"
+                        )
+                    write_record(
+                        _key(generation, "embedding", str(user_id)),
+                        {definition.name: json.dumps(vector)},
+                    )
+                    counts["user_embeddings"] += 1
+
         if pending:
             pipe.execute()
 
@@ -288,6 +325,10 @@ def materialize_online(
             businesses=counts["businesses"],
             definitions=json.dumps(
                 {name: get(name).version for name in feature_names()}, sort_keys=True
+            ),
+            embeddings=json.dumps(
+                ({definition.name: definition.version} if user_embedding_file else {}),
+                sort_keys=True,
             ),
         )
         store.hset(_manifest_key(generation), mapping=_redis_mapping(manifest_values))
@@ -323,6 +364,8 @@ def materialize_online(
         items=counts["items"],
         user_categories=counts["user_categories"],
         businesses=counts["businesses"],
+        user_embeddings=counts["user_embeddings"],
+        embeddings=(((definition.name, definition.version),) if user_embedding_file else ()),
     )
 
 
@@ -360,6 +403,12 @@ class OnlineFeatureStore:
             raise OnlineStoreUnavailable(
                 "Redis feature versions do not match the active registry; rematerialize"
             )
+        raw_embeddings: dict[str, int] = json.loads(raw.get("embeddings", "{}"))
+        for name, version in raw_embeddings.items():
+            if name not in EMBEDDING_REGISTRY or get_embedding(name).version != version:
+                raise OnlineStoreUnavailable(
+                    "Redis embedding versions do not match the active registry; rematerialize"
+                )
         manifest = OnlineManifest(
             generation=generation,
             as_of=datetime.fromisoformat(raw["as_of"]),
@@ -367,9 +416,37 @@ class OnlineFeatureStore:
             items=int(raw["items"]),
             user_categories=int(raw["user_categories"]),
             businesses=int(raw["businesses"]),
+            user_embeddings=int(raw.get("user_embeddings", 0)),
+            embeddings=tuple(sorted(raw_embeddings.items())),
         )
         self._thread.manifest = manifest
         return manifest
+
+    def lookup_user_embedding(
+        self, user_id: str, name: str = USER_BEHAVIORAL_EMBEDDING
+    ) -> list[float] | None:
+        """Read one registered user vector from the active atomic snapshot."""
+        definition = get_embedding(name)
+        manifest = self.manifest()
+        if (name, definition.version) not in manifest.embeddings:
+            raise OnlineStoreUnavailable(
+                f"{name} is not materialized in Redis; rematerialize with that definition"
+            )
+        generation = manifest.generation
+        try:
+            raw = self.client.get(_key(generation, "embedding", user_id))
+        except RedisError as exc:
+            raise OnlineStoreUnavailable(f"online store lookup failed: {exc}") from exc
+        record = _decode_record(raw)
+        encoded = record.get(name)
+        if encoded is None:
+            return None
+        vector = [float(value) for value in json.loads(encoded)]
+        if len(vector) != definition.shape[0]:
+            raise OnlineStoreUnavailable(
+                f"stored {name} has {len(vector)} values, expected {definition.shape[0]}"
+            )
+        return vector
 
     def _connection(self) -> duckdb.DuckDBPyConnection:
         """One reusable DuckDB connection per serving thread."""
@@ -569,13 +646,16 @@ class OnlineFeatureStore:
 
 
 def main() -> None:
-    manifest = materialize_online()
+    manifest = materialize_online(
+        user_embedding_file=get_embedding(USER_BEHAVIORAL_EMBEDDING).artifact
+    )
     print(f"activated Redis generation {manifest.generation}")
     print(f"  as-of            {manifest.as_of.isoformat()}")
     print(f"  users            {manifest.users:,}")
     print(f"  items            {manifest.items:,}")
     print(f"  user categories  {manifest.user_categories:,}")
     print(f"  businesses       {manifest.businesses:,}")
+    print(f"  user embeddings  {manifest.user_embeddings:,}")
 
 
 if __name__ == "__main__":

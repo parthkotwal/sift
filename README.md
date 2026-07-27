@@ -10,7 +10,7 @@ Scoring 150K businesses with a good model takes seconds, so the work is split in
 request: user_id, location
    │
    ▼
-retrieval   150K → ~500   ANN over embeddings ∪ heuristics   recall@500
+retrieval   14.6K → ~500  exact ALS dot product (ANN at scale) recall@500
    ▼
 ranking     500 → 50      LightGBM on user×item features     NDCG@10
    ▼
@@ -19,7 +19,7 @@ rerank      50 → 10       hard filters + diversity
 response: 10 businesses   p99 < 100ms, budgeted per stage
 ```
 
-Offline, a batch job builds point-in-time-correct training examples from the review log, trains the retrieval embeddings and the ranker on a frozen temporal split, rebuilds the ANN index, and materializes features to both stores.
+Offline, a batch job builds point-in-time-correct training examples from the review log, trains retrieval embeddings and candidate-conditioned rankers on a frozen temporal split, and materializes features to both stores. Exact vector search won the current index gate: at 14,568 metro businesses it is ~1ms p99 and lossless, while HNSW missed the required overlap and paid no useful rent. ANN remains the scale-up seam, not a dependency carried for appearances.
 
 ## The two hard problems
 
@@ -29,6 +29,10 @@ Offline, a batch job builds point-in-time-correct training examples from the rev
 ## Build order
 
 Backwards, one stage at a time: dumb popularity baseline end-to-end first, then the eval harness, then ranking, then the feature store, then learned retrieval (ALS first; a two-tower lands only if it beats ALS at recall@500), then rerank, then scale. Nothing lands without beating the thing before it.
+
+The fixed two-tower has now been run through that gate and did not replace ALS.
+Its code and versioned artifacts remain reproducible for inspection; the selected
+online path is unchanged.
 
 ## Run locally
 
@@ -40,20 +44,23 @@ truth, and the online store is a rebuildable serving materialization.
 uv sync
 docker compose up -d redis
 uv run python -m sift.store.materialize   # historical timelines -> Parquet
-uv run python -m sift.store.online        # latest entity state -> Redis
-uv run python -m sift.store.skew           # Redis == Parquet as-of-now
+uv run python -m sift.retrieval.interactions
+uv run python -m sift.retrieval.als
+uv run python -m sift.store.online        # current state + ALS user vectors -> Redis
+uv run python -m sift.store.skew          # Redis == Parquet as-of-now
 uv run uvicorn sift.api.main:app --reload
 ```
 
-`GET /recommend?user_id=<id>&k=10` runs popularity retrieval → Redis feature
-lookup → LightGBM ranking and returns a per-stage latency breakdown. The popularity
-artifact is still the retrieval source until the ALS stage replaces it; Redis
-removes Parquet feature computation from the request path.
+`GET /recommend?user_id=<id>&k=10` reads the versioned user embedding from Redis
+and performs exact ALS retrieval over the full metro catalog. Users absent from the
+ALS artifact fall back explicitly to pre-T popularity. The ALS-conditioned
+LightGBM ranker remains runnable but does not serve: it lowered NDCG@10 relative to
+ALS's own order, so it failed the model gate.
 
 For a latency distribution rather than one request:
 
 ```bash
-uv run python -m sift.ranking.online --samples 100
+uv run python -m sift.retrieval.online --samples 100
 ```
 
 Set `SIFT_REDIS_URL` to use a non-default Redis endpoint.

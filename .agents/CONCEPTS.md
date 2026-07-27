@@ -16,9 +16,15 @@ A living study guide. Each entry: what the idea is, why Sift needs it, and the q
 
 **What:** Index structures (HNSW graphs, IVF cells) that find the ~k closest vectors to a query in sub-millisecond time by searching a tiny fraction of the space, trading a little recall for a lot of speed. Exact search over 150K×64 floats is a big dot-product; over 150M it's impossible — ANN is what makes embedding retrieval servable.
 
-**Here:** FAISS or hnswlib over item embeddings; the user's vector queries it at request time. Index rebuilt by the offline job whenever embeddings are re-exported.
+**Here:** the fidelity/latency comparison rejected ANN for the current 14,568-item metro catalog. Raw-inner-product HNSW returned only 0.889 mean overlap@500; a denser graph approached the 0.99 gate only by becoming slower than exact NumPy scoring. Exact search is therefore the current index, at ~1ms p99. ANN is retained as a scale-up concept and interface, not as an unused dependency.
 
 **Own it:** *What does HNSW give up relative to exact search, and how would you measure whether it's hurting you?* (Compare ANN recall@500 against brute-force on a sample.)
+
+The subtlety here is maximum inner product search: raw dot product is not cosine,
+and it is not a metric. Normalizing vectors would change ALS's ranking, while a
+graph built directly in inner-product space can have poor reachability. Always
+validate the exact ranking the model means, rather than assuming the index's
+distance label makes it equivalent.
 
 ## Embedding-based retrieval; ALS; two-tower models
 
@@ -26,13 +32,25 @@ A living study guide. Each entry: what the idea is, why Sift needs it, and the q
 
 **Here:** ALS first (D11) — the whole serving path built on a model the author owns; the two-tower is an upgrade gated on beating ALS at recall@500.
 
+**The 5b implementation:** user tower = learned ID plus right-exclusive user state;
+item tower = learned ID plus quasi-static category/location/price attributes. The
+asymmetry is a temporal correctness choice. If an in-batch item's time-varying
+aggregate were computed at that item's own event timestamp, it could be a future
+value for an earlier query elsewhere in the batch. Keeping item inputs static makes
+one encoded item valid for every query timestamp in that sampled-softmax matrix.
+
 **Own it:** *In what precise sense is ALS "a two-tower without the towers," and what's the one capability the towers add?*
 
 ## Negative sampling (and in-batch negatives)
 
 **What:** Ranking/retrieval models need examples of what users *didn't* choose. Since that's almost everything, you sample. Uniform random negatives are easy but mostly teach "popular beats obscure." **In-batch negatives** (each positive's item serves as a negative for the other users in the batch) are nearly free — but sample items proportional to popularity, over-penalizing popular items; the **logQ correction** (subtract log sampling probability from the logit) compensates.
 
-**Here:** Ranker negatives sampled at training-set assembly; two-tower (if attempted) uses in-batch + sampled-softmax with logQ or mixed-in uniform negatives. Strategy is a recorded decision when built.
+**Here:** Ranker negatives are sampled at training-set assembly. The two-tower uses
+in-batch items plus uniform full-catalog negatives, with logQ computed from that
+mixture. Uniform candidates ensure businesses with no positive event are trained
+against rather than retaining arbitrary random vectors. A separate mask removes
+every known user-positive from the denominator except the row's target; otherwise
+efficient negative sampling quietly manufactures false negatives (D26).
 
 **Own it:** *Why do uniform negatives make the model popularity-biased, and why do in-batch negatives have the opposite bias?*
 

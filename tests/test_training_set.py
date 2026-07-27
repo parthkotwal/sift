@@ -27,9 +27,7 @@ def _neg(
     k: int,
     seed: int = 0,
 ) -> list[tuple[int, str]]:
-    return list(
-        sample_negatives(positives, _POOL, user_history, k, random.Random(seed))
-    )
+    return list(sample_negatives(positives, _POOL, user_history, k, random.Random(seed)))
 
 
 def _scalar(con: duckdb.DuckDBPyConnection, sql: str) -> object:
@@ -94,8 +92,12 @@ def _synthetic_events(tmp_path: Path) -> tuple[Path, Path, Path]:
         business,
         [
             {
-                "business_id": f"b{i}", "city": "Philadelphia", "state": "PA",
-                "latitude": 39.95 + i / 100, "longitude": -75.16, "is_open": 1,
+                "business_id": f"b{i}",
+                "city": "Philadelphia",
+                "state": "PA",
+                "latitude": 39.95 + i / 100,
+                "longitude": -75.16,
+                "is_open": 1,
                 "categories": "Restaurants, Pizza" if i % 2 else "Bars",
                 "attributes": {"RestaurantsPriceRange2": str(i % 4 + 1)},
             }
@@ -103,22 +105,32 @@ def _synthetic_events(tmp_path: Path) -> tuple[Path, Path, Path]:
         ],
     )
     reviews = [
-        ("u1", "b0", "2016-01-01"), ("u1", "b1", "2017-01-01"),
-        ("u2", "b0", "2016-06-01"), ("u2", "b2", "2017-06-01"), ("u2", "b3", "2018-06-01"),
+        ("u1", "b0", "2016-01-01"),
+        ("u1", "b1", "2017-01-01"),
+        ("u2", "b0", "2016-06-01"),
+        ("u2", "b2", "2017-06-01"),
+        ("u2", "b3", "2018-06-01"),
         ("u3", "b1", "2016-03-01"),
     ]
     _write_ndjson(
         review,
-        [{"user_id": u, "business_id": b, "stars": 5, "date": f"{d} 12:00:00"}
-         for u, b, d in reviews],
+        [
+            {"user_id": u, "business_id": b, "stars": 5, "date": f"{d} 12:00:00"}
+            for u, b, d in reviews
+        ],
     )
     build_events(
-        business_json=business, review_json=review, out_dir=events,
-        metro_city="Philadelphia", metro_state="PA",
+        business_json=business,
+        review_json=review,
+        out_dir=events,
+        metro_city="Philadelphia",
+        metro_state="PA",
     )
     build_dim_business(
-        business_json=business, out_file=dim,
-        metro_city="Philadelphia", metro_state="PA",
+        business_json=business,
+        out_file=dim,
+        metro_city="Philadelphia",
+        metro_state="PA",
     )
     store = tmp_path / "historical"
     materialize_historical(events_dir=events, dim_file=dim, out_dir=store)
@@ -129,8 +141,14 @@ def test_assembly_has_one_positive_per_group_and_valid_negatives(tmp_path: Path)
     events, dim, store = _synthetic_events(tmp_path)
     out = tmp_path / "training_set.parquet"
     n = build_training_set(
-        events_dir=events, dim_file=dim, store_dir=store, split_t=T,
-        pool_size=6, k=2, seed=1, out_file=out,
+        events_dir=events,
+        dim_file=dim,
+        store_dir=store,
+        split_t=T,
+        pool_size=6,
+        k=2,
+        seed=1,
+        out_file=out,
     )
     con = duckdb.connect()
     glob = sql_path(out)
@@ -144,8 +162,7 @@ def test_assembly_has_one_positive_per_group_and_valid_negatives(tmp_path: Path)
     )
     assert bad_groups == 0
     # No negative is a business the user actually reviewed (no false negatives).
-    reviewed = {("u1", "b0"), ("u1", "b1"), ("u2", "b0"), ("u2", "b2"),
-                ("u2", "b3"), ("u3", "b1")}
+    reviewed = {("u1", "b0"), ("u1", "b1"), ("u2", "b0"), ("u2", "b2"), ("u2", "b3"), ("u3", "b1")}
     negatives = con.execute(
         f"SELECT user_id, business_id FROM read_parquet({glob}) WHERE label = 0"
     ).fetchall()
@@ -162,8 +179,14 @@ def test_positives_are_restricted_to_the_candidate_pool(tmp_path: Path) -> None:
     events, dim, store = _synthetic_events(tmp_path)
     out = tmp_path / "training_set.parquet"
     build_training_set(
-        events_dir=events, dim_file=dim, store_dir=store, split_t=T,
-        pool_size=3, k=2, seed=1, out_file=out,
+        events_dir=events,
+        dim_file=dim,
+        store_dir=store,
+        split_t=T,
+        pool_size=3,
+        k=2,
+        seed=1,
+        out_file=out,
     )
     con = duckdb.connect()
     glob = sql_path(out)
@@ -177,6 +200,34 @@ def test_positives_are_restricted_to_the_candidate_pool(tmp_path: Path) -> None:
     assert off_pool == []
 
 
+def test_personalized_candidates_scope_each_users_rows(tmp_path: Path) -> None:
+    events, dim, store = _synthetic_events(tmp_path)
+    out = tmp_path / "personalized.parquet"
+    pools = {
+        "u1": ["b0", "b2", "b3"],
+        "u2": ["b2", "b4", "b5"],
+        "u3": ["b1", "b6", "b7"],
+    }
+    build_training_set(
+        events_dir=events,
+        dim_file=dim,
+        store_dir=store,
+        split_t=T,
+        pool_size=3,
+        k=1,
+        seed=1,
+        out_file=out,
+        candidate_provider=lambda user_id, k: pools[user_id][:k],
+    )
+    con = duckdb.connect()
+    rows = con.execute(
+        f"SELECT user_id, business_id, label FROM read_parquet({sql_path(out)})"
+    ).fetchall()
+    con.close()
+    assert sum(int(label) for _, _, label in rows) == 3  # u1:b0, u2:b2, u3:b1
+    assert all(str(business) in pools[str(user)] for user, business, _ in rows)
+
+
 def test_row_order_within_a_group_does_not_encode_the_label(tmp_path: Path) -> None:
     """LightGBM reads groups as consecutive blocks in file order, and resolves tied
     scores in that order. If the artifact were sorted with the positive first, an
@@ -187,8 +238,14 @@ def test_row_order_within_a_group_does_not_encode_the_label(tmp_path: Path) -> N
     events, dim, store = _synthetic_events(tmp_path)
     out = tmp_path / "training_set.parquet"
     build_training_set(
-        events_dir=events, dim_file=dim, store_dir=store, split_t=T,
-        pool_size=6, k=2, seed=1, out_file=out,
+        events_dir=events,
+        dim_file=dim,
+        store_dir=store,
+        split_t=T,
+        pool_size=6,
+        k=2,
+        seed=1,
+        out_file=out,
     )
     con = duckdb.connect()
     con.execute("SET threads TO 1")  # single-threaded scan preserves file order
@@ -212,8 +269,16 @@ def test_row_order_within_a_group_does_not_encode_the_label(tmp_path: Path) -> N
 def test_assembly_is_idempotent(tmp_path: Path) -> None:
     events, dim, store = _synthetic_events(tmp_path)
     out = tmp_path / "training_set.parquet"
-    kw = dict(events_dir=events, dim_file=dim, store_dir=store, split_t=T, pool_size=6, k=2, seed=1,
-              out_file=out)
+    kw = dict(
+        events_dir=events,
+        dim_file=dim,
+        store_dir=store,
+        split_t=T,
+        pool_size=6,
+        k=2,
+        seed=1,
+        out_file=out,
+    )
     first = build_training_set(**kw)  # type: ignore[arg-type]
     first_bytes = out.read_bytes()
     second = build_training_set(**kw)  # type: ignore[arg-type]

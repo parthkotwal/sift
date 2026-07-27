@@ -30,6 +30,10 @@ def test_every_definition_states_a_leakage_argument() -> None:
     for name, d in defs.REGISTRY.items():
         assert d.leakage.strip(), f"{name} has no leakage argument"
         assert len(d.leakage) > 40, f"{name}'s leakage argument is too thin to be real"
+    for name, embedding in defs.EMBEDDING_REGISTRY.items():
+        assert embedding.leakage.strip(), f"{name} has no leakage argument"
+        assert embedding.shape == (64,)
+        assert embedding.artifact.suffix == ".parquet"
 
 
 def test_definitions_declare_known_state_groups() -> None:

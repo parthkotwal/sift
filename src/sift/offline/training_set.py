@@ -26,7 +26,7 @@ from __future__ import annotations
 import csv
 import random
 import tempfile
-from collections.abc import Collection, Iterable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterable, Iterator, Mapping, Sequence
 from datetime import date
 from pathlib import Path
 
@@ -44,6 +44,9 @@ POOL_SIZE = 500  # negatives drawn from the top-500, matching retrieval's output
 SEED = 20260722  # fixes the sampled negatives so the training set is reproducible
 
 TRAINING_SET = DERIVED_DIR / "training_set.parquet"
+ALS_TRAINING_SET = DERIVED_DIR / "training_set_als.parquet"
+
+CandidateProvider = Callable[[str, int], Sequence[str]]
 
 
 def sample_negatives(
@@ -88,8 +91,15 @@ def build_training_set(
     k: int = NEG_RATIO,
     seed: int = SEED,
     out_file: Path = TRAINING_SET,
+    candidate_provider: CandidateProvider | None = None,
 ) -> int:
-    """Build the training-set Parquet and return its row count."""
+    """Build the training-set Parquet and return its row count.
+
+    The default preserves the accepted popularity-pool baseline. Passing a
+    provider changes both positives and negatives to that user's retrieved pool,
+    which is required when training the ranker that follows personalized ALS
+    retrieval (D20's candidate-conditioned training rule).
+    """
     glob = sql_path(events_dir / "**" / "*.parquet")
     t = str(split_t)
     con = duckdb.connect()
@@ -99,60 +109,117 @@ def build_training_set(
         )
         # Features come from the store, never recomputed here (chokepoint 2).
         attach_store(con, historical_dir=store_dir, dim_file=dim_file)
-        # The candidate pool, built first because it now scopes the positives too:
-        # this is the set retrieval serves, so it defines the ranker's whole world.
-        con.execute(
-            f"""
-            CREATE TABLE pool AS
-            SELECT business_id FROM events
-            WHERE event_type = 'review' AND ts < TIMESTAMP '{t}'
-            GROUP BY business_id
-            ORDER BY count(*) DESC, business_id
-            LIMIT {pool_size}
-            """
-        )
-        pool = [str(r[0]) for r in con.execute("SELECT business_id FROM pool").fetchall()]
-        # Positives: deterministic group_id per pre-T review event of a pool business
-        # (D20). Reviews of non-pool businesses are retrieval's problem, not ranking's.
-        con.execute(
-            f"""
-            CREATE TABLE positives AS
-            SELECT row_number() OVER (ORDER BY user_id, ts, business_id) AS group_id,
-                   user_id, business_id, ts
-            FROM (
-                SELECT e.user_id, e.business_id, e.ts
-                FROM events e
-                SEMI JOIN pool p ON e.business_id = p.business_id
-                WHERE e.event_type = 'review' AND e.ts < TIMESTAMP '{t}'
-            )
-            """
-        )
-        # Exclusion set for negative sampling. Reading it off the (now pool-scoped)
-        # positives loses nothing: negatives are drawn from the pool, so a user's
-        # reviews of non-pool businesses could never be sampled anyway.
-        user_history: dict[str, set[str]] = {}
-        for user_id, business_id in con.execute(
-            "SELECT DISTINCT user_id, business_id FROM positives"
-        ).fetchall():
-            user_history.setdefault(str(user_id), set()).add(str(business_id))
-
-        pos_rows = [
-            (int(g), str(u), str(b))
-            for g, u, b in con.execute(
-                "SELECT group_id, user_id, business_id FROM positives"
-            ).fetchall()
-        ]
+        out_file.parent.mkdir(parents=True, exist_ok=True)
         rng = random.Random(seed)
-        # Stream the sampled negatives through a temp CSV: DuckDB's bulk CSV read
-        # is ~1000x faster than executemany for millions of rows, and nothing
-        # larger than one row is held in Python at a time.
-        with tempfile.NamedTemporaryFile(
-            "w", suffix=".csv", dir=out_file.parent, delete=False, newline=""
-        ) as handle:
-            neg_csv = Path(handle.name)
-            csv.writer(handle).writerows(
-                sample_negatives(pos_rows, pool, user_history, k, rng)
+        if candidate_provider is None:
+            # One global pool is the popularity baseline's serving conditional.
+            con.execute(
+                f"""
+                CREATE TABLE pool AS
+                SELECT business_id FROM events
+                WHERE event_type = 'review' AND ts < TIMESTAMP '{t}'
+                GROUP BY business_id
+                ORDER BY count(*) DESC, business_id
+                LIMIT {pool_size}
+                """
             )
+            pool = [str(r[0]) for r in con.execute("SELECT business_id FROM pool").fetchall()]
+            con.execute(
+                f"""
+                CREATE TABLE positives AS
+                SELECT row_number() OVER (ORDER BY user_id, ts, business_id) AS group_id,
+                       user_id, business_id, ts
+                FROM (
+                    SELECT e.user_id, e.business_id, e.ts
+                    FROM events e
+                    SEMI JOIN pool p ON e.business_id = p.business_id
+                    WHERE e.event_type = 'review' AND e.ts < TIMESTAMP '{t}'
+                )
+                """
+            )
+            user_history: dict[str, set[str]] = {}
+            for user_id, business_id in con.execute(
+                "SELECT DISTINCT user_id, business_id FROM positives"
+            ).fetchall():
+                user_history.setdefault(str(user_id), set()).add(str(business_id))
+            pos_rows = [
+                (int(g), str(u), str(b))
+                for g, u, b in con.execute(
+                    "SELECT group_id, user_id, business_id FROM positives"
+                ).fetchall()
+            ]
+            with tempfile.NamedTemporaryFile(
+                "w", suffix=".csv", dir=out_file.parent, delete=False, newline=""
+            ) as handle:
+                neg_csv = Path(handle.name)
+                csv.writer(handle).writerows(sample_negatives(pos_rows, pool, user_history, k, rng))
+        else:
+            # Personalized retrieval changes the pool per user. Stream the accepted
+            # positives and sampled negatives rather than materializing users×500.
+            con.execute(
+                f"""
+                CREATE TABLE raw_positives AS
+                SELECT user_id, business_id, ts
+                FROM events
+                WHERE event_type = 'review' AND ts < TIMESTAMP '{t}'
+                ORDER BY user_id, ts, business_id
+                """
+            )
+            user_history = {}
+            for user_id, business_id in con.execute(
+                "SELECT DISTINCT user_id, business_id FROM raw_positives"
+            ).fetchall():
+                user_history.setdefault(str(user_id), set()).add(str(business_id))
+            with (
+                tempfile.NamedTemporaryFile(
+                    "w", suffix=".csv", dir=out_file.parent, delete=False, newline=""
+                ) as positive_handle,
+                tempfile.NamedTemporaryFile(
+                    "w", suffix=".csv", dir=out_file.parent, delete=False, newline=""
+                ) as negative_handle,
+            ):
+                positive_csv = Path(positive_handle.name)
+                neg_csv = Path(negative_handle.name)
+                positive_writer = csv.writer(positive_handle)
+                negative_writer = csv.writer(negative_handle)
+                current_user = ""
+                personalized_pool: tuple[str, ...] = ()
+                pool_set: set[str] = set()
+                group_id = 0
+                rows = con.execute(
+                    "SELECT user_id, business_id, ts FROM raw_positives "
+                    "ORDER BY user_id, ts, business_id"
+                ).fetchall()
+                for raw_user, raw_business, ts_value in rows:
+                    user_id, business_id = str(raw_user), str(raw_business)
+                    if user_id != current_user:
+                        current_user = user_id
+                        personalized_pool = tuple(candidate_provider(user_id, pool_size))
+                        if len(personalized_pool) != len(set(personalized_pool)):
+                            raise ValueError(f"candidate provider duplicated IDs for {user_id}")
+                        pool_set = set(personalized_pool)
+                    if business_id not in pool_set:
+                        continue
+                    group_id += 1
+                    positive_writer.writerow((group_id, user_id, business_id, ts_value))
+                    negative_writer.writerows(
+                        sample_negatives(
+                            [(group_id, user_id, business_id)],
+                            personalized_pool,
+                            user_history,
+                            k,
+                            rng,
+                        )
+                    )
+            try:
+                con.execute(
+                    f"CREATE TABLE positives AS SELECT * FROM read_csv("
+                    f"{sql_path(positive_csv)}, header=false, columns={{'group_id': "
+                    "'BIGINT', 'user_id': 'VARCHAR', 'business_id': 'VARCHAR', "
+                    "'ts': 'TIMESTAMP'})"
+                )
+            finally:
+                positive_csv.unlink(missing_ok=True)
         try:
             con.execute(
                 f"CREATE TABLE neg AS SELECT * FROM read_csv({sql_path(neg_csv)}, "
@@ -180,7 +247,6 @@ def build_training_set(
         # Projected from the registry rather than spelled out, so a feature added
         # to the definition cannot silently fail to reach the training artifact.
         feat_cols = ", ".join(f"f.{name}" for name in feature_names())
-        out_file.parent.mkdir(parents=True, exist_ok=True)
         out_file.unlink(missing_ok=True)
         con.execute(
             f"""
@@ -199,9 +265,7 @@ def build_training_set(
             ) TO {sql_path(out_file)} (FORMAT PARQUET)
             """
         )
-        row = con.execute(
-            f"SELECT count(*) FROM read_parquet({sql_path(out_file)})"
-        ).fetchone()
+        row = con.execute(f"SELECT count(*) FROM read_parquet({sql_path(out_file)})").fetchone()
         assert row is not None
         return int(row[0])
     finally:
@@ -214,8 +278,7 @@ def main() -> None:
     con = duckdb.connect()
     try:
         counts = con.execute(
-            f"SELECT sum(label), sum(1 - label), count(DISTINCT group_id) "
-            f"FROM read_parquet({glob})"
+            f"SELECT sum(label), sum(1 - label), count(DISTINCT group_id) FROM read_parquet({glob})"
         ).fetchone()
         assert counts is not None
         pos, neg, groups = int(counts[0]), int(counts[1]), int(counts[2])

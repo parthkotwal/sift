@@ -198,3 +198,70 @@ runtime requirement.
 **Cost accepted:** online projection still invokes DuckDB so the registry's SQL text
 remains the single feature definition. This may consume part of the 20ms lookup
 budget; the new per-stage benchmark measures that cost before any optimization.
+
+## D25 — ALS lands; exact search wins the current index gate   [accepted] (2026-07-26)
+
+**Context:** Build step 5a trained the fixed D11 ALS configuration on 737,406
+pre-T user/business interaction pairs (confidence = repeat count) over 213,961
+users and the complete 14,568-business metro catalog. Retrieval must beat pre-T
+popularity at recall@500. The architecture expected an ANN index, but dependencies
+also have to pay rent.
+
+**Measured choice:** ALS lands: recall@500 **0.2131 → 0.2519**; recall@10
+0.0169 → 0.0350; NDCG@10 0.0122 → 0.0269. At @500 it uniquely recovers 13,928
+held-out target pairs while popularity uniquely recovers 10,744. Use exact
+full-catalog inner-product search now. The initial HNSW index reached only 0.889
+mean exact overlap@500. A denser configuration still missed the 0.99 fidelity gate
+and became slower than exact search; exact is ~1ms p99 at this catalog size.
+
+**Ranker consequence:** D20 makes candidate source part of the ranker's training
+contract. A separate ALS-conditioned artifact/model was built (3.389M rows,
+677,864 groups; best validation NDCG@10 0.6977). It did not land: on the frozen
+holdout it changed ALS recall@10 0.0350 → 0.0334 and NDCG@10 0.0269 → 0.0260.
+The API therefore serves ALS's own order; popularity is the explicit cold-user
+fallback. Both ranker variants remain runnable.
+
+**Serving and definition seam:** `user_embedding_behavioral_v1` and
+`item_embedding_behavioral_v1` are registered vector feature definitions (D12).
+The online user vector is published inside Redis's generation switch and checked
+coordinate-by-coordinate against its Parquet artifact. Warm online p99 is 2.690ms
+(Redis vector lookup + exact retrieval); in-process FastAPI p99 is 3.634ms.
+
+**Scale trigger:** revisit ANN only when exact retrieval materially approaches the
+30ms stage budget or catalog/memory growth makes the full scan costly. At that
+point the replacement must pass exact overlap@500 and end-to-end retrieval recall,
+not merely return neighbors quickly.
+
+## D26 — The fixed two-tower does not replace ALS   [accepted] (2026-07-27)
+
+**Context:** D11 permits one two-tower attempt after ALS, gated strictly on beating
+ALS's 0.2519 recall@500. The architecture already selected PyTorch, a small MLP per
+tower, 64-D outputs, and sampled-softmax; the remaining choices had to resolve
+temporal inputs and negative-sampling bias without becoming a tuning sprint.
+
+**Fixed design, no sweep:** learned 32-D user/item ID embeddings; user tower adds
+`u_reviews_to_date`, `u_mean_stars_to_date`, and `u_days_since_last`, all read
+right-exclusively at the positive event timestamp; item tower adds category
+multi-hot, location, and price from the D21 quasi-static dimension. Each side uses
+a 128-unit ReLU MLP and emits an L2-normalized 64-D vector. Five deterministic CPU
+epochs optimize sampled-softmax over in-batch items plus 128 uniform full-catalog
+negatives. A mixture logQ correction addresses popularity-biased in-batch sampling;
+the complete pre-T CSR history masks known positives from the denominator.
+
+**Temporal choice:** item aggregates were deliberately excluded. An item's value
+as-of its own row can be from the future relative to another row for which it serves
+as an in-batch negative (I21). Quasi-static item inputs make the shared item vector
+valid for every query timestamp. User aggregates remain point-in-time because each
+user vector belongs only to its own row.
+
+**Result:** two-tower recall@500 is **0.2399**, below ALS at **0.2519**. It also
+loses at recall@10 (0.0192 vs 0.0350) and NDCG@10 (0.0141 vs 0.0269). At @500,
+14,065 target pairs are found by both, 10,706 only by the two-tower, 10,944 only by
+ALS, and 53,804 by neither. Exact retrieval p99 is comparable (0.861ms two-tower,
+0.967ms ALS), so latency cannot rescue the quality loss.
+
+**Choice:** do not land it. ALS remains the Redis/FastAPI embedding and no
+two-tower-conditioned ranker is trained—the candidate source did not pass its own
+gate. Keep the deterministic training/evaluation path and versioned rejected
+artifacts runnable and inspectable; do not tune, mine hard negatives, or run
+ablations. PyTorch remains isolated to the explicitly attempted 5b offline stage.

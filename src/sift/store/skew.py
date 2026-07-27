@@ -19,7 +19,11 @@ from pathlib import Path
 import duckdb
 
 from sift.config import sql_path
-from sift.features.definitions import feature_names
+from sift.features.definitions import (
+    USER_BEHAVIORAL_EMBEDDING,
+    feature_names,
+    get_embedding,
+)
 from sift.offline.dim_business import DIM_BUSINESS
 from sift.store.materialize import HISTORICAL_DIR, state_path
 from sift.store.online import FeatureQuery, OnlineFeatureStore
@@ -61,6 +65,7 @@ def check_skew(
     sample_size: int = 100,
     historical_dir: Path = HISTORICAL_DIR,
     dim_file: Path = DIM_BUSINESS,
+    user_embedding_file: Path | None = None,
 ) -> SkewReport:
     """Compare all registered features for deterministic sampled entity pairs."""
     if sample_size < 1:
@@ -80,11 +85,15 @@ def check_skew(
         source_max_ts = max_row[0]
         assert isinstance(source_max_ts, datetime)
         offline_as_of = source_max_ts + timedelta(microseconds=1)
+        user_source = (
+            user_embedding_file
+            if user_embedding_file is not None
+            else state_path("user", historical_dir)
+        )
         users = [
             str(row[0])
             for row in con.execute(
-                f"SELECT DISTINCT user_id FROM read_parquet("
-                f"{sql_path(state_path('user', historical_dir))}) "
+                f"SELECT DISTINCT user_id FROM read_parquet({sql_path(user_source)}) "
                 "ORDER BY hash(user_id), user_id LIMIT ?",
                 [sample_size],
             ).fetchall()
@@ -108,6 +117,17 @@ def check_skew(
             [(q.query_id, q.user_id, q.business_id, offline_as_of) for q in queries],
         )
         offline = read_features(con)
+        offline_embeddings: dict[str, list[float]] = {}
+        if user_embedding_file is not None:
+            offline_embeddings = {
+                str(user_id): [float(component) for component in vector]
+                for user_id, vector in con.execute(
+                    f"SELECT user_id, value FROM read_parquet("
+                    f"{sql_path(user_embedding_file)}) "
+                    "WHERE user_id IN (SELECT unnest(?::VARCHAR[]))",
+                    [users],
+                ).fetchall()
+            }
     finally:
         con.close()
 
@@ -129,9 +149,27 @@ def check_skew(
                         online=online_row[index],
                     )
                 )
+    embedding_values = 0
+    if user_embedding_file is not None:
+        definition = get_embedding(USER_BEHAVIORAL_EMBEDDING)
+        for query in queries:
+            expected = offline_embeddings[query.user_id]
+            actual = store.lookup_user_embedding(query.user_id, definition.name)
+            for index, expected_value in enumerate(expected):
+                embedding_values += 1
+                actual_value = None if actual is None else actual[index]
+                if not _equal(expected_value, actual_value):
+                    mismatches.append(
+                        SkewMismatch(
+                            query_id=query.query_id,
+                            feature=f"{definition.name}[{index}]",
+                            offline=expected_value,
+                            online=actual_value,
+                        )
+                    )
     return SkewReport(
         sampled_pairs=len(queries),
-        compared_values=len(queries) * len(names),
+        compared_values=len(queries) * len(names) + embedding_values,
         offline_as_of=offline_as_of,
         online_as_of=manifest.as_of,
         mismatches=tuple(mismatches),
@@ -142,7 +180,11 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--sample-size", type=int, default=100)
     args = parser.parse_args()
-    report = check_skew(OnlineFeatureStore(), sample_size=args.sample_size)
+    report = check_skew(
+        OnlineFeatureStore(),
+        sample_size=args.sample_size,
+        user_embedding_file=get_embedding(USER_BEHAVIORAL_EMBEDDING).artifact,
+    )
     print(f"sampled {report.sampled_pairs} pairs / {report.compared_values} feature values")
     if report.offline_as_of != report.online_as_of:
         print(

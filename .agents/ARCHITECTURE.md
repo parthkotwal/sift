@@ -21,7 +21,8 @@ What it is *not*: a model-experimentation project (no tuning sprints, no ablatio
 request: user_id, location
     │
     ▼
- RETRIEVAL    150K → ~500    ANN search over embeddings,          metric: recall@500
+ RETRIEVAL    14.6K → ~500   exact search over ALS embeddings;   metric: recall@500
+                              ANN is the measured scale-up seam
     │                        unioned with cheap heuristics
     │                        (popular nearby, category match)
     ▼
@@ -34,7 +35,12 @@ request: user_id, location
 response: 10 businesses      end-to-end p99 < 100ms
 ```
 
-**Retrieval** narrows the full catalog to ~500 candidates: approximate-nearest-neighbor search (FAISS or hnswlib) over item embeddings against the user's embedding, unioned with heuristic sources — popular-nearby and category-match-on-history. The union matters: each source's *marginal* contribution is measured (what fraction of eventual hits came only from that source), so no source rides for free.
+**Retrieval** narrows the full catalog to ~500 candidates by dot product over ALS
+user/item embeddings. The current Philadelphia catalog is 14,568 items, where
+exact NumPy scoring is ~1ms p99 and lossless; HNSW failed its 0.99 exact-overlap
+gate before it could earn the dependency (D25). ANN remains the same index
+interface's scale-up option. Heuristic sources may be unioned later, with marginal
+hit contribution measured so no source rides for free.
 
 **Ranking** scores those ~500 with a gradient-boosted model over features the retrieval stage can't afford: distance, category affinity, review velocity, rating trend, price match, plus which retrieval source produced the candidate. Cuts to 50.
 
@@ -48,7 +54,8 @@ A batch job (plain scheduled scripts — no orchestrator, a deliberate cut, `DEC
 
 1. Builds training examples from the review log with **point-in-time-correct** features (positives from real events, negatives sampled — see below).
 2. Trains the retrieval embedding model and the LightGBM ranker on a temporal split (train before date T, evaluate after) that is **frozen in build step 1 and never touched again**.
-3. Exports item embeddings and rebuilds the ANN index.
+3. Exports item embeddings and validates the retrieval index against exact search;
+   the current index is exact, with ANN deferred until catalog scale makes it pay.
 4. Materializes features to both stores (historical → Parquet, current → Redis).
 
 Raw-data hygiene from the earlier framing survives underneath: raw JSON lands immutably as date-partitioned Parquet, and one canonical event table (`user_id, entity_id, event_type, ts, payload` — `DECISIONS.md` D2) feeds all feature computation. Offline jobs are partition-wise and idempotent (re-run = identical output).
@@ -86,8 +93,8 @@ As-of `t`, right-exclusive windows. Hazard taxonomy lives in `DATA.md`.
 ## Retrieval training and eval
 
 - **Step one is ALS, not a neural net** (`DECISIONS.md` D11): ALS factors are a two-tower without the towers — user/item vectors whose dot product predicts interaction — so the whole serving path (index, union, eval) gets built on a model the author fully owns. The learned two-tower is an *upgrade* that must beat ALS at recall@500 to land; if it doesn't, ALS ships and the system is unchanged.
-- **Two-tower, when attempted:** small MLPs per side over store-served features, dim ~64, in-batch negatives with sampled-softmax loss. Known flaw to correct or accept knowingly: in-batch negatives oversample popular items (fix: logQ correction, or mix in uniform random negatives). No hard-negative mining — that's model experimentation.
-- **Retrieval is evaluated against the full catalog** (did the ~500 contain the user's actual future interaction?), never with sampled negatives — retrieval's job is the catalog, and eval choice flips conclusions (a lesson learned the hard way). Report popularity vs. ALS vs. two-tower, plus per-source marginal contribution and index latency.
+- **Two-tower result:** the fixed v1 uses 32-D learned IDs, point-in-time user features, D21-approved static item attributes, 128-unit MLPs, and 64-D normalized outputs. Its sampled-softmax candidates combine in-batch and uniform full-catalog negatives, apply logQ, and mask known positives. It scored 0.2399 recall@500 against ALS's 0.2519, so it does not land (D26). No tuning or hard-negative follow-up: that would turn the project into model experimentation.
+- **Retrieval is evaluated against the full catalog** (did the ~500 contain the user's actual future interaction?), never with sampled negatives — retrieval's job is the catalog, and eval choice flips conclusions (a lesson learned the hard way). Report popularity vs. ALS vs. two-tower, plus per-source marginal contribution and index latency. ALS landed in D25; its candidate-conditioned LightGBM did not, so the online path currently serves ALS order directly.
 
 ## Build order — backwards, one stage at a time
 
@@ -97,13 +104,13 @@ Each step ends with something that runs end to end; nothing lands without beatin
 2. **Eval harness:** recall@k and NDCG@10 against the holdout + per-stage latency measurement. Every later change is judged against this.
 3. **Ranking stage:** hand-computed features + LightGBM, reading features straight from Parquet at request time — deliberately wrong, to isolate whether ranking helps before adding storage.
 4. **Feature store:** pull features behind definitions; materialize to Parquet and Redis; swap the service to Redis reads; land the leak test and the future-invariance test.
-5. **Retrieval stage:** 5a — ALS embeddings → ANN index, replace popularity retrieval, measure recall@500. 5b — two-tower, lands only if it beats 5a.
+5. **Retrieval stage:** 5a — ALS embeddings → measured index, replace popularity retrieval, measure recall@500. Exact search won at current scale (D25). 5b — the fixed two-tower was measured and did not beat ALS (D26); ALS remains selected.
 6. **Rerank:** filters + diversity.
 7. **Scale:** all metros; Spark for training-example generation **if and only if** candidate-pair volume warrants it (measured, not assumed).
 
 ## Stack
 
-Python · PyTorch (two-tower, step 5b only) · LightGBM · `implicit` ALS · FAISS or hnswlib · Redis (online features) · Postgres (metadata) · FastAPI · Parquet + DuckDB (offline, inspection) · Docker Compose. Deliberately small — every tool must be explainable out loud.
+Python · PyTorch (two-tower, step 5b only) · LightGBM · `implicit` ALS · NumPy exact vector search (ANN only when scale earns it) · Redis (online features) · Postgres (metadata) · FastAPI · Parquet + DuckDB (offline, inspection) · Docker Compose. Deliberately small — every tool must be explainable out loud.
 
 ## Scope
 

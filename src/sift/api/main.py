@@ -1,10 +1,4 @@
-"""FastAPI entry point for the measured online ranking path.
-
-Popularity still retrieves the candidate pool until build step 5, but the response
-is now produced by current Redis features plus the trained LightGBM ranker. Each
-response exposes per-stage timings; unlike the old offline evaluator's cached dict
-lookup, these numbers include the work a real request performs (ISSUES.md I3).
-"""
+"""FastAPI entry point for Redis-backed ALS retrieval."""
 
 from __future__ import annotations
 
@@ -14,12 +8,11 @@ from functools import lru_cache
 from typing import Annotated
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response
-from lightgbm.basic import LightGBMError
 from pydantic import BaseModel
 from redis.exceptions import RedisError
 
 from sift.config import METRO_CITY, METRO_STATE
-from sift.ranking.online import OnlineRanker
+from sift.retrieval.online import OnlineALSRetriever
 from sift.store.online import OnlineStoreUnavailable
 
 app = FastAPI(title="Sift", version="0.0.0")
@@ -66,19 +59,19 @@ class RecommendResponse(BaseModel):
 
 
 @lru_cache(maxsize=1)
-def _load_online_ranker() -> OnlineRanker:
-    return OnlineRanker.load()
+def _load_online_retriever() -> OnlineALSRetriever:
+    return OnlineALSRetriever.load()
 
 
-def get_online_ranker() -> OnlineRanker:
-    """Dependency: model, candidate source, and Redis lookup client."""
+def get_online_retriever() -> OnlineALSRetriever:
+    """Load the winning warm-user path and its explicit cold fallback."""
     try:
-        return _load_online_ranker()
-    except (FileNotFoundError, LightGBMError, RedisError, OnlineStoreUnavailable) as exc:
+        return _load_online_retriever()
+    except (FileNotFoundError, RedisError, OnlineStoreUnavailable) as exc:
         raise HTTPException(
             status_code=503,
             detail=(
-                "online ranker unavailable; build the popularity/model artifacts, "
+                "online retriever unavailable; build the popularity/ALS artifacts, "
                 "start Redis, and run `python -m sift.store.online`"
             ),
         ) from exc
@@ -93,11 +86,11 @@ def health() -> dict[str, str]:
 def recommend(
     user_id: str,
     response: Response,
-    ranker: Annotated[OnlineRanker, Depends(get_online_ranker)],
+    retriever: Annotated[OnlineALSRetriever, Depends(get_online_retriever)],
     k: Annotated[int, Query(ge=1, le=50)] = 10,
 ) -> RecommendResponse:
     try:
-        result = ranker.recommend(user_id, k)
+        result = retriever.recommend(user_id, k)
     except (RedisError, OnlineStoreUnavailable) as exc:
         raise HTTPException(status_code=503, detail="online feature store unavailable") from exc
     latency = result.latency
@@ -110,7 +103,7 @@ def recommend(
     return RecommendResponse(
         user_id=user_id,
         metro=f"{METRO_CITY}, {METRO_STATE}",
-        path="popularity retrieval -> Redis features -> LightGBM ranker",
+        path="Redis user embedding -> exact ALS retrieval (popularity cold fallback)",
         latency=LatencyBreakdown(
             retrieval_ms=latency.retrieval_ms,
             feature_lookup_ms=latency.feature_lookup_ms,

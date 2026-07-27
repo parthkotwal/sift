@@ -14,6 +14,33 @@ Format: `### <id> — <title>   [open | fixed | deferred | accepted]`
 
 ## Fixed in the current build
 
+### I21 — In-batch item features can cross temporal boundaries   [fixed]
+
+A naive two-tower batch would encode each positive item with aggregates as-of that
+item's own event. The resulting item vector is then a negative for every other row.
+For an earlier row, that vector can contain item history from its future even though
+every individual feature lookup was right-exclusive. The batch matrix creates a
+new temporal edge the per-row leak test does not express.
+
+**Fixed:** time-varying features exist only on the user/query tower. The item tower
+uses learned ID parameters plus D21's quasi-static identity attributes, so one item
+encoding is valid across all timestamps in the batch. Known user positives are also
+masked from sampled-softmax negatives. The lesson is broader: point-in-time-correct
+rows can still become time-incorrect when a training objective combines rows.
+
+### I20 — Swapping retrieval silently invalidates the ranker's training conditional   [fixed]
+
+The accepted ranker was trained only on popularity's candidate pool. Passing a
+new user's ALS top-500 through that model would violate D20 even though the feature
+schema is unchanged: candidate source is part of the model's input distribution.
+
+**Fixed:** the training-set builder now accepts a personalized candidate provider
+and tests that every positive and negative belongs to that user's pool. ALS got a
+separate training artifact and model, leaving the popularity-conditioned baseline
+runnable. The corrected model still lowered ALS NDCG@10, so it did not land; the
+API serves ALS order directly. A future candidate-source swap must retrain and
+remeasure the downstream ranker, never just change one line in serving.
+
 ### I3 — Reported ranker latency measures nothing   [fixed]
 
 `eval/run.py` times the `recommend` callable, but `ranker_recommender` precomputes

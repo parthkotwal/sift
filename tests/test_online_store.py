@@ -8,8 +8,10 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import cast
 
+import duckdb
 from redis import Redis
 
+from sift.config import sql_path
 from sift.offline.dim_business import build_dim_business
 from sift.offline.ingest import build_events
 from sift.store.materialize import materialize_historical
@@ -193,6 +195,45 @@ def test_online_lookup_matches_parquet_as_of_now(tmp_path: Path) -> None:
     assert rows[1][1:6] == (2, 4.0, 31, 1, 3.0)
     no_price = OnlineFeatureStore(_redis(fake)).lookup([FeatureQuery(3, "u3", "b3")])
     assert no_price[0][-1] is None
+
+
+def test_user_embedding_is_published_and_read_from_same_generation(tmp_path: Path) -> None:
+    historical, dim = _artifacts(tmp_path)
+    embedding_file = tmp_path / "users.parquet"
+    vector = [float(index) for index in range(64)]
+    con = duckdb.connect()
+    con.execute(
+        f"COPY (SELECT 'u1' AS user_id, ?::FLOAT[64] AS value) TO "
+        f"{sql_path(embedding_file)} (FORMAT PARQUET)",
+        [vector],
+    )
+    con.close()
+    fake = _MemoryRedis()
+    manifest = materialize_online(
+        client=_redis(fake),
+        historical_dir=historical,
+        dim_file=dim,
+        user_embedding_file=embedding_file,
+    )
+    store = OnlineFeatureStore(_redis(fake))
+    assert manifest.user_embeddings == 1
+    assert store.lookup_user_embedding("u1") == vector
+    assert store.lookup_user_embedding("cold") is None
+    generation = fake.values[ACTIVE_GENERATION_KEY]
+    key = f"{KEY_PREFIX}:{generation}:embedding:u1"
+    record = json.loads(cast(str, fake.values[key]))
+    corrupted = json.loads(record["user_embedding_behavioral_v1"])
+    corrupted[0] = -999.0
+    record["user_embedding_behavioral_v1"] = json.dumps(corrupted)
+    fake.values[key] = json.dumps(record)
+    report = check_skew(
+        store,
+        sample_size=1,
+        historical_dir=historical,
+        dim_file=dim,
+        user_embedding_file=embedding_file,
+    )
+    assert any(m.feature == "user_embedding_behavioral_v1[0]" for m in report.mismatches)
 
 
 def test_refresh_publishes_a_new_generation_and_retires_the_old(tmp_path: Path) -> None:

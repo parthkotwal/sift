@@ -7,16 +7,16 @@ requires-python = ">=3.12"
 dependencies = [
     "duckdb>=1.5.5",
     "fastapi>=0.115",
-    "hnswlib>=0.8.0",
     "implicit>=0.7.2",
     "lightgbm>=4.7.0",
     "numpy>=2.5.1",
     "redis>=5.2",
+    "torch>=2.13.0",
     "uvicorn[standard]>=0.34",
 ]
 
 [dependency-groups]
-# Dev tooling. Runtime ML deps (implicit, faiss/hnswlib, ...)
+# Dev tooling. Runtime ML deps (implicit, LightGBM, ...)
 # are added at the build step that first needs them — every dep pays rent.
 dev = [
     "ruff>=0.9",

@@ -1,4 +1,4 @@
-"""Endpoint behavior for the Redis-backed online ranker path."""
+"""Endpoint behavior for the Redis-backed online ALS path."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ from collections.abc import Iterator
 import pytest
 from fastapi.testclient import TestClient
 
-from sift.api.main import app, get_online_ranker
+from sift.api.main import app, get_online_retriever
 from sift.ranking.online import (
     OnlineRecommendation,
     RankedBusiness,
@@ -30,7 +30,7 @@ class _FakeRanker:
 
 @pytest.fixture
 def client() -> Iterator[TestClient]:
-    app.dependency_overrides[get_online_ranker] = _FakeRanker
+    app.dependency_overrides[get_online_retriever] = _FakeRanker
     yield TestClient(app)
     app.dependency_overrides.clear()
 
@@ -41,7 +41,9 @@ def test_recommend_returns_ranked_online_results(client: TestClient) -> None:
     body = resp.json()
     assert [r["business_id"] for r in body["results"]] == ["u1-b1", "u1-b2"]
     assert [r["rank"] for r in body["results"]] == [1, 2]
-    assert body["path"] == "popularity retrieval -> Redis features -> LightGBM ranker"
+    assert body["path"] == (
+        "Redis user embedding -> exact ALS retrieval (popularity cold fallback)"
+    )
 
 
 def test_recommend_exposes_real_stage_timings(client: TestClient) -> None:
