@@ -11,14 +11,15 @@ REPO_ROOT="$(git rev-parse --show-toplevel)"
 REVIEW_DIR="$REPO_ROOT/.agents/reviews"
 mkdir -p "$REVIEW_DIR"
 
-MSG="$(git log -1 --format=%B "$SHA")"
 SUBJECT="$(git log -1 --format=%s "$SHA")"
+TRAILERS="$(git log -1 --format=%B "$SHA" | git interpret-trailers --parse)"
 
 notify() {
-  osascript -e "display notification \"$2\" with title \"$1\"" >/dev/null 2>&1 || true
+  osascript -e 'on run argv' -e 'display notification (item 2 of argv) with title (item 1 of argv)' -e 'end run' \
+    -- "$1" "$2" >/dev/null 2>&1 || true
 }
 
-if echo "$MSG" | grep -qi "Co-Authored-By: Claude"; then
+if echo "$TRAILERS" | grep -qi "^Co-Authored-By: *Claude"; then
   REVIEWER="codex"
   OUT="$REVIEW_DIR/${SHA}-codex.md"
   export PATH="$HOME/.local/bin:$PATH"
@@ -30,7 +31,7 @@ if echo "$MSG" | grep -qi "Co-Authored-By: Claude"; then
     > "$REVIEW_DIR/${SHA}-codex.log" 2>&1
   notify "Codex reviewed $SHA" "$SUBJECT"
 
-elif echo "$MSG" | grep -qi "Co-Authored-By: Codex"; then
+elif echo "$TRAILERS" | grep -qi "^Co-Authored-By: *Codex"; then
   REVIEWER="claude"
   OUT="$REVIEW_DIR/${SHA}-claude.md"
   if ! command -v claude >/dev/null 2>&1; then
