@@ -11,6 +11,10 @@
 #   scripts/cross-review.sh <sha> claude  # Claude reviews commit <sha>
 #   scripts/cross-review.sh <sha>         # auto-detect via trailer (hook default)
 #   scripts/cross-review.sh               # auto-detect on HEAD
+#
+# Both reviewers are read-only: Claude's tool allowlist has no Write/Edit,
+# and Codex's `review` subcommand only ever produces a written review in
+# every observed run, even though its sandbox is workspace-write.
 set -euo pipefail
 
 SHA="${1:-$(git rev-parse HEAD)}"
@@ -33,20 +37,30 @@ notify() {
 
 run_codex_review() {
   local out="$REVIEW_DIR/${SHA}-codex.md"
+  local jsonl="$REVIEW_DIR/${SHA}-codex.jsonl"
   export PATH="$HOME/.local/bin:$PATH"
   if ! command -v codex >/dev/null 2>&1; then
     echo "cross-review: codex CLI not found, skipping review of $SHA" >&2
     return 1
   fi
   codex exec review --commit "$SHA" --title "$SUBJECT" -o "$out" \
-    -c model_reasoning_effort="medium" \
-    > "$REVIEW_DIR/${SHA}-codex.log" 2>&1
+    -c model_reasoning_effort="medium" --json \
+    > "$jsonl" 2>"$REVIEW_DIR/${SHA}-codex.log"
+
+  local usage tokens
+  usage="$(jq -c 'select(.type=="turn.completed") | .usage' "$jsonl" 2>/dev/null | tail -1)"
+  tokens="$(jq -r '(.input_tokens // 0) + (.output_tokens // 0)' <<<"${usage:-null}" 2>/dev/null || echo 0)"
+  if [ -z "${usage:-}" ] || [ "$usage" = "null" ] || [ "$tokens" = "0" ]; then
+    echo "cross-review: codex review of $SHA written to $out (tokens: n/a — codex-cli's review subcommand doesn't report usage)" >&2
+  else
+    echo "cross-review: codex review of $SHA written to $out (tokens: $usage)" >&2
+  fi
   notify "Codex reviewed $SHA" "$SUBJECT"
-  echo "cross-review: codex review of $SHA written to $out" >&2
 }
 
 run_claude_review() {
   local out="$REVIEW_DIR/${SHA}-claude.md"
+  local json="$REVIEW_DIR/${SHA}-claude.json"
   if ! command -v claude >/dev/null 2>&1; then
     echo "cross-review: claude CLI not found, skipping review of $SHA" >&2
     return 1
@@ -55,9 +69,18 @@ run_claude_review() {
     --model sonnet \
     --permission-mode dontAsk \
     --allowedTools "Read Bash(git show:*) Bash(git log:*) Bash(git diff:*) Bash(git blame:*)" \
-    > "$out" 2>"$REVIEW_DIR/${SHA}-claude.log"
+    --output-format json \
+    > "$json" 2>"$REVIEW_DIR/${SHA}-claude.log"
+
+  jq -r '.result // "(no result — see .claude.log)"' "$json" > "$out" 2>/dev/null \
+    || echo "(failed to parse claude output — see $json)" > "$out"
+
+  local input_tok output_tok cost
+  input_tok="$(jq -r '.usage.input_tokens + .usage.cache_creation_input_tokens + .usage.cache_read_input_tokens' "$json" 2>/dev/null || echo 0)"
+  output_tok="$(jq -r '.usage.output_tokens' "$json" 2>/dev/null || echo 0)"
+  cost="$(jq -r '.total_cost_usd' "$json" 2>/dev/null || echo 0)"
+  echo "cross-review: claude review of $SHA written to $out (tokens: ${input_tok:-0} in / ${output_tok:-0} out, cost: \$${cost:-0})" >&2
   notify "Claude reviewed $SHA" "$SUBJECT"
-  echo "cross-review: claude review of $SHA written to $out" >&2
 }
 
 case "$FORCE_REVIEWER" in
