@@ -28,6 +28,7 @@ if echo "$TRAILERS" | grep -qi "^Co-Authored-By: *Claude"; then
     exit 0
   fi
   codex exec review --commit "$SHA" --title "$SUBJECT" -o "$OUT" \
+    -c model_reasoning_effort="medium" \
     > "$REVIEW_DIR/${SHA}-codex.log" 2>&1
   notify "Codex reviewed $SHA" "$SUBJECT"
 
@@ -39,6 +40,7 @@ elif echo "$TRAILERS" | grep -qi "^Co-Authored-By: *Codex"; then
     exit 0
   fi
   claude -p "Review the changes introduced by commit $SHA in this git repository (subject: \"$SUBJECT\"). Run 'git show $SHA' to see the full diff. Write a concise review: a 1-2 sentence summary, then specific, actionable findings with file:line references, ranked most severe first. If nothing significant, say so briefly. Do not modify any files." \
+    --model sonnet \
     --permission-mode dontAsk \
     --allowedTools "Read Bash(git show:*) Bash(git log:*) Bash(git diff:*) Bash(git blame:*)" \
     > "$OUT" 2>"$REVIEW_DIR/${SHA}-claude.log"
