@@ -12,9 +12,9 @@ Format: `### <id> — <title>   [open | fixed | deferred | accepted]`
 
 ---
 
-## Open
+## Fixed in the current build
 
-### I3 — Reported ranker latency measures nothing   [open]
+### I3 — Reported ranker latency measures nothing   [fixed]
 
 `eval/run.py` times the `recommend` callable, but `ranker_recommender` precomputes
 every user's list *before* `evaluate` runs, so the timed callable is a dict lookup.
@@ -26,11 +26,23 @@ the popularity baseline are currently meaningless.
 cached answer. Matters because "measure latency per stage" is a stated project rule
 and the <100ms p99 budget is a headline claim.
 
-### I4 — `libomp` is an uncaptured system dependency   [open]
+**Fixed (2026-07-26):** offline ranker evaluation now explicitly suppresses latency
+for its precomputed-list closure, so it cannot publish a dict lookup as serving
+latency. The Redis-backed `OnlineRanker` measures retrieval, feature lookup, model
+inference, overhead, and total around the real per-request work; the API exposes the
+same breakdown and `python -m sift.ranking.online` reports p50/p95/p99 over sampled
+users. Metric evaluation and serving latency are now deliberately separate runs.
+
+### I4 — `libomp` is an uncaptured system dependency   [fixed]
 
 LightGBM needs `brew install libomp` on macOS. Not expressible in `pyproject`/
 `uv.lock`, so a clean machine fails at import with no guidance. Note it in the
 README's setup section or a bootstrap script before anyone else clones this.
+
+**Fixed (2026-07-26):** the README's local setup now states the macOS `libomp`
+requirement next to `uv sync`.
+
+## Open
 
 ### I5 — Repeats vs. the already-reviewed rerank filter   [deferred to build step 6]
 
@@ -55,6 +67,19 @@ signal. Revisit once the ranker has real score resolution.
 ---
 
 ## Fixed — kept because the failure mode recurs
+
+### I19 — Online decoding assumed a nullable aggregate was present   [fixed]
+
+The first real Redis-vs-Parquet skew run failed before it could compare values:
+the lookup decoder indexed `cum_price` as required, but Redis correctly omitted the
+field when a user's entire history had unknown price tiers. The synthetic online
+fixture gave every user at least one priced business, so it passed for the wrong
+reason — another I1/I8-shaped fixture gap where the absence case was not represented.
+
+**Fixed** by decoding nullable cumulative sums as `None`, which becomes SQL `NULL`
+before the shared definition is evaluated, and by adding a user whose only business
+has no price. The important positive result is that the real skew check caught this
+at the store boundary before the API path was treated as valid.
 
 ### I18 — The training artifact was not byte-reproducible (float-sum association)   [fixed]
 

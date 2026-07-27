@@ -22,6 +22,7 @@ from types import ModuleType
 import pytest
 
 import sift.offline.training_set
+import sift.ranking.online
 import sift.ranking.rank
 import sift.ranking.train
 import sift.store.read
@@ -30,6 +31,7 @@ import sift.store.read
 CONSUMERS: tuple[ModuleType, ...] = (
     sift.offline.training_set,
     sift.ranking.rank,
+    sift.ranking.online,
     sift.ranking.train,
 )
 
@@ -83,5 +85,7 @@ def test_feature_reads_go_through_the_store() -> None:
         if "feature" not in source.lower():
             continue
         assert (
-            "sift.store.read" in source or "sift.features.definitions" in source
+            "sift.store.read" in source
+            or "sift.store.online" in source
+            or "sift.features.definitions" in source
         ), f"{module.__name__} touches features without going through the store"

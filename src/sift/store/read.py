@@ -134,6 +134,63 @@ uc AS (
     )
 
 
+def current_feature_query(
+    features: Sequence[str] | None = None,
+    queries: str = "queries",
+    *,
+    user_state: str = "user_current",
+    item_state: str = "item_current",
+    user_category_state: str = "user_category_current",
+    dim: str = "business_current",
+) -> str:
+    """SQL projecting current Redis state through the registered expressions.
+
+    Redis has already selected the last state row per entity, so these are ordinary
+    identity joins rather than temporal joins. The feature expressions are exactly
+    the same ones used by :func:`asof_feature_query`; only the way their input aliases
+    are populated differs. Keeping both assemblers here makes this module the single
+    feature-read chokepoint for training and serving.
+    """
+    names = tuple(features) if features is not None else defs.feature_names()
+    for name in names:
+        defs.get(name)
+    groups = defs.required_groups(names)
+
+    ctes: list[str] = []
+    joins: list[str] = []
+    if "user" in groups:
+        joins.append(f"LEFT JOIN {user_state} u ON q.user_id = u.user_id")
+    if "item" in groups:
+        joins.append(f"LEFT JOIN {item_state} i ON q.business_id = i.business_id")
+    if "user_category" in groups:
+        ctes.append(
+            f"""dim_cat AS (
+    SELECT business_id, unnest(categories) AS category FROM {dim}
+),
+query_cat AS (
+    SELECT q.query_id, q.user_id, c.category
+    FROM {queries} q JOIN dim_cat c ON q.business_id = c.business_id
+),
+uc AS (
+    SELECT qc.query_id, sum(COALESCE(t.cum_count, 0)) AS matched
+    FROM query_cat qc
+    LEFT JOIN {user_category_state} t
+        ON qc.user_id = t.user_id AND qc.category = t.category
+    GROUP BY qc.query_id
+)"""
+        )
+        joins.append("LEFT JOIN uc ON q.query_id = uc.query_id")
+    if "business" in groups:
+        joins.append(f"LEFT JOIN {dim} b ON q.business_id = b.business_id")
+
+    projection = ",\n    ".join(f"{defs.get(name).expr} AS {name}" for name in names)
+    with_clause = "WITH " + ",\n".join(ctes) + "\n" if ctes else ""
+    return (
+        f"{with_clause}SELECT q.query_id,\n    {projection}\n"
+        f"FROM {queries} q\n" + "\n".join(joins) + "\nORDER BY q.query_id"
+    )
+
+
 def read_features(
     con: duckdb.DuckDBPyConnection,
     features: Sequence[str] | None = None,
@@ -141,6 +198,15 @@ def read_features(
 ) -> list[tuple[object, ...]]:
     """Run the read path; rows are (query_id, *features)."""
     return con.execute(asof_feature_query(features, queries)).fetchall()
+
+
+def read_current_features(
+    con: duckdb.DuckDBPyConnection,
+    features: Sequence[str] | None = None,
+    queries: str = "queries",
+) -> list[tuple[object, ...]]:
+    """Project current state; rows are ``(query_id, *features)``."""
+    return con.execute(current_feature_query(features, queries)).fetchall()
 
 
 def get_asof(

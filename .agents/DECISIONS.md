@@ -171,3 +171,30 @@ Plain partitioned Parquet; no Iceberg/Delta. Unchanged by the reframe — even m
 **Consequent design — everything is an expression over materialised state.** A definition declares `name, entity, dtype, version, reads, expr, leakage`, where `reads` names the state groups the expression consumes (`user`, `item`, `user_category`, `business`) and `expr` is SQL over their aliased columns. This unifies the two cases: `u_reviews_to_date` is an expression over one group's state, `ui_distance_km` an expression over two. The state groups are the unit of *compute and storage*; definitions are the unit of *reference and versioning*, which is how consumers bind (D12).
 **The leakage argument becomes a required field.** AGENTS.md mandates a one-line "why can't this contain the future?" per feature; making it a non-defaulted dataclass field means a definition cannot be registered without one, and a test asserts none are empty. A documentation rule turned into a structural one.
 **Cost accepted:** the read path is now an assembled query rather than a hand-written one, so a malformed `expr` fails at SQL-compile time rather than in Python. Mitigated by the registry test suite compiling every definition against a synthetic fixture.
+
+## D24 — Redis publishes generation-scoped current state behind one pointer   [accepted] (2026-07-26)
+
+**Context:** Build step 4's online materialisation writes hundreds of thousands of
+entity records. Updating stable keys in place would let a request observe a mixed
+snapshot — new user state with old item state — even though each individual Redis
+command is atomic. The online representation also has to preserve D23: entity state
+is stored; `user x item` values are derived rather than materialised as a cross product.
+**Options:** (a) overwrite stable records in place; (b) write a fresh generation and
+atomically switch an active-generation pointer; (c) use Redis logical databases and
+`SWAPDB`.
+**Choice:** (b). User and item latest rows are individual JSON records; a user's
+current category vector is one record (category → cumulative count); business
+identity state is one record. A lookup resolves the generation once, bulk-fetches
+the required records with `MGET`, and projects them through the same registry SQL
+expressions as the historical reader.
+The old generation receives a one-hour TTL after publication so in-flight readers
+can finish.
+**Why:** (a) violates snapshot consistency. (c) makes Sift own whole Redis databases,
+which is unsafe in a shared local instance and hides the key schema. The generation
+pointer makes the publication boundary inspectable and atomic while keeping keys
+namespaced. Redis earns its dependency by replacing the measured ~41-second Parquet
+cross product with batched current-state lookups; Docker Compose captures the new
+runtime requirement.
+**Cost accepted:** online projection still invokes DuckDB so the registry's SQL text
+remains the single feature definition. This may consume part of the 20ms lookup
+budget; the new per-stage benchmark measures that cost before any optimization.

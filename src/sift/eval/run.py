@@ -40,8 +40,9 @@ class EvalReport:
         for k in sorted(self.recall):
             lines.append(f"  recall@{k:<4} {self.recall[k]:.4f}")
         lines.append(f"  NDCG@{NDCG_K}    {self.ndcg_at_10:.4f}")
-        lat = " ".join(f"{name}={value:.3f}ms" for name, value in self.latency_ms.items())
-        lines.append(f"  retrieval latency: {lat}")
+        if self.latency_ms:
+            lat = " ".join(f"{name}={value:.3f}ms" for name, value in self.latency_ms.items())
+            lines.append(f"  recommender-call latency: {lat}")
         return "\n".join(lines)
 
 
@@ -50,17 +51,24 @@ def evaluate(
     ground_truth: Mapping[str, set[str]],
     name: str,
     ks: Sequence[int] = DEFAULT_KS,
+    *,
+    measure_latency: bool = True,
 ) -> EvalReport:
-    """Macro-average: every user counts equally, regardless of activity level."""
+    """Macro-average: every user counts equally, regardless of activity level.
+
+    ``measure_latency=False`` is required for a recommender backed by precomputed
+    lists: timing that closure would measure a dict lookup, not serving work (I3).
+    """
     max_k = max(ks)
     recall_totals = dict.fromkeys(ks, 0.0)
     ndcg_total = 0.0
     latencies: list[float] = []
 
     for user_id, relevant in ground_truth.items():
-        start = time.perf_counter()
+        start = time.perf_counter() if measure_latency else 0.0
         recommended = recommend(user_id, max_k)
-        latencies.append((time.perf_counter() - start) * 1000.0)
+        if measure_latency:
+            latencies.append((time.perf_counter() - start) * 1000.0)
         for k in ks:
             recall_totals[k] += recall_at_k(recommended, relevant, k)
         ndcg_total += ndcg_at_k(recommended, relevant, NDCG_K)
@@ -71,11 +79,15 @@ def evaluate(
         n_users=n,
         recall={k: recall_totals[k] / n for k in ks} if n else dict.fromkeys(ks, 0.0),
         ndcg_at_10=ndcg_total / n if n else 0.0,
-        latency_ms={
-            "p50": percentile(latencies, 50),
-            "p95": percentile(latencies, 95),
-            "p99": percentile(latencies, 99),
-        },
+        latency_ms=(
+            {
+                "p50": percentile(latencies, 50),
+                "p95": percentile(latencies, 95),
+                "p99": percentile(latencies, 99),
+            }
+            if measure_latency
+            else {}
+        ),
     )
 
 

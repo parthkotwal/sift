@@ -66,6 +66,13 @@ A living study guide. Each entry: what the idea is, why Sift needs it, and the q
 
 **Here:** The feature store's reason to exist: one *definition*, materialized to Parquet (historical, as-of) and Redis (current). Plus a recurring check comparing the two for sampled entities. Corollary rule: a signal that's legitimate online but unconstructible historically (`is_open`) is skew by definition → serving-time filter, never a feature (D13).
 
+The Redis refresh is a snapshot publication, not a stream of independently visible
+record updates: a complete generation is written under new keys, then one active-
+generation pointer is changed atomically. A request resolves that pointer once, so
+it cannot combine half-old user state with half-new item state. Old generations live
+for a grace period so an in-flight reader that resolved the previous pointer can
+finish safely.
+
 **Own it:** *Give one concrete way skew arises even when both paths are "correct," and how one-definition-two-materializations prevents it.*
 
 ## Feature store

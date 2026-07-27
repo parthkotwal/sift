@@ -1,25 +1,44 @@
-"""FastAPI application entry point.
+"""FastAPI entry point for the measured online ranking path.
 
-Build step 1 — the dumb path. `/recommend` returns the metro's most-reviewed
-businesses (pre-split popularity), the same list for every user. That user-
-independence is the baseline's defining weakness and the entire point: it is the
-floor every later stage (retrieval, ranking) must beat on the frozen eval.
-
-Serving reads the artifact written by `sift.offline.popularity` — one source of
-truth shared with the offline job, so online and offline can't disagree.
+Popularity still retrieves the candidate pool until build step 5, but the response
+is now produced by current Redis features plus the trained LightGBM ranker. Each
+response exposes per-stage timings; unlike the old offline evaluator's cached dict
+lookup, these numbers include the work a real request performs (ISSUES.md I3).
 """
 
 from __future__ import annotations
 
+import time
+from collections.abc import Awaitable, Callable
+from functools import lru_cache
 from typing import Annotated
 
-from fastapi import Depends, FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response
+from lightgbm.basic import LightGBMError
 from pydantic import BaseModel
+from redis.exceptions import RedisError
 
 from sift.config import METRO_CITY, METRO_STATE
-from sift.offline.popularity import PopularityEntry, load_ranking
+from sift.ranking.online import OnlineRanker
+from sift.store.online import OnlineStoreUnavailable
 
 app = FastAPI(title="Sift", version="0.0.0")
+
+
+@app.middleware("http")
+async def add_app_timing(
+    request: Request,
+    call_next: Callable[[Request], Awaitable[Response]],
+) -> Response:
+    """Expose app-level time, including routing and response serialization."""
+    started = time.perf_counter()
+    response = await call_next(request)
+    app_ms = (time.perf_counter() - started) * 1_000
+    stages = response.headers.get("Server-Timing")
+    response.headers["Server-Timing"] = (
+        f"{stages}, app;dur={app_ms:.3f}" if stages else f"app;dur={app_ms:.3f}"
+    )
+    return response
 
 
 class Recommendation(BaseModel):
@@ -27,23 +46,41 @@ class Recommendation(BaseModel):
     business_id: str
     name: str
     pre_t_reviews: int
+    score: float
+
+
+class LatencyBreakdown(BaseModel):
+    retrieval_ms: float
+    feature_lookup_ms: float
+    ranking_ms: float
+    overhead_ms: float
+    total_ms: float
 
 
 class RecommendResponse(BaseModel):
     user_id: str
     metro: str
-    baseline: str
+    path: str
+    latency: LatencyBreakdown
     results: list[Recommendation]
 
 
-def get_ranking() -> list[PopularityEntry]:
-    """Dependency: the popularity ranking. Overridable in tests."""
+@lru_cache(maxsize=1)
+def _load_online_ranker() -> OnlineRanker:
+    return OnlineRanker.load()
+
+
+def get_online_ranker() -> OnlineRanker:
+    """Dependency: model, candidate source, and Redis lookup client."""
     try:
-        return load_ranking()
-    except FileNotFoundError as exc:
+        return _load_online_ranker()
+    except (FileNotFoundError, LightGBMError, RedisError, OnlineStoreUnavailable) as exc:
         raise HTTPException(
             status_code=503,
-            detail="popularity artifact not built; run `python -m sift.offline.popularity`",
+            detail=(
+                "online ranker unavailable; build the popularity/model artifacts, "
+                "start Redis, and run `python -m sift.store.online`"
+            ),
         ) from exc
 
 
@@ -55,23 +92,40 @@ def health() -> dict[str, str]:
 @app.get("/recommend")
 def recommend(
     user_id: str,
-    ranking: Annotated[list[PopularityEntry], Depends(get_ranking)],
-    k: Annotated[int, Query(ge=1, le=500)] = 10,
+    response: Response,
+    ranker: Annotated[OnlineRanker, Depends(get_online_ranker)],
+    k: Annotated[int, Query(ge=1, le=50)] = 10,
 ) -> RecommendResponse:
-    # user_id is accepted but ignored: the popularity baseline is identical for
-    # everyone. When retrieval (step 5) lands, the response becomes user-specific.
-    top = ranking[:k]
+    try:
+        result = ranker.recommend(user_id, k)
+    except (RedisError, OnlineStoreUnavailable) as exc:
+        raise HTTPException(status_code=503, detail="online feature store unavailable") from exc
+    latency = result.latency
+    response.headers["Server-Timing"] = (
+        f"retrieval;dur={latency.retrieval_ms:.3f}, "
+        f"features;dur={latency.feature_lookup_ms:.3f}, "
+        f"ranking;dur={latency.ranking_ms:.3f}, "
+        f"total;dur={latency.total_ms:.3f}"
+    )
     return RecommendResponse(
         user_id=user_id,
         metro=f"{METRO_CITY}, {METRO_STATE}",
-        baseline="popularity (pre-T review count)",
+        path="popularity retrieval -> Redis features -> LightGBM ranker",
+        latency=LatencyBreakdown(
+            retrieval_ms=latency.retrieval_ms,
+            feature_lookup_ms=latency.feature_lookup_ms,
+            ranking_ms=latency.ranking_ms,
+            overhead_ms=latency.overhead_ms,
+            total_ms=latency.total_ms,
+        ),
         results=[
             Recommendation(
-                rank=i,
-                business_id=e.business_id,
-                name=e.name,
-                pre_t_reviews=e.pre_t_reviews,
+                rank=index,
+                business_id=entry.business_id,
+                name=entry.name,
+                pre_t_reviews=entry.pre_t_reviews,
+                score=entry.score,
             )
-            for i, e in enumerate(top, start=1)
+            for index, entry in enumerate(result.results, start=1)
         ],
     )

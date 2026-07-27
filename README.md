@@ -29,3 +29,31 @@ Offline, a batch job builds point-in-time-correct training examples from the rev
 ## Build order
 
 Backwards, one stage at a time: dumb popularity baseline end-to-end first, then the eval harness, then ranking, then the feature store, then learned retrieval (ALS first; a two-tower lands only if it beats ALS at recall@500), then rerank, then scale. Nothing lands without beating the thing before it.
+
+## Run locally
+
+Python dependencies are locked with `uv`. LightGBM also requires OpenMP on macOS
+(`brew install libomp`). Redis is deliberately ephemeral: Parquet is the source of
+truth, and the online store is a rebuildable serving materialization.
+
+```bash
+uv sync
+docker compose up -d redis
+uv run python -m sift.store.materialize   # historical timelines -> Parquet
+uv run python -m sift.store.online        # latest entity state -> Redis
+uv run python -m sift.store.skew           # Redis == Parquet as-of-now
+uv run uvicorn sift.api.main:app --reload
+```
+
+`GET /recommend?user_id=<id>&k=10` runs popularity retrieval → Redis feature
+lookup → LightGBM ranking and returns a per-stage latency breakdown. The popularity
+artifact is still the retrieval source until the ALS stage replaces it; Redis
+removes Parquet feature computation from the request path.
+
+For a latency distribution rather than one request:
+
+```bash
+uv run python -m sift.ranking.online --samples 100
+```
+
+Set `SIFT_REDIS_URL` to use a non-default Redis endpoint.

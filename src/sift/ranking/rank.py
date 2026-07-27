@@ -39,7 +39,7 @@ import numpy as np
 
 from sift.config import SPLIT_T
 from sift.eval.holdout import load_ground_truth
-from sift.eval.run import Recommender, evaluate, popularity_recommender
+from sift.eval.run import evaluate, popularity_recommender
 from sift.features.definitions import feature_names
 from sift.offline.dim_business import DIM_BUSINESS
 from sift.offline.popularity import load_ranking
@@ -114,16 +114,6 @@ def reranked_lists(
     return lists
 
 
-def ranker_recommender(model: lgb.Booster, ground_truth_users: Sequence[str]) -> Recommender:
-    pool = [entry.business_id for entry in load_ranking()[:SERVING_POOL]]
-    lists = reranked_lists(model, ground_truth_users, pool, str(SPLIT_T), progress=True)
-
-    def recommend(user_id: str, k: int) -> Sequence[str]:
-        return lists.get(user_id, pool)[:k]
-
-    return recommend
-
-
 def _resolution(lists: dict[str, list[str]]) -> None:
     """How much of the ranker's output is actually personalised? A user-independent
     reordering of a user-independent baseline cannot beat it (see D20)."""
@@ -144,7 +134,12 @@ def main() -> None:
     def recommend(user_id: str, k: int) -> Sequence[str]:
         return lists.get(user_id, pool)[:k]
 
-    ranked = evaluate(recommend, ground_truth, name="popularity -> LightGBM ranker")
+    ranked = evaluate(
+        recommend,
+        ground_truth,
+        name="popularity -> LightGBM ranker",
+        measure_latency=False,
+    )
     print()
     print(baseline.render())
     print()
