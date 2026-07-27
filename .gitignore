@@ -13,3 +13,7 @@ scratch/
 
 # OS / editor
 .DS_Store
+
+# Cross-review output (scripts/cross-review.sh) — scratch notes, promote real
+# findings into .agents/ISSUES.md by hand.
+.agents/reviews/

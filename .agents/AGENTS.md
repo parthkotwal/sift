@@ -55,6 +55,7 @@ The author's prior projects all read as "web service + ML layer + async job" —
 - Python, type hints, small modules with single responsibilities. Tests assert correctness *properties* (future-invariance, idempotency, schema conformance, no-leak), not line coverage.
 - Comments state constraints the code can't show; no narration.
 - Commits are named for what changed in the system, not the code ("store: right-exclusive as-of join + invariance test" beats "fix bug").
+- End every commit message you author with a co-author trailer: `Co-Authored-By: Codex <noreply@openai.com>`. A `scripts/cross-review.sh` post-commit hook reads this trailer to decide which tool reviews which commit — Claude Code already tags its own commits the same way (`Co-Authored-By: Claude <model> <noreply@anthropic.com>`), so a commit with neither trailer is a manual, non-agent commit and gets no automatic review.
 
 ## Extensibility
 
