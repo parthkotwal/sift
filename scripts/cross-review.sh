@@ -12,14 +12,19 @@
 #   scripts/cross-review.sh <sha>         # auto-detect via trailer (hook default)
 #   scripts/cross-review.sh               # auto-detect on HEAD
 #
-# Both reviewers are read-only: Claude's tool allowlist has no Write/Edit,
-# and Codex's `review` subcommand only ever produces a written review in
-# every observed run, even though its sandbox is workspace-write.
+# Each reviewer runs inside its own throwaway `git worktree` checked out at
+# <sha> (detached HEAD, deleted when the review finishes). This is what makes
+# it safe to run while another agent is actively editing this repo: whatever
+# commands the reviewer decides to run -- grep, pytest, ls, whatever -- see
+# only the frozen, historical state of the reviewed commit, never your live
+# working tree. Neither reviewer is given Write/Edit either, so even inside
+# its own disposable copy it can only read and report, never modify.
 #
 # Every run opens the resulting .md (macOS `open`, default handler) and
 # fires a notification. To act on a review's findings, see apply-review.sh.
 #
-# Toggle automatic (hook-triggered) review on/off without touching the hook:
+# Toggle automatic (hook-triggered) review on/off without touching the hook
+# -- e.g. if you just don't want the notification/cost right now:
 #   git config sift.cross-review-enabled false   # turn off
 #   git config --unset sift.cross-review-enabled  # back to default (on)
 # This only gates the hook's auto-detect path -- an explicit
@@ -52,6 +57,18 @@ open_review() {
   open "$1" >/dev/null 2>&1 || true
 }
 
+make_worktree() {
+  local dir
+  dir="$(mktemp -d "${TMPDIR:-/tmp}/sift-review-${SHA}.XXXXXX")"
+  rmdir "$dir"  # git worktree add wants to create the leaf dir itself
+  git worktree add --detach --quiet "$dir" "$SHA" >&2
+  echo "$dir"
+}
+
+cleanup_worktree() {
+  git worktree remove --force "$1" >/dev/null 2>&1 || rm -rf "$1"
+}
+
 run_codex_review() {
   local out="$REVIEW_DIR/${SHA}-codex.md"
   local jsonl="$REVIEW_DIR/${SHA}-codex.jsonl"
@@ -60,7 +77,11 @@ run_codex_review() {
     echo "cross-review: codex CLI not found, skipping review of $SHA" >&2
     return 1
   fi
-  codex exec review --commit "$SHA" --title "$SUBJECT" -o "$out" \
+  local worktree
+  worktree="$(make_worktree)"
+  trap 'cleanup_worktree "$worktree"' RETURN
+
+  codex exec -C "$worktree" review --commit "$SHA" --title "$SUBJECT" -o "$out" \
     -c model_reasoning_effort="medium" --json \
     > "$jsonl" 2>"$REVIEW_DIR/${SHA}-codex.log"
 
@@ -83,11 +104,19 @@ run_claude_review() {
     echo "cross-review: claude CLI not found, skipping review of $SHA" >&2
     return 1
   fi
-  claude -p "Review the changes introduced by commit $SHA in this git repository (subject: \"$SUBJECT\"). Run 'git show $SHA' to see the full diff. Write a concise review: a 1-2 sentence summary, then specific, actionable findings with file:line references, ranked most severe first. If nothing significant, say so briefly. Do not modify any files." \
+  local worktree
+  worktree="$(make_worktree)"
+  trap 'cleanup_worktree "$worktree"' RETURN
+
+  # Isolated to its own worktree now, so this can safely have full Bash/Read
+  # (to grep, run tests, etc., matching what Codex's review does) -- only
+  # Write/Edit stay blocked, since a review should never modify, even its
+  # own disposable copy.
+  (cd "$worktree" && claude -p "Review the changes introduced by commit $SHA in this git repository (subject: \"$SUBJECT\"). Run 'git show $SHA' to see the full diff; feel free to run tests or grep around this checkout for context. Write a concise review: a 1-2 sentence summary, then specific, actionable findings with file:line references, ranked most severe first. If nothing significant, say so briefly. Do not modify any files." \
     --model sonnet \
     --permission-mode dontAsk \
-    --allowedTools "Read Bash(git show:*) Bash(git log:*) Bash(git diff:*) Bash(git blame:*)" \
-    --output-format json \
+    --disallowedTools "Write Edit" \
+    --output-format json) \
     > "$json" 2>"$REVIEW_DIR/${SHA}-claude.log"
 
   jq -r '.result // "(no result — see .claude.log)"' "$json" > "$out" 2>/dev/null \
