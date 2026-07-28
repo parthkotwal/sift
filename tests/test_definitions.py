@@ -76,9 +76,11 @@ def test_required_groups_is_the_union_of_what_is_asked_for() -> None:
     assert defs.required_groups() == {
         "user", "item", "user_category", "business", "user_als", "item_als",
     }
-    # Servable-online is the subset whose state the publisher emits (I25).
-    assert "ui_als_score" not in defs.online_features()
-    assert set(defs.online_features()) < set(defs.feature_names())
+    # Servable-online is the subset whose state the publisher emits. Every group is
+    # published now, so the two lists agree — the assertion is that servability is
+    # *derived* from the publisher's groups rather than maintained by hand.
+    assert set(defs.online_features()) == set(defs.feature_names())
+    assert set(defs.required_groups()) == set(defs.ONLINE_STATE_GROUPS)
 
 
 def _fixture() -> duckdb.DuckDBPyConnection:

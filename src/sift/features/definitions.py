@@ -281,11 +281,17 @@ def get_embedding(name: str) -> EmbeddingDefinition:
         ) from None
 
 
-# State groups the Redis publisher materialises. The ALS slice groups (D27) are not
-# among them: their vectors are large, per-slice, and only the newest slice matters
-# online, so publishing them is its own build step gated on `ui_als_score` actually
-# landing (ISSUES.md I25).
-ONLINE_STATE_GROUPS: tuple[str, ...] = ("user", "item", "user_category", "business")
+# State groups the Redis publisher materialises. The ALS slice groups joined this
+# list once `ui_als_score` earned its place (D27): only the newest slice is
+# published, since serving has one "now".
+ONLINE_STATE_GROUPS: tuple[str, ...] = (
+    "user",
+    "item",
+    "user_category",
+    "business",
+    "user_als",
+    "item_als",
+)
 
 
 def online_features() -> tuple[str, ...]:

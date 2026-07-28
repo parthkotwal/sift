@@ -40,14 +40,14 @@ from sift.features.definitions import (
     online_features,
 )
 from sift.offline.dim_business import DIM_BUSINESS
-from sift.store.materialize import HISTORICAL_DIR
+from sift.store.materialize import HISTORICAL_DIR, state_path
 from sift.store.read import attach_store, read_current_features
 
 DEFAULT_REDIS_URL = "redis://localhost:6379/0"
 KEY_PREFIX = "sift:online"
 ACTIVE_GENERATION_KEY = f"{KEY_PREFIX}:active"
 GENERATION_INDEX_KEY = f"{KEY_PREFIX}:generations"
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 PIPELINE_SIZE = 1_000
 OLD_GENERATION_TTL_SECONDS = 3_600
 
@@ -73,6 +73,8 @@ class OnlineManifest:
     businesses: int
     user_embeddings: int = 0
     embeddings: tuple[tuple[str, int], ...] = ()
+    user_als: int = 0
+    item_als: int = 0
 
 
 def redis_client(url: str | None = None) -> Redis:
@@ -197,6 +199,8 @@ def materialize_online(
         "user_categories": 0,
         "businesses": 0,
         "user_embeddings": 0,
+        "user_als": 0,
+        "item_als": 0,
     }
     pipe = store.pipeline(transaction=False)
     pending = 0
@@ -291,6 +295,23 @@ def materialize_online(
                 write_record(_key(generation, "business", str(business_id)), values)
                 counts["businesses"] += 1
 
+        # ALS slice state (D27). Only the newest slice matters online: `_last_rows`
+        # picks it per entity, which is the same row the offline as-of read selects
+        # for a query at serving "now", so the skew check compares like with like.
+        for group, key_column, counter in (
+            ("user_als", "user_id", "user_als"),
+            ("item_als", "business_id", "item_als"),
+        ):
+            if not state_path(group, historical_dir).exists():
+                continue
+            als_rows = con.execute(_last_rows(f"{group}_state", key_column))
+            while batch := als_rows.fetchmany(PIPELINE_SIZE):
+                for entity_id, ts, vector in batch:
+                    values = _mapping(ts=ts)
+                    values["value"] = json.dumps([float(v) for v in vector])
+                    write_record(_key(generation, group, str(entity_id)), values)
+                    counts[counter] += 1
+
         if user_embedding_file is not None:
             definition = get_embedding(user_embedding_name)
             embedding_rows = con.execute(
@@ -323,6 +344,8 @@ def materialize_online(
             items=counts["items"],
             user_categories=counts["user_categories"],
             businesses=counts["businesses"],
+            user_als=counts["user_als"],
+            item_als=counts["item_als"],
             definitions=json.dumps(
                 {name: get(name).version for name in online_features()}, sort_keys=True
             ),
@@ -373,6 +396,14 @@ class OnlineFeatureStore:
     """Batch lookup client: Redis fetch plus registry-expression projection."""
 
     def __init__(self, client: Redis | None = None) -> None:
+        # Item ALS vectors are identical for every request in a generation and are
+        # the largest payload in a lookup: 500 candidates x 64 floats of JSON per
+        # request took feature lookup from ~2ms to ~49ms p50, blowing the 20ms stage
+        # budget on data that never changes between requests. Cached in-process and
+        # keyed by generation, so a republish invalidates it rather than serving
+        # stale vectors. The user side stays per-request — it is one key, and it is
+        # the half that actually varies.
+        self._item_als_cache: dict[str, dict[str, dict[str, str]]] = {}
         self.client = client or redis_client()
         self._thread = local()
 
@@ -418,6 +449,8 @@ class OnlineFeatureStore:
             businesses=int(raw["businesses"]),
             user_embeddings=int(raw.get("user_embeddings", 0)),
             embeddings=tuple(sorted(raw_embeddings.items())),
+            user_als=int(raw.get("user_als", 0)),
+            item_als=int(raw.get("item_als", 0)),
         )
         self._thread.manifest = manifest
         return manifest
@@ -473,9 +506,13 @@ class OnlineFeatureStore:
         for user_id in users:
             keys.append(_key(generation, "user", user_id))
             keys.append(_key(generation, "user_category", user_id))
+            keys.append(_key(generation, "user_als", user_id))
+        item_als_cached = self._item_als_cache.get(generation)
         for business_id in businesses:
             keys.append(_key(generation, "item", business_id))
             keys.append(_key(generation, "business", business_id))
+            if item_als_cached is None:
+                keys.append(_key(generation, "item_als", business_id))
         try:
             responses = self.client.mget(keys)
         except RedisError as exc:
@@ -484,16 +521,30 @@ class OnlineFeatureStore:
         cursor = 0
         user_state: dict[str, dict[str, str]] = {}
         user_categories: dict[str, dict[str, str]] = {}
+        user_als: dict[str, dict[str, str]] = {}
         for user_id in users:
             user_state[user_id] = _decode_record(responses[cursor])
             user_categories[user_id] = _decode_record(responses[cursor + 1])
-            cursor += 2
+            user_als[user_id] = _decode_record(responses[cursor + 2])
+            cursor += 3
         item_state: dict[str, dict[str, str]] = {}
         business_state: dict[str, dict[str, str]] = {}
+        item_als: dict[str, dict[str, str]] = {}
         for business_id in businesses:
             item_state[business_id] = _decode_record(responses[cursor])
             business_state[business_id] = _decode_record(responses[cursor + 1])
             cursor += 2
+            if item_als_cached is None:
+                item_als[business_id] = _decode_record(responses[cursor])
+                cursor += 1
+        if item_als_cached is None:
+            # Only this generation's entries; a republish gets a fresh dict.
+            self._item_als_cache = {generation: item_als}
+        else:
+            item_als = {
+                business_id: item_als_cached.get(business_id, {})
+                for business_id in businesses
+            }
 
         con = self._connection()
         self._load_relations(
@@ -504,6 +555,8 @@ class OnlineFeatureStore:
             user_categories,
             item_state,
             business_state,
+            user_als,
+            item_als,
         )
         return read_current_features(con, features)
 
@@ -516,6 +569,8 @@ class OnlineFeatureStore:
         user_categories: Mapping[str, Mapping[str, str]],
         items: Mapping[str, Mapping[str, str]],
         businesses: Mapping[str, Mapping[str, str]],
+        user_als: Mapping[str, Mapping[str, str]] | None = None,
+        item_als: Mapping[str, Mapping[str, str]] | None = None,
     ) -> None:
         query_rows = [
             (query.query_id, query.user_id, query.business_id, as_of) for query in queries
@@ -604,6 +659,32 @@ class OnlineFeatureStore:
             [_rows_json(("user_id", "category", "cum_count"), category_rows)],
         )
 
+        # ALS slice vectors (D27). Redis holds the newest slice per entity, so the
+        # current path joins on identity alone — the temporal selection already
+        # happened when the snapshot was published.
+        for relation, key_column, records in (
+            ("user_als_current", "user_id", user_als or {}),
+            ("item_als_current", "business_id", item_als or {}),
+        ):
+            als_rows: list[tuple[object, ...]] = [
+                (entity_id, json.loads(state["value"]))
+                for entity_id, state in records.items()
+                if state
+            ]
+            con.execute(
+                f"CREATE OR REPLACE TABLE {relation} AS SELECT "
+                f"json_extract_string(value, '$.{key_column}') AS {key_column}, "
+                # FLOAT[], not DOUBLE[]: the offline state is FLOAT[64], and
+                # list_dot_product accumulates at the element type. Widening here
+                # would make the online path compute the same definition at higher
+                # precision and disagree with the offline one in the eighth
+                # significant digit — which the skew check duly flagged. One
+                # definition means one *type* as well as one expression.
+                "json_extract(value, '$.value')::FLOAT[] AS value "
+                "FROM json_each(?::JSON)",
+                [_rows_json((key_column, "value"), als_rows)],
+            )
+
         business_rows: list[tuple[object, ...]] = []
         for business_id, state in businesses.items():
             if state:
@@ -656,6 +737,8 @@ def main() -> None:
     print(f"  user categories  {manifest.user_categories:,}")
     print(f"  businesses       {manifest.businesses:,}")
     print(f"  user embeddings  {manifest.user_embeddings:,}")
+    print(f"  user ALS vectors {manifest.user_als:,}")
+    print(f"  item ALS vectors {manifest.item_als:,}")
 
 
 if __name__ == "__main__":

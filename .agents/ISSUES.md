@@ -117,6 +117,50 @@ requirement next to `uv sync`.
 
 ## Open
 
+### I29 — Online feature lookup now exceeds its 20ms stage budget   [open]
+
+Publishing ALS state (D27) took online feature lookup from ~2ms to **49ms p50**,
+and an in-process per-generation cache for the item vectors only brought it to
+**39ms p50 / 48ms p99**. ARCHITECTURE allocates ≤20ms to online feature lookup, so
+the stage is over budget even though end-to-end p99 (49.96ms) still fits under 100ms.
+This is the per-stage budget doing its job: an end-to-end number alone would have
+looked fine.
+
+**Where the remaining time goes.** Not Redis — the item vectors are cached. It is
+`_load_relations` rebuilding `item_als_current` every request by serialising 500
+cached vectors to JSON and reparsing them in DuckDB. The cache removed the network
+round trip but not the marshalling.
+
+**Two fixes, and they are not equivalent:**
+(a) Materialise `item_als_current` once per generation on the connection instead of
+per request. Contained, keeps the current architecture, probably gets most of the
+20ms back.
+(b) Stop recomputing the score at all. For ALS-retrieved candidates,
+`ui_als_score` *is* the score retrieval already computed to select the top-500 — the
+feature store is recomputing something the stage above just produced. Passing it
+down as a candidate attribute is the standard funnel pattern (ARCHITECTURE:84's
+"retrieval source" is the same idea), but it means one feature arrives by a
+different route than the others, which needs care: the offline training path must
+produce it identically or it becomes skew.
+
+(b) is faster and arguably more correct, but it is a design decision about how
+retrieval and ranking exchange information, not a performance patch. Raise it before
+implementing.
+
+### I30 — The API does not serve the ranker that now lands   [open]
+
+`retrieval/online.py` serves ALS order directly, and its docstring still states the
+reason: "The ALS-conditioned ranker did not beat ALS's own ordering, so it does not
+land." D27 falsified that — the ranker now beats ALS on recall@10 (+10.3%) and
+NDCG@10 (+9.3%). The docstring is stale and the API is serving the displaced model.
+
+Wiring it needs the ALS retriever to score its 500 candidates through
+`ALS_RANKER_MODEL` the way `OnlineRanker` already does for popularity, plus stage
+latency instrumentation. Gated behind I29: shipping a ranker whose feature lookup is
+2.5x over budget would trade measured quality for measured latency without deciding
+which matters more here.
+
+
 ### I25 — The online store cannot serve `ui_als_score`   [open]
 
 The Redis publisher materialises the user/item/user_category/business groups; the

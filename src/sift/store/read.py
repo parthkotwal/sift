@@ -180,6 +180,8 @@ def current_feature_query(
     item_state: str = "item_current",
     user_category_state: str = "user_category_current",
     dim: str = "business_current",
+    user_als_state: str = "user_als_current",
+    item_als_state: str = "item_als_current",
 ) -> str:
     """SQL projecting current Redis state through the registered expressions.
 
@@ -223,6 +225,19 @@ uc AS (
         joins.append("LEFT JOIN uc ON q.query_id = uc.query_id")
     if "business" in groups:
         joins.append(f"LEFT JOIN {dim} b ON q.business_id = b.business_id")
+    if "user_als" in groups or "item_als" in groups:
+        # Identity joins: Redis already holds the newest slice per entity, so the
+        # temporal selection happened at publish time. Inner joins for the same
+        # reason as the as-of path — list_dot_product raises on an absent payload.
+        ctes.append(
+            f"""als AS (
+    SELECT q.query_id, list_dot_product(ua.value, ia.value) AS score
+    FROM {queries} q
+    JOIN {user_als_state} ua ON q.user_id = ua.user_id
+    JOIN {item_als_state} ia ON q.business_id = ia.business_id
+)"""
+        )
+        joins.append("LEFT JOIN als ON q.query_id = als.query_id")
 
     projection = ",\n    ".join(f"{defs.get(name).expr} AS {name}" for name in names)
     with_clause = "WITH " + ",\n".join(ctes) + "\n" if ctes else ""

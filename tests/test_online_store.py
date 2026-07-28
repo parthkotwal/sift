@@ -11,6 +11,7 @@ from typing import cast
 import duckdb
 from redis import Redis
 
+from conftest import write_als_state
 from sift.config import sql_path
 from sift.offline.dim_business import build_dim_business
 from sift.offline.ingest import build_events
@@ -179,6 +180,15 @@ def _artifacts(tmp_path: Path) -> tuple[Path, Path]:
         metro_state="PA",
     )
     materialize_historical(events_dir=events, dim_file=dim, out_dir=historical)
+    # ALS slice state so the publisher has something to snapshot; without it
+    # `ui_als_score` would be quietly absent from every online lookup and the skew
+    # check would compare eight features while claiming to cover nine.
+    write_als_state(
+        historical,
+        {f"u{i}": [float(i + 1), 1.0, 0.0] for i in range(1, 6)},
+        {f"b{j}": [1.0, float(j + 1), 0.0] for j in range(0, 8)},
+        boundary="2015-01-01 00:00:00",
+    )
     return historical, dim
 
 
@@ -191,7 +201,11 @@ def test_online_lookup_matches_parquet_as_of_now(tmp_path: Path) -> None:
     )
     assert manifest.users == 3
     assert manifest.items == 3
-    assert rows[0][1:] == (2, 4.0, 31, 2, 4.5, rows[0][6], 1.5, 0.5)
+    # ui_als_score is asserted by value, not passed through like the distance: u1's
+    # published vector is [2, 1, 0] and b1's is [1, 2, 0], so a correct
+    # publish -> Redis -> decode -> dot product round trip gives exactly 4.0. A
+    # transposed or truncated vector (I26) would not.
+    assert rows[0][1:] == (2, 4.0, 31, 2, 4.5, rows[0][6], 1.5, 4.0, 0.5)
     assert rows[1][1:6] == (2, 4.0, 31, 1, 3.0)
     no_price = OnlineFeatureStore(_redis(fake)).lookup([FeatureQuery(3, "u3", "b3")])
     assert no_price[0][-1] is None
