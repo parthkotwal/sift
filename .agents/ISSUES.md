@@ -14,6 +14,52 @@ Format: `### <id> — <title>   [open | fixed | deferred | accepted]`
 
 ## Fixed in the current build
 
+### I23 — The two-tower's logQ correction is applied after the temperature   [accepted]
+
+Raised in review of 26cfe46 as a defect: because `logits = sim / TEMPERATURE`
+(÷0.07) happens *before* `- log(mixture_q)`, the debias term looked ~14x too weak
+relative to the similarity term, which would make D26's negative verdict suspect.
+
+**Reviewed, and the code is right as written — no change.** The sampled-softmax
+estimator approximates the full-catalog denominator by importance weighting,
+`sum_{j in S} exp(s_j)/q_j = sum_{j in S} exp(s_j - log q_j)`, where `s` is *the
+model's score function*. The score function here is cosine/T — the temperature is
+part of the model, not a post-hoc rescale — so `log q` is subtracted from the
+scaled logit, in nats (Yi et al. 2019). Subtracting before the division computes
+`(cos - log q)/T = s - log(q)/T`, which is the estimator for a proposal
+distribution `q^(1/T)`: a ~-9 nat correction becomes ~-130 against similarities
+bounded by ±1/T = ±14.3, so the objective would be dominated by the sampler rather
+than by the model. That is a real bug, and it is the one the "fix" would have
+introduced.
+
+**What was actually missing was the test.** Coverage checked only shape and
+masking, so either ordering passed. The correction is now
+`two_tower.corrected_logits` / `mixture_sampling_probability`, with tests pinning
+the term's *magnitude* (`-log q`, and a 100x-rarer candidate penalised by log(100)
+not log(100)/T) and the uniform floor that keeps `log q` finite. Kept here because
+the finding is plausible enough to be re-raised: **an order-of-operations question
+inside an estimator needs a magnitude assertion, not a shape assertion.**
+
+### I22 — Two-tower export mapped user vectors by scan order   [fixed]
+
+`load_export_user_values` built its `query_id` with `row_number() OVER ()` over a
+registered in-memory array and trusted that to line up index-for-index with
+`interactions.user_ids`. Nothing guarantees that: the window has no `ORDER BY`, and
+a parallelised scan may emit rows in any order — after which every user embedding
+is written under the wrong `user_id`, silently, with no shape or dtype change to
+notice. Same class as I18 (order assumptions that hold until DuckDB parallelises),
+but this path was neither guarded nor tested.
+
+**Fixed** by making the index an explicit array joined with `POSITIONAL JOIN` — the
+pattern already used in `als.write_factor_parquet` and `rank.reranked_candidate_lists`
+— whose row-position semantics are defined rather than incidental. The function now
+takes `store_dir`/`dim_file` (I1's rule: no hidden dependency on machine state) and
+`test_export_user_values_follow_the_id_mapping_not_the_scan_order` reads one store
+under two different ID orders. **Honest limit:** that test cannot force a parallel
+reorder at fixture size, so it would not have caught the old code — the guarantee
+now comes from the join's semantics, and the test stops a rewrite from keying rows
+off store order again.
+
 ### I21 — In-batch item features can cross temporal boundaries   [fixed]
 
 A naive two-tower batch would encode each positive item with aggregates as-of that
@@ -71,6 +117,89 @@ requirement next to `uv sync`.
 
 ## Open
 
+### I25 — The online store cannot serve `ui_als_score`   [open]
+
+The Redis publisher materialises the user/item/user_category/business groups; the
+ALS slice groups (D27) are not among them, so `online_features()` omits
+`ui_als_score` and serving still runs the eight-feature model. The new ranker beats
+ALS offline but **cannot be deployed** until the publisher emits current ALS state —
+shipping a model that reads a feature serving cannot supply is training/serving skew
+by construction, the exact hazard the store exists to prevent.
+
+Deliberately gated rather than built ahead: "models pay rent", so the online work
+waited on the offline verdict. The verdict is in, so this is now the blocker.
+`online_features()` derives servability from `ONLINE_STATE_GROUPS`, so adding the
+groups to the publisher closes this automatically rather than needing a list edited
+in two places.
+
+### I26 — A 2-D ndarray registers into DuckDB transposed   [fixed]
+
+`als_slices._slice_rows` registered an (N, 64) factor array and selected
+`column0..column63`. DuckDB scans a 2-D ndarray as **one column per first-axis
+entry**, so the array arrived as 64 rows of N columns: the first 64 entities got
+correct vectors and the remaining 691,178 were silently NULL-filled. Nothing raised
+— the parquet wrote, the row counts were right, the schema was right, and the
+feature simply came back NULL for 99.9% of rows.
+
+`als.write_factor_parquet` already had this right and even documents it
+(`np.ascontiguousarray(factors.T)`); the new code reimplemented the registration
+without the transpose. **Fixed** with the transpose plus the shape assertion that
+module already carried, and `build_slices` now refuses to write a group whose
+vectors contain NULL elements — a structural guard, since the symptom is invisible
+downstream.
+
+**Rule:** when reimplementing a data-marshalling step that exists elsewhere, copy
+the whole idiom including the parts that look decorative. The transpose looked like
+a formatting detail and was load-bearing.
+
+### I27 — `list_contains(value, NULL)` cannot detect NULL elements   [fixed]
+
+While diagnosing I26 I checked for NULL vector elements with
+`list_contains(value, NULL)` and got 0 for every row, which is how the corrupted
+state initially looked clean. `list_contains` returns NULL rather than true when
+searching for NULL — ordinary three-valued logic — so the check can never fire.
+`sum(CASE WHEN ... THEN 1 ELSE 0 END)` over that then counts zero.
+
+Use `len(list_filter(value, x -> x IS NULL)) > 0`, which is what the guard in
+`build_slices` uses now. **Third instance of the I8 class in this project** (vacuous
+leak test, undersized idempotency fixture, and now a NULL-blind diagnostic), and the
+first where the vacuous check was a *diagnostic* rather than a test — it sent the
+investigation to the wrong layer for two rounds.
+
+### I28 — DuckDB `list_dot_product` raises on absent LEFT-join payloads   [fixed]
+
+`list_dot_product(a, b)` errors with "left argument can not contain NULL values"
+rather than returning NULL when an operand is missing. Neither a `CASE WHEN a IS
+NULL` guard nor a `WHERE a IS NOT NULL` filter reliably prevents it: the function is
+still evaluated across the vector.
+
+**Fixed** by computing the score in a CTE behind *inner* ASOF joins, so the function
+only ever meets rows where both vectors exist, and LEFT JOINing the result back by
+`query_id` — the same shape `ui_category_affinity` already uses for `uc`. The
+definition's expression is therefore `als.score`, not a dot product written inline.
+
+### I24 — No regression test pins the headline retrieval metrics   [deferred]
+
+ALS's 0.2519 recall@500 and the two-tower's 0.2399 (D25/D26) exist only as prose in
+`DECISIONS.md`. Nothing fails if a refactor moves them: the suite covers component
+properties (determinism, unit norms, masking, zero vectors for cold items) and the
+metric *functions*, but never the end-to-end number that decides whether a model
+lands. A silent quality regression would be caught by a human re-running eval, or
+not at all.
+
+**Deferred, with the reason stated rather than assumed:** the numbers are computed
+on the real Yelp dump, which is gitignored and must stay that way, so a test that
+asserts them either can't run in CI or reintroduces I1's hidden dependency on
+machine state. A synthetic fixture large enough to make ALS beat popularity by a
+stable margin is a fixture whose result is a property of the fixture, not of the
+model — the I8 failure mode with extra steps.
+
+**The shape a real fix takes:** treat the eval run as an artifact, not a test —
+write `data/RESULTS.md` numbers to a versioned JSON alongside the model manifest,
+and have the eval entrypoint diff against the previous run and refuse to overwrite
+a regression without an explicit flag. That belongs to the build step that touches
+eval next, not to a review fix.
+
 ### I5 — Repeats vs. the already-reviewed rerank filter   [deferred to build step 6]
 
 D18 choice 3 counts a business reviewed both before and after T as a valid target;
@@ -90,6 +219,19 @@ the correct funnel behaviour.
 **Deferred on purpose:** adding it now would drag the ranker's numbers toward
 popularity's and disguise the finding that the ranker has no personalization
 signal. Revisit once the ranker has real score resolution.
+
+**The two rank paths deliberately differ (2026-07-27, from review of 26cfe46).**
+`reranked_lists` (popularity pool) keeps the unstable `np.argsort` this entry
+defers; `reranked_candidate_lists` (personalized pool) uses `kind="stable"`, so
+ties fall back to the candidate order the provider supplied — for ALS that *is*
+retrieval's own ranking, which is the correct funnel behaviour described above.
+The divergence was undocumented when it landed; it is intentional, and the reason
+is that the deferral's rationale does not transfer. Popularity's pool is a fixed
+global list, so stable tie-breaking there means "fall back to global popularity" —
+exactly the incumbent the ranker must beat, which is what would hide the ranker's
+lack of resolution. ALS's pool is per-user, so stable tie-breaking is a personalized
+fallback and hides nothing. Both call sites now carry that reasoning inline.
+Unifying them requires remeasuring both baselines, not editing one line.
 
 ---
 

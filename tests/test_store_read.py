@@ -15,6 +15,7 @@ from typing import Any
 import duckdb
 import pytest
 
+from conftest import write_als_state
 from sift.config import sql_path
 from sift.features import definitions as defs
 from sift.offline.dim_business import build_dim_business
@@ -97,6 +98,12 @@ def con(tmp_path: Path) -> duckdb.DuckDBPyConnection:
     events, dim = _write_dump(tmp_path)
     historical = tmp_path / "historical"
     materialize_historical(events_dir=events, dim_file=dim, out_dir=historical)
+    write_als_state(
+        historical,
+        {f"u{i}": [float(i + 1), 1.0, 0.0] for i in range(1, 6)},
+        {f"b{j}": [1.0, float(j + 1), 0.0] for j in range(0, 8)},
+        boundary="2015-01-01 00:00:00",
+    )
 
     connection = duckdb.connect()
     attach_store(connection, historical_dir=historical, dim_file=dim)
@@ -117,7 +124,10 @@ def test_both_materialisation_routes_read_identically(
     _attach_raw(other, events, dim)
     materialize_into(other)
     _add_queries(other)
-    assert read_features(other) == read_features(con)
+    # The ALS slice groups come from neither route (they are fitted models,
+    # not aggregations), so the comparison covers what materialisation builds.
+    built = [n for n in defs.feature_names() if 'als' not in n]
+    assert read_features(other, built) == read_features(con, built)
 
 
 def test_equality_holds_feature_by_feature(
@@ -130,8 +140,9 @@ def test_equality_holds_feature_by_feature(
     _attach_raw(other, events, dim)
     materialize_into(other)
     _add_queries(other)
-    parquet = {row[0]: row[1:] for row in read_features(con)}
-    for index, name in enumerate(defs.feature_names()):
+    built = [n for n in defs.feature_names() if 'als' not in n]
+    parquet = {row[0]: row[1:] for row in read_features(con, built)}
+    for index, name in enumerate(built):
         in_memory = {row[0]: row[1] for row in read_features(other, [name])}
         expected = {qid: values[index] for qid, values in parquet.items()}
         assert in_memory == expected, f"{name} differs between materialisation routes"

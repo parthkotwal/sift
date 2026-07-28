@@ -21,8 +21,8 @@ import duckdb
 from sift.config import sql_path
 from sift.features.definitions import (
     USER_BEHAVIORAL_EMBEDDING,
-    feature_names,
     get_embedding,
+    online_features,
 )
 from sift.offline.dim_business import DIM_BUSINESS
 from sift.store.materialize import HISTORICAL_DIR, state_path
@@ -116,7 +116,10 @@ def check_skew(
             "INSERT INTO queries VALUES (?, ?, ?, ?)",
             [(q.query_id, q.user_id, q.business_id, offline_as_of) for q in queries],
         )
-        offline = read_features(con)
+        # Compare only what serving can actually supply: the check is about the
+        # two paths disagreeing, and a feature the publisher never emits has no
+        # online side to disagree with.
+        offline = read_features(con, online_features())
         offline_embeddings: dict[str, list[float]] = {}
         if user_embedding_file is not None:
             offline_embeddings = {
@@ -132,7 +135,7 @@ def check_skew(
         con.close()
 
     online = store.lookup(queries)
-    names = feature_names()
+    names = online_features()
     mismatches: list[SkewMismatch] = []
     for offline_row, online_row in zip(offline, online, strict=True):
         if offline_row[0] != online_row[0]:

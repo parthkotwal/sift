@@ -195,6 +195,16 @@ def build_training_set(
                     if user_id != current_user:
                         current_user = user_id
                         personalized_pool = tuple(candidate_provider(user_id, pool_size))
+                        # A short pool is a silent change to the serving conditional
+                        # (D20): it thins that user's negatives and leaves the ranker
+                        # with unequal pools per user, which only surfaces later as a
+                        # hard failure in `rank.reranked_candidate_lists`. Fail here,
+                        # where the provider that caused it is still named.
+                        if len(personalized_pool) != pool_size:
+                            raise ValueError(
+                                f"candidate provider returned {len(personalized_pool)} of "
+                                f"{pool_size} candidates for {user_id}"
+                            )
                         if len(personalized_pool) != len(set(personalized_pool)):
                             raise ValueError(f"candidate provider duplicated IDs for {user_id}")
                         pool_set = set(personalized_pool)

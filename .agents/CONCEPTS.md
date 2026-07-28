@@ -52,7 +52,19 @@ against rather than retaining arbitrary random vectors. A separate mask removes
 every known user-positive from the denominator except the row's target; otherwise
 efficient negative sampling quietly manufactures false negatives (D26).
 
-**Own it:** *Why do uniform negatives make the model popularity-biased, and why do in-batch negatives have the opposite bias?*
+**Where logQ goes, exactly.** The correction comes from importance-weighting the
+sampled denominator: `sum_{j in S} exp(s_j)/q_j = sum_{j in S} exp(s_j - log q_j)`.
+`s` is the *whole* score function — for a temperature-scaled model that is
+cosine/T — so `log q` is subtracted from the already-scaled logit, in nats. Doing
+it before the division silently corrects for `q^(1/T)` instead of `q`; at T=0.07
+that is a ~14x over-correction that lets the sampler dominate the objective. `q`
+must also be the distribution the sampler *actually* draws from: here a
+size-weighted mixture of popularity-proportional in-batch draws and uniform
+catalog draws, whose uniform component is what keeps `log q` finite for an item
+that never appears as a positive (I23).
+
+**Own it:** *Why do uniform negatives make the model popularity-biased, and why do in-batch negatives have the opposite bias?* And: *your logits are `cos/T` and you
+subtract `log q` — what changes if you subtract before dividing by T?*
 
 ## Candidate-conditioned training (train on the serving distribution)
 

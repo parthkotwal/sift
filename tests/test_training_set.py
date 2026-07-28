@@ -9,7 +9,9 @@ from datetime import date
 from pathlib import Path
 
 import duckdb
+import pytest
 
+from conftest import write_als_state
 from sift.config import sql_path
 from sift.offline.dim_business import build_dim_business
 from sift.offline.ingest import build_events
@@ -134,6 +136,12 @@ def _synthetic_events(tmp_path: Path) -> tuple[Path, Path, Path]:
     )
     store = tmp_path / "historical"
     materialize_historical(events_dir=events, dim_file=dim, out_dir=store)
+    write_als_state(
+        store,
+        {f"u{i}": [float(i + 1), 1.0, 0.0] for i in range(1, 6)},
+        {f"b{j}": [1.0, float(j + 1), 0.0] for j in range(0, 8)},
+        boundary="2015-01-01 00:00:00",
+    )
     return events, dim, store
 
 
@@ -226,6 +234,27 @@ def test_personalized_candidates_scope_each_users_rows(tmp_path: Path) -> None:
     con.close()
     assert sum(int(label) for _, _, label in rows) == 3  # u1:b0, u2:b2, u3:b1
     assert all(str(business) in pools[str(user)] for user, business, _ in rows)
+
+
+def test_a_short_candidate_pool_fails_at_the_provider(tmp_path: Path) -> None:
+    """A provider that returns fewer than `pool_size` candidates changes the
+    serving conditional D20 pins: that user's negatives are drawn from a thinner
+    pool, and the ranker later receives unequal pools per user — which surfaces
+    only downstream, in `rank.reranked_candidate_lists`, far from the cause."""
+    events, dim, store = _synthetic_events(tmp_path)
+    short = {"u1": ["b0", "b2"], "u2": ["b2", "b4", "b5"], "u3": ["b1", "b6", "b7"]}
+    with pytest.raises(ValueError, match=r"returned 2 of 3 candidates for u1"):
+        build_training_set(
+            events_dir=events,
+            dim_file=dim,
+            store_dir=store,
+            split_t=T,
+            pool_size=3,
+            k=1,
+            seed=1,
+            out_file=tmp_path / "short.parquet",
+            candidate_provider=lambda user_id, k: short[user_id],
+        )
 
 
 def test_row_order_within_a_group_does_not_encode_the_label(tmp_path: Path) -> None:

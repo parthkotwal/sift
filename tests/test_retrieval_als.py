@@ -84,6 +84,25 @@ def test_interaction_artifact_is_idempotent(tmp_path: Path) -> None:
     assert interactions.read_bytes() == first
 
 
+def test_catalog_only_items_get_an_exact_zero_vector(tmp_path: Path) -> None:
+    """`item_embedding_behavioral_v1`'s registered leakage argument claims a
+    catalog item with no pre-T interaction "receives a zero vector rather than
+    future state". That is a property of the ALS solve — the item's normal
+    equations reduce to `(lambda*I) y = 0` when no user has touched it — but
+    nothing tested it, so a change of solver or of the confidence encoding could
+    leave b3 holding its random initialisation and put an untrained vector into
+    the index. b3 is in the dimension and in no review.
+    """
+    interactions, dim, _events = _artifacts(tmp_path)
+    data = load_interactions(interactions_file=interactions, dim_file=dim)
+    assert data.item_ids == ("b1", "b2", "b3")
+    assert data.matrix[:, 2].nnz == 0  # b3 is catalog-only
+
+    _users, items = train_als(data, out_dir=tmp_path / "cold", show_progress=False)
+    assert np.array_equal(items[2], np.zeros(FACTORS, dtype=np.float32))
+    assert np.any(items[0] != 0.0)  # the interacted items are not trivially zero
+
+
 def test_als_is_reproducible_and_exports_fixed_length_vectors(tmp_path: Path) -> None:
     interactions, dim, _events = _artifacts(tmp_path)
     data = load_interactions(interactions_file=interactions, dim_file=dim)

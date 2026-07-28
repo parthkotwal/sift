@@ -11,6 +11,7 @@ Run: ``python -m sift.retrieval.interactions``.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import date
 from pathlib import Path
 
 import duckdb
@@ -37,8 +38,14 @@ def build_interactions(
     events_dir: Path = EVENTS_DIR,
     dim_file: Path = DIM_BUSINESS,
     out_file: Path = INTERACTIONS,
+    cutoff: date = SPLIT_T,
 ) -> int:
-    """Materialise deterministic ``(user, item, review_count)`` rows."""
+    """Materialise deterministic ``(user, item, review_count)`` rows.
+
+    `cutoff` is the exclusive upper bound on event time. It defaults to the frozen
+    split, which is the headline retrieval model; `als_slices` passes earlier
+    boundaries to build the point-in-time slices (D27).
+    """
     out_file.parent.mkdir(parents=True, exist_ok=True)
     out_file.unlink(missing_ok=True)
     events = sql_path(events_dir / "**" / "*.parquet")
@@ -51,7 +58,7 @@ def build_interactions(
                 FROM read_parquet({events}, hive_partitioning=true) e
                 SEMI JOIN read_parquet({sql_path(dim_file)}) d
                     ON e.business_id = d.business_id
-                WHERE e.event_type = 'review' AND e.ts < TIMESTAMP '{SPLIT_T}'
+                WHERE e.event_type = 'review' AND e.ts < TIMESTAMP '{cutoff}'
                 GROUP BY e.user_id, e.business_id
                 ORDER BY e.user_id, e.business_id
             ) TO {sql_path(out_file)} (FORMAT PARQUET)

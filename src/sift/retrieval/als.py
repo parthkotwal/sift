@@ -67,14 +67,16 @@ def write_factor_parquet(
         con.close()
 
 
-def train_als(
-    data: InteractionData | None = None,
-    *,
-    out_dir: Path = ALS_DIR,
-    show_progress: bool = True,
+def fit_factors(
+    data: InteractionData, *, show_progress: bool = True
 ) -> tuple[NDArray[np.float32], NDArray[np.float32]]:
-    """Train and write NPY (runtime) plus Parquet (inspection/store) factors."""
-    interactions = load_interactions() if data is None else data
+    """Fit ALS and return (user_factors, item_factors).
+
+    The single place the ALS configuration lives. `train_als` writes the frozen
+    pre-T artifact through it; `als_slices` fits one model per time slice through
+    it too, so a slice can never differ from the headline model by a hyperparameter
+    — only by the data it is allowed to see, which is the entire point (D27).
+    """
     model = AlternatingLeastSquares(
         factors=FACTORS,
         regularization=REGULARIZATION,
@@ -84,9 +86,22 @@ def train_als(
         num_threads=1,
         dtype=np.float32,
     )
-    model.fit(interactions.matrix, show_progress=show_progress)
-    user_factors = np.asarray(model.user_factors, dtype=np.float32)
-    item_factors = np.asarray(model.item_factors, dtype=np.float32)
+    model.fit(data.matrix, show_progress=show_progress)
+    return (
+        np.asarray(model.user_factors, dtype=np.float32),
+        np.asarray(model.item_factors, dtype=np.float32),
+    )
+
+
+def train_als(
+    data: InteractionData | None = None,
+    *,
+    out_dir: Path = ALS_DIR,
+    show_progress: bool = True,
+) -> tuple[NDArray[np.float32], NDArray[np.float32]]:
+    """Train and write NPY (runtime) plus Parquet (inspection/store) factors."""
+    interactions = load_interactions() if data is None else data
+    user_factors, item_factors = fit_factors(interactions, show_progress=show_progress)
 
     out_dir.mkdir(parents=True, exist_ok=True)
     paths = {

@@ -73,7 +73,12 @@ def test_get_rejects_unknown_names_with_a_useful_message() -> None:
 def test_required_groups_is_the_union_of_what_is_asked_for() -> None:
     assert defs.required_groups(("u_reviews_to_date",)) == {"user"}
     assert defs.required_groups(("ui_distance_km",)) == {"user", "business"}
-    assert defs.required_groups() == {"user", "item", "user_category", "business"}
+    assert defs.required_groups() == {
+        "user", "item", "user_category", "business", "user_als", "item_als",
+    }
+    # Servable-online is the subset whose state the publisher emits (I25).
+    assert "ui_als_score" not in defs.online_features()
+    assert set(defs.online_features()) < set(defs.feature_names())
 
 
 def _fixture() -> duckdb.DuckDBPyConnection:
@@ -95,6 +100,14 @@ def _fixture() -> duckdb.DuckDBPyConnection:
         CREATE TABLE uc AS SELECT 1::BIGINT AS query_id, 3.0 AS matched;
         CREATE TABLE b AS SELECT 'b1' AS business_id, 39.95 AS latitude,
                -75.16 AS longitude, 2::SMALLINT AS price_tier;
+        -- ALS slice vectors (D27): the read path supplies these as ua/ia.
+        CREATE TABLE ua AS SELECT 'u1' AS user_id, TIMESTAMP '2018-01-01' AS ts,
+               [1.0, 2.0, 0.0]::FLOAT[3] AS value;
+        CREATE TABLE ia AS SELECT 'b1' AS business_id, TIMESTAMP '2018-01-01' AS ts,
+               [3.0, 1.0, 0.0]::FLOAT[3] AS value;
+        -- The read path hands ui_als_score a precomputed `als` relation rather than
+        -- raw vectors, so the fixture mirrors that shape.
+        CREATE TABLE als AS SELECT 1::BIGINT AS query_id, 5.0 AS score;
         """
     )
     return con
@@ -109,7 +122,10 @@ def test_every_expression_compiles_and_returns_one_value(name: str) -> None:
         "FROM q LEFT JOIN u ON q.user_id = u.user_id "
         "LEFT JOIN i ON q.business_id = i.business_id "
         "LEFT JOIN uc ON q.query_id = uc.query_id "
-        "LEFT JOIN b ON q.business_id = b.business_id"
+        "LEFT JOIN b ON q.business_id = b.business_id "
+        "LEFT JOIN ua ON q.user_id = ua.user_id "
+        "LEFT JOIN ia ON q.business_id = ia.business_id "
+        "LEFT JOIN als ON q.query_id = als.query_id"
     ).fetchall()
     con.close()
     assert len(rows) == 1 and len(rows[0]) == 1
@@ -122,13 +138,18 @@ def test_every_expression_survives_a_cold_start_entity(name: str) -> None:
     con = _fixture()
     con.execute("DELETE FROM u")  # no prior events for this user
     con.execute("DELETE FROM uc")
+    con.execute("DELETE FROM ua")  # and no ALS slice covers them yet
+    con.execute("DELETE FROM als")
     definition = defs.get(name)
     (row,) = con.execute(
         f"SELECT {definition.expr} AS {name} "
         "FROM q LEFT JOIN u ON q.user_id = u.user_id "
         "LEFT JOIN i ON q.business_id = i.business_id "
         "LEFT JOIN uc ON q.query_id = uc.query_id "
-        "LEFT JOIN b ON q.business_id = b.business_id"
+        "LEFT JOIN b ON q.business_id = b.business_id "
+        "LEFT JOIN ua ON q.user_id = ua.user_id "
+        "LEFT JOIN ia ON q.business_id = ia.business_id "
+        "LEFT JOIN als ON q.query_id = als.query_id"
     ).fetchall()
     con.close()
     # u_* counts COALESCE to 0; everything depending on absent state must be NULL.

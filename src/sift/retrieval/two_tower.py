@@ -29,6 +29,7 @@ from sift.features.definitions import (
     USER_TWO_TOWER_EMBEDDING,
     get_embedding,
 )
+from sift.offline.dim_business import DIM_BUSINESS
 from sift.retrieval.als import write_factor_parquet
 from sift.retrieval.interactions import InteractionData, load_interactions
 from sift.retrieval.two_tower_data import (
@@ -39,6 +40,7 @@ from sift.retrieval.two_tower_data import (
     load_item_inputs,
     load_training_examples,
 )
+from sift.store.materialize import HISTORICAL_DIR
 from sift.store.read import asof_feature_query, attach_store
 
 OUTPUT_DIM = BEHAVIORAL_EMBEDDING_DIM
@@ -152,18 +154,75 @@ def known_positive_mask(
     return mask
 
 
+def mixture_sampling_probability(
+    item_q: NDArray[np.float64],
+    candidates: NDArray[np.int64],
+    batch_positives: int,
+    n_items: int,
+) -> NDArray[np.float64]:
+    """q(j): the probability the *actual* sampler proposes candidate j.
+
+    The candidate set is two samplers concatenated — `batch_positives` draws from
+    the empirical item distribution (`item_q`, popularity-skewed) and
+    `UNIFORM_NEGATIVES` draws uniform over the catalog — so q is their
+    size-weighted mixture, not either component. Uniform draws put a floor under
+    every item, which is what keeps `log q` finite for an item that never appears
+    as a positive.
+    """
+    return (batch_positives * item_q[candidates] + UNIFORM_NEGATIVES / n_items) / (
+        batch_positives + UNIFORM_NEGATIVES
+    )
+
+
+def corrected_logits(similarities: Tensor, mixture_q: NDArray[np.float64]) -> Tensor:
+    """Sampled-softmax logits: temperature-scale first, then subtract log q.
+
+    The order is load-bearing and is the one place this could quietly be wrong.
+    The estimator approximates the full-catalog denominator by importance
+    weighting, sum_{j in S} exp(s_j) / q_j = sum_{j in S} exp(s_j - log q_j),
+    where s is *the model's score function* — and the score function here is
+    cosine/T, temperature included. So the correction is subtracted from the
+    scaled logit, in nats, exactly as written (Yi et al. 2019, §"sampling-bias-
+    corrected"; see CONCEPTS.md → negative sampling).
+
+    Correcting before the division would give (cos - log q)/T = s - log(q)/T,
+    i.e. the estimator for a proposal distribution q^(1/T). With T=0.07 that
+    inflates a ~-9 nat correction to ~-130 against similarities bounded by
+    ±1/T = ±14.3: the popularity term would swamp the model's own score and the
+    objective would be trained mostly on the sampler. Weaker-looking is correct.
+    """
+    logits = similarities / TEMPERATURE
+    return logits - torch.from_numpy(np.log(mixture_q)).to(logits.dtype)
+
+
 def load_export_user_values(
     user_ids: tuple[str, ...],
     item_ids: tuple[str, ...],
+    *,
+    store_dir: Path = HISTORICAL_DIR,
+    dim_file: Path = DIM_BUSINESS,
 ) -> NDArray[np.float32]:
-    """Read every known user's tower inputs as-of frozen T through the store."""
+    """Read every known user's tower inputs as-of frozen T through the store.
+
+    Row *i* of the result must be ``user_ids[i]``: the caller encodes it as user
+    index *i* and writes the vector under that ID. The index is therefore an
+    explicit array joined POSITIONAL-ly, not `row_number() OVER ()` — an unordered
+    window over a scan whose order nothing in DuckDB promises (I18's class: a
+    parallel scan is free to reorder, and the mislabelling would be silent). The
+    read path already returns `ORDER BY query_id`, so the columns below line up.
+
+    `business_id` is a placeholder: `USER_FEATURES` are user-group only, so the
+    read path joins no item state and the value is never read.
+    """
     con = duckdb.connect()
     try:
-        attach_store(con)
+        attach_store(con, historical_dir=store_dir, dim_file=dim_file)
+        con.register("export_ids", np.arange(len(user_ids), dtype=np.int64))
         con.register("export_users", np.asarray(user_ids))
         con.execute(
-            "CREATE TABLE queries AS SELECT row_number() OVER () - 1 AS query_id, "
-            "column0 AS user_id, ? AS business_id, ?::TIMESTAMP AS ts FROM export_users",
+            "CREATE TABLE queries AS SELECT q.column0 AS query_id, u.column0 AS user_id, "
+            "? AS business_id, ?::TIMESTAMP AS ts "
+            "FROM export_ids q POSITIONAL JOIN export_users u",
             [item_ids[0], str(SPLIT_T)],
         )
         values = con.execute(asof_feature_query(USER_FEATURES)).fetchnumpy()
@@ -259,12 +318,11 @@ def train_two_tower(
                 static_dense[candidates],
                 static_categories[candidates],
             )
-            logits = user_vectors @ item_vectors.T / TEMPERATURE
             candidate_np = candidates.numpy(force=True)
-            mixture_q = (batch_size * item_q[candidate_np] + UNIFORM_NEGATIVES / n_items) / (
-                batch_size + UNIFORM_NEGATIVES
+            logits = corrected_logits(
+                user_vectors @ item_vectors.T,
+                mixture_sampling_probability(item_q, candidate_np, batch_size, n_items),
             )
-            logits = logits - torch.from_numpy(np.log(mixture_q)).to(logits.dtype)
             mask = known_positive_mask(
                 history,
                 batch_users.numpy(force=True),

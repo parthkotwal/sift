@@ -35,9 +35,9 @@ from sift.config import sql_path
 from sift.features.definitions import (
     EMBEDDING_REGISTRY,
     USER_BEHAVIORAL_EMBEDDING,
-    feature_names,
     get,
     get_embedding,
+    online_features,
 )
 from sift.offline.dim_business import DIM_BUSINESS
 from sift.store.materialize import HISTORICAL_DIR
@@ -324,7 +324,7 @@ def materialize_online(
             user_categories=counts["user_categories"],
             businesses=counts["businesses"],
             definitions=json.dumps(
-                {name: get(name).version for name in feature_names()}, sort_keys=True
+                {name: get(name).version for name in online_features()}, sort_keys=True
             ),
             embeddings=json.dumps(
                 ({definition.name: definition.version} if user_embedding_file else {}),
@@ -397,7 +397,7 @@ class OnlineFeatureStore:
                 f"Redis schema {raw['schema_version']} != client schema {SCHEMA_VERSION}"
             )
         expected_definitions = json.dumps(
-            {name: get(name).version for name in feature_names()}, sort_keys=True
+            {name: get(name).version for name in online_features()}, sort_keys=True
         )
         if raw.get("definitions") != expected_definitions:
             raise OnlineStoreUnavailable(

@@ -100,6 +100,11 @@ def reranked_lists(
             x = np.column_stack([to_float(data[name]) for name in feature_names()])
             assert x.shape[0] == len(batch) * n_cand, "feature rows lost in the join"
             scores = np.asarray(model.predict(x), dtype=np.float64).reshape(len(batch), n_cand)
+            # Unstable on purpose, and it is not the same choice as the personalized
+            # path below: I6 defers a stable tie-break here so the popularity-pool
+            # ranker's numbers keep showing that it has almost no score resolution
+            # (18 distinct scores over 500). Making it stable would quietly drag them
+            # toward popularity's and hide that finding.
             order = np.argsort(-scores, axis=1)  # best score first, per user
             for i, user_id in enumerate(batch):
                 lists[user_id] = [pool[j] for j in order[i]]
@@ -156,6 +161,11 @@ def reranked_candidate_lists(
             x = np.column_stack([to_float(data[name]) for name in feature_names()])
             assert x.shape[0] == len(batch) * n_cand, "feature rows lost in the join"
             scores = np.asarray(model.predict(x), dtype=np.float64).reshape(len(batch), n_cand)
+            # Stable, unlike `reranked_lists`: ties fall back to the candidate order
+            # the provider gave, which for a personalized pool is retrieval's own
+            # ranking — the correct funnel behaviour I6 describes. The divergence is
+            # deliberate and recorded in I6; do not "unify" them without remeasuring
+            # both baselines.
             order = np.argsort(-scores, axis=1, kind="stable")
             for index, user_id in enumerate(batch):
                 pool = candidates_by_user[user_id]

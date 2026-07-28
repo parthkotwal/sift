@@ -70,6 +70,24 @@ def _con(
     )
     con.executemany("INSERT INTO dim_business VALUES (?, ?, ?, ?, ?)", dim)
     materialize_into(con)
+    # ALS slice state (D27). One boundary at 2018-01-01, so a query before it gets
+    # NULL and a query after it scores against the slice — the as-of selection that
+    # keeps retrieval's score from reporting the label.
+    con.execute(
+        "CREATE TABLE user_als_state(user_id VARCHAR, ts TIMESTAMP, value FLOAT[3])"
+    )
+    con.execute(
+        "CREATE TABLE item_als_state(business_id VARCHAR, ts TIMESTAMP, value FLOAT[3])"
+    )
+    con.executemany(
+        "INSERT INTO user_als_state VALUES (?, ?, ?)",
+        [("u1", "2018-01-01 00:00:00", [1.0, 2.0, 0.0])],
+    )
+    con.executemany(
+        "INSERT INTO item_als_state VALUES (?, ?, ?)",
+        [("b1", "2018-01-01 00:00:00", [3.0, 1.0, 0.0]),
+         ("b2", "2018-01-01 00:00:00", [0.0, 1.0, 0.0])],
+    )
     return con
 
 
@@ -84,7 +102,10 @@ def test_features_match_hand_computed_values() -> None:
     assert row[:6] == (1, 2, 4.0, 92, 2, 4.5)
     assert row[6] == pytest.approx(2.7799, abs=1e-3)  # ui_distance_km
     assert row[7] == pytest.approx(1.5)               # ui_category_affinity
-    assert row[8] == pytest.approx(0.5)               # ui_price_delta
+    # ALS slice boundary is 2018-01-01, which is NOT strictly before this query at
+    # 2018-06-01 -- wait, it is: the 2018 slice applies. u1.b1 = 1*3 + 2*1 = 5.
+    assert row[8] == pytest.approx(5.0)               # ui_als_score
+    assert row[9] == pytest.approx(0.5)               # ui_price_delta
 
 
 def test_boundary_is_right_exclusive() -> None:
@@ -98,7 +119,10 @@ def test_boundary_is_right_exclusive() -> None:
     assert row[:6] == (1, 1, 5.0, 59, 0, None)
     assert row[6] == pytest.approx(5.5598, abs=1e-3)
     assert row[7] == pytest.approx(1.0)
-    assert row[8] == pytest.approx(1.0)
+    # Query is 2018-03-01; the only slice boundary is 2018-01-01, strictly before
+    # it, so the slice applies: u1.b2 = 1*0 + 2*1 = 2.
+    assert row[8] == pytest.approx(2.0)
+    assert row[9] == pytest.approx(1.0)
 
 
 def test_cold_start_query_yields_zero_and_nulls() -> None:
@@ -106,13 +130,13 @@ def test_cold_start_query_yields_zero_and_nulls() -> None:
     (row,) = read_features(con)
     # No history -> no centroid, no taste vector, no price mix: every ui_* is NULL,
     # which LightGBM consumes as a native missing value rather than a fake zero.
-    assert row == (1, 0, None, None, 2, 4.5, None, None, None)
+    assert row == (1, 0, None, None, 2, 4.5, None, None, None, None)
 
 
 def test_business_absent_from_the_dimension_yields_null_not_a_crash() -> None:
     con = _con(_BASE_EVENTS, [(1, "u1", "b_unknown", "2018-06-01 00:00:00")])
     (row,) = read_features(con)
-    assert row[6] is None and row[7] is None and row[8] is None
+    assert row[6] is None and row[7] is None and row[9] is None
 
 
 def test_future_invariance() -> None:
@@ -129,7 +153,7 @@ def test_future_invariance_covers_the_user_x_item_features() -> None:
     query = [(1, "u1", "b1", "2018-06-01 00:00:00")]
     (before,) = read_features(_con(_BASE_EVENTS, query))
     (after,) = read_features(_con(_BASE_EVENTS + _FUTURE_EVENTS, query))
-    ui = slice(6, 9)
+    ui = slice(6, 10)
     assert before[ui] == after[ui]
     assert all(v is not None for v in before[ui])  # invariance is not vacuous here
 

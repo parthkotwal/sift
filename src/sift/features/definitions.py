@@ -167,6 +167,28 @@ _DEFINITIONS: tuple[FeatureDefinition, ...] = (
         "set at listing time and is independent of any later review (D21).",
     ),
     FeatureDefinition(
+        name="ui_als_score",
+        entity="user x item",
+        dtype="DOUBLE",
+        version=1,
+        reads=("user_als", "item_als"),
+        # Reads the `als` CTE the read path builds, the same way ui_category_affinity
+        # reads `uc`. The dot product cannot be written inline here: DuckDB's
+        # list_dot_product raises rather than returning NULL when a LEFT-join payload
+        # is absent, and neither a CASE guard nor a WHERE filter reliably keeps it
+        # from seeing one. Computing it behind inner ASOF joins means the function
+        # only ever meets matched rows, and the LEFT JOIN back supplies NULL for the
+        # rest — the honest value for an entity no ALS slice covers.
+        expr="als.score",
+        leakage="Retrieval's own score, which the ranker was previously blind to. Both "
+                "vectors come from an ALS model fit only on interactions strictly "
+                "before the row's timestamp (D27), chosen by the same right-exclusive "
+                "as-of join as every other state group. The headline pre-T model is "
+                "never read here: it was fit on the row's own positive pair, and its "
+                "score for an observed pair reports the label rather than predicting "
+                "it (0.4555 vs 0.0047 mean; 98.7% separation).",
+    ),
+    FeatureDefinition(
         name="ui_price_delta",
         entity="user x item",
         dtype="DOUBLE",
@@ -227,7 +249,14 @@ _EMBEDDINGS: tuple[EmbeddingDefinition, ...] = (
 
 EMBEDDING_REGISTRY: dict[str, EmbeddingDefinition] = {d.name: d for d in _EMBEDDINGS}
 
-STATE_GROUPS: tuple[str, ...] = ("user", "item", "user_category", "business")
+STATE_GROUPS: tuple[str, ...] = (
+    "user",
+    "item",
+    "user_category",
+    "business",
+    "user_als",
+    "item_als",
+)
 
 
 def feature_names() -> tuple[str, ...]:
@@ -250,6 +279,27 @@ def get_embedding(name: str) -> EmbeddingDefinition:
         raise KeyError(
             f"unknown embedding {name!r}; registered: {', '.join(EMBEDDING_REGISTRY)}"
         ) from None
+
+
+# State groups the Redis publisher materialises. The ALS slice groups (D27) are not
+# among them: their vectors are large, per-slice, and only the newest slice matters
+# online, so publishing them is its own build step gated on `ui_als_score` actually
+# landing (ISSUES.md I25).
+ONLINE_STATE_GROUPS: tuple[str, ...] = ("user", "item", "user_category", "business")
+
+
+def online_features() -> tuple[str, ...]:
+    """Features the online store can serve: those whose every input is published.
+
+    Derived rather than listed, so it corrects itself the moment a state group joins
+    the publisher. Training may use the full registry — but deploying a model that
+    reads a feature serving cannot supply is training/serving skew by construction,
+    which is the hazard the store exists to prevent, so this is what gates a swap.
+    """
+    servable = set(ONLINE_STATE_GROUPS)
+    return tuple(
+        name for name, d in REGISTRY.items() if set(d.reads) <= servable
+    )
 
 
 def required_groups(names: tuple[str, ...] | None = None) -> set[str]:

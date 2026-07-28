@@ -46,6 +46,8 @@ from sift.store.materialize import HISTORICAL_DIR, state_path
 USER_STATE = "user_state"
 ITEM_STATE = "item_state"
 USER_CATEGORY_STATE = "user_category_state"
+USER_ALS_STATE = "user_als_state"
+ITEM_ALS_STATE = "item_als_state"
 DIM = "dim_business"
 
 
@@ -55,7 +57,15 @@ def attach_store(
     historical_dir: Path = HISTORICAL_DIR,
     dim_file: Path = DIM_BUSINESS,
 ) -> None:
-    """Expose the materialised store to a connection under the standard names."""
+    """Expose the materialised store to a connection under the standard names.
+
+    The ALS slice groups are attached only when their artifacts exist: they are
+    produced by a later build step (D27), and a store without them still serves the
+    other eight features. Requesting `ui_als_score` against a store that lacks them
+    fails loudly on the missing relation rather than silently returning NULL, which
+    is the behaviour we want — a silently absent retrieval score would look like a
+    feature that simply does not help.
+    """
     for group, relation in (
         ("user", USER_STATE),
         ("item", ITEM_STATE),
@@ -66,6 +76,13 @@ def attach_store(
             f"CREATE OR REPLACE VIEW {relation} AS "
             f"SELECT * FROM read_parquet({sql_path(path)})"
         )
+    for group, relation in (("user_als", USER_ALS_STATE), ("item_als", ITEM_ALS_STATE)):
+        path = state_path(group, historical_dir)
+        if path.exists():
+            con.execute(
+                f"CREATE OR REPLACE VIEW {relation} AS "
+                f"SELECT * FROM read_parquet({sql_path(path)})"
+            )
     con.execute(
         f"CREATE OR REPLACE VIEW {DIM} AS "
         f"SELECT * FROM read_parquet({sql_path(dim_file)})"
@@ -80,6 +97,8 @@ def asof_feature_query(
     item_state: str = ITEM_STATE,
     user_category_state: str = USER_CATEGORY_STATE,
     dim: str = DIM,
+    user_als_state: str = USER_ALS_STATE,
+    item_als_state: str = ITEM_ALS_STATE,
 ) -> str:
     """SQL returning (query_id, *features) for every row of `queries`, as-of its ts."""
     names = tuple(features) if features is not None else defs.feature_names()
@@ -123,6 +142,25 @@ uc AS (
         joins.append("LEFT JOIN uc ON q.query_id = uc.query_id")
     if "business" in groups:
         joins.append(f"LEFT JOIN {dim} b ON q.business_id = b.business_id")
+    if "user_als" in groups or "item_als" in groups:
+        # The ALS slices are ordinary timestamped state, so the as-of join picks the
+        # model fit strictly before this query — that is what stops retrieval's own
+        # score from reporting the label it is meant to predict (D27). The dot
+        # product lives in a CTE behind *inner* ASOF joins so it only ever sees rows
+        # where both vectors exist; DuckDB's list_dot_product raises on an absent
+        # LEFT-join payload instead of returning NULL. The outer LEFT JOIN restores
+        # the missing rows with a NULL score.
+        ctes.append(
+            f"""als AS (
+    SELECT q.query_id, list_dot_product(ua.value, ia.value) AS score
+    FROM {queries} q
+    ASOF JOIN {user_als_state} ua
+        ON q.user_id = ua.user_id AND q.ts > ua.ts
+    ASOF JOIN {item_als_state} ia
+        ON q.business_id = ia.business_id AND q.ts > ia.ts
+)"""
+        )
+        joins.append("LEFT JOIN als ON q.query_id = als.query_id")
 
     projection = ",\n    ".join(
         f"{defs.get(name).expr} AS {name}" for name in names
@@ -151,7 +189,10 @@ def current_feature_query(
     are populated differs. Keeping both assemblers here makes this module the single
     feature-read chokepoint for training and serving.
     """
-    names = tuple(features) if features is not None else defs.feature_names()
+    # Defaults to what the publisher actually materialises, not to the whole
+    # registry: a feature whose state never reaches Redis cannot be served, and
+    # silently returning NULL for it would be skew wearing a NULL's clothes.
+    names = tuple(features) if features is not None else defs.online_features()
     for name in names:
         defs.get(name)
     groups = defs.required_groups(names)
