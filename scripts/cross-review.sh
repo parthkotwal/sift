@@ -100,6 +100,13 @@ case "$FORCE_REVIEWER" in
     run_claude_review
     ;;
   "")
+    # Commits that only touch this cross-review tooling itself aren't worth
+    # auto-reviewing — force a reviewer explicitly (see usage above) if you
+    # ever want one anyway.
+    CHANGED_FILES="$(git diff-tree --no-commit-id --name-only -r "$SHA")"
+    if [ -n "$CHANGED_FILES" ] && ! grep -qv '^scripts/' <<<"$CHANGED_FILES"; then
+      exit 0
+    fi
     TRAILERS="$(git log -1 --format=%B "$SHA" | git interpret-trailers --parse)"
     if echo "$TRAILERS" | grep -qi "^Co-Authored-By: *Claude"; then
       run_codex_review
