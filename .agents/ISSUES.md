@@ -117,35 +117,40 @@ requirement next to `uv sync`.
 
 ## Open
 
-### I29 — Online feature lookup now exceeds its 20ms stage budget   [open]
+### I29 — Online feature lookup regressed on ALS state   [fixed, partially]
 
-Publishing ALS state (D27) took online feature lookup from ~2ms to **49ms p50**,
-and an in-process per-generation cache for the item vectors only brought it to
-**39ms p50 / 48ms p99**. ARCHITECTURE allocates ≤20ms to online feature lookup, so
-the stage is over budget even though end-to-end p99 (49.96ms) still fits under 100ms.
-This is the per-stage budget doing its job: an end-to-end number alone would have
-looked fine.
+Publishing ALS state (D27) took online feature lookup from ~2ms to **49ms p50** —
+over its 20ms allocation, though end-to-end p99 still fit under 100ms. The
+per-stage budget is what surfaced this; an end-to-end number alone looked fine.
 
-**Where the remaining time goes.** Not Redis — the item vectors are cached. It is
-`_load_relations` rebuilding `item_als_current` every request by serialising 500
-cached vectors to JSON and reparsing them in DuckDB. The cache removed the network
-round trip but not the marshalling.
+**Cause:** item ALS vectors were published per business, so a 500-candidate request
+fetched 500 keys from Redis and rebuilt a DuckDB relation from 500 x 64 floats of
+JSON — every request, for data identical across requests within a generation.
 
-**Two fixes, and they are not equivalent:**
-(a) Materialise `item_als_current` once per generation on the connection instead of
-per request. Contained, keeps the current architecture, probably gets most of the
-20ms back.
-(b) Stop recomputing the score at all. For ALS-retrieved candidates,
-`ui_als_score` *is* the score retrieval already computed to select the top-500 — the
-feature store is recomputing something the stage above just produced. Passing it
-down as a candidate attribute is the standard funnel pattern (ARCHITECTURE:84's
-"retrieval source" is the same idea), but it means one feature arrives by a
-different route than the others, which needs care: the offline training path must
-produce it identically or it becomes skew.
+**Fixed** two ways, in the order that mattered. The catalog's vectors are now one
+Redis record rather than 14,568, and `_ensure_item_als` builds `item_als_current`
+once per (connection, generation) instead of per request. Only the user side, which
+genuinely varies, is still per-request.
 
-(b) is faster and arguably more correct, but it is a design decision about how
-retrieval and ranking exchange information, not a performance patch. Raise it before
-implementing.
+| | feature lookup p50 | p99 | total p99 |
+|---|---:|---:|---:|
+| per-item keys | 49.192ms | 60.986ms | 62.752ms |
+| + in-process cache | 39.139ms | 48.198ms | 49.961ms |
+| **one record, built once** | **19.354ms** | **26.874ms** | **28.393ms** |
+
+**Honest remainder:** p50 now sits just under the 20ms allocation but p95/p99
+(25.3/26.9ms) still exceed it. Total p99 is 28.4ms against a 100ms end-to-end
+budget, so there is headroom overall, but this stage is not yet inside its own
+line. The next lever is the user-side relation and the per-request JSON round trip
+into DuckDB, which is the same class of cost one layer down. Left open rather than
+declared done.
+
+**Also caught here:** `materialize_online`'s printed report showed
+`user ALS vectors 0` while Redis held 180,528. The counts were added to the Redis
+hash and the read path but not to the `OnlineManifest` the function *returns*,
+which is what `main()` prints. The data was correct and the report was not — worth
+recording because a report that under-states is more dangerous than one that
+errors: it sends the next reader to debug something that works.
 
 ### I30 — The API does not serve the ranker that now lands   [open]
 

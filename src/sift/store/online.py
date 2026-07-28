@@ -47,7 +47,8 @@ DEFAULT_REDIS_URL = "redis://localhost:6379/0"
 KEY_PREFIX = "sift:online"
 ACTIVE_GENERATION_KEY = f"{KEY_PREFIX}:active"
 GENERATION_INDEX_KEY = f"{KEY_PREFIX}:generations"
-SCHEMA_VERSION = 4
+ITEM_ALS_ALL = "__catalog__"
+SCHEMA_VERSION = 5
 PIPELINE_SIZE = 1_000
 OLD_GENERATION_TTL_SECONDS = 3_600
 
@@ -298,19 +299,32 @@ def materialize_online(
         # ALS slice state (D27). Only the newest slice matters online: `_last_rows`
         # picks it per entity, which is the same row the offline as-of read selects
         # for a query at serving "now", so the skew check compares like with like.
-        for group, key_column, counter in (
-            ("user_als", "user_id", "user_als"),
-            ("item_als", "business_id", "item_als"),
-        ):
-            if not state_path(group, historical_dir).exists():
-                continue
-            als_rows = con.execute(_last_rows(f"{group}_state", key_column))
-            while batch := als_rows.fetchmany(PIPELINE_SIZE):
-                for entity_id, ts, vector in batch:
+        if state_path("user_als", historical_dir).exists():
+            user_als_rows = con.execute(_last_rows("user_als_state", "user_id"))
+            while batch := user_als_rows.fetchmany(PIPELINE_SIZE):
+                for user_id, ts, vector in batch:
                     values = _mapping(ts=ts)
                     values["value"] = json.dumps([float(v) for v in vector])
-                    write_record(_key(generation, group, str(entity_id)), values)
-                    counts[counter] += 1
+                    write_record(_key(generation, "user_als", str(user_id)), values)
+                    counts["user_als"] += 1
+
+        # Item ALS vectors are catalog-wide and identical across requests, so they go
+        # in ONE record rather than 14.5k. Per-item keys meant a 500-candidate request
+        # fetched and reparsed 500 vectors that never change between requests — the
+        # dominant cost behind 49ms feature lookup (I29).
+        if state_path("item_als", historical_dir).exists():
+            item_als_rows = con.execute(
+                _last_rows("item_als_state", "business_id")
+            ).fetchall()
+            catalog = {
+                str(business_id): [float(v) for v in vector]
+                for business_id, _ts, vector in item_als_rows
+            }
+            write_record(
+                _key(generation, "item_als", ITEM_ALS_ALL),
+                {"vectors": json.dumps(catalog)},
+            )
+            counts["item_als"] = len(catalog)
 
         if user_embedding_file is not None:
             definition = get_embedding(user_embedding_name)
@@ -388,6 +402,8 @@ def materialize_online(
         user_categories=counts["user_categories"],
         businesses=counts["businesses"],
         user_embeddings=counts["user_embeddings"],
+        user_als=counts["user_als"],
+        item_als=counts["item_als"],
         embeddings=(((definition.name, definition.version),) if user_embedding_file else ()),
     )
 
@@ -396,14 +412,6 @@ class OnlineFeatureStore:
     """Batch lookup client: Redis fetch plus registry-expression projection."""
 
     def __init__(self, client: Redis | None = None) -> None:
-        # Item ALS vectors are identical for every request in a generation and are
-        # the largest payload in a lookup: 500 candidates x 64 floats of JSON per
-        # request took feature lookup from ~2ms to ~49ms p50, blowing the 20ms stage
-        # budget on data that never changes between requests. Cached in-process and
-        # keyed by generation, so a republish invalidates it rather than serving
-        # stale vectors. The user side stays per-request — it is one key, and it is
-        # the half that actually varies.
-        self._item_als_cache: dict[str, dict[str, dict[str, str]]] = {}
         self.client = client or redis_client()
         self._thread = local()
 
@@ -507,12 +515,9 @@ class OnlineFeatureStore:
             keys.append(_key(generation, "user", user_id))
             keys.append(_key(generation, "user_category", user_id))
             keys.append(_key(generation, "user_als", user_id))
-        item_als_cached = self._item_als_cache.get(generation)
         for business_id in businesses:
             keys.append(_key(generation, "item", business_id))
             keys.append(_key(generation, "business", business_id))
-            if item_als_cached is None:
-                keys.append(_key(generation, "item_als", business_id))
         try:
             responses = self.client.mget(keys)
         except RedisError as exc:
@@ -529,24 +534,13 @@ class OnlineFeatureStore:
             cursor += 3
         item_state: dict[str, dict[str, str]] = {}
         business_state: dict[str, dict[str, str]] = {}
-        item_als: dict[str, dict[str, str]] = {}
         for business_id in businesses:
             item_state[business_id] = _decode_record(responses[cursor])
             business_state[business_id] = _decode_record(responses[cursor + 1])
             cursor += 2
-            if item_als_cached is None:
-                item_als[business_id] = _decode_record(responses[cursor])
-                cursor += 1
-        if item_als_cached is None:
-            # Only this generation's entries; a republish gets a fresh dict.
-            self._item_als_cache = {generation: item_als}
-        else:
-            item_als = {
-                business_id: item_als_cached.get(business_id, {})
-                for business_id in businesses
-            }
 
         con = self._connection()
+        self._ensure_item_als(con, generation)
         self._load_relations(
             con,
             queries,
@@ -556,9 +550,31 @@ class OnlineFeatureStore:
             item_state,
             business_state,
             user_als,
-            item_als,
         )
         return read_current_features(con, features)
+
+    def _ensure_item_als(self, con: duckdb.DuckDBPyConnection, generation: str) -> None:
+        """Build `item_als_current` once per (connection, generation).
+
+        The catalog's ALS vectors do not vary by request, so fetching and parsing
+        them per request was pure waste and the dominant cost in feature lookup
+        (I29). Keyed by generation so a republish rebuilds the relation rather than
+        serving the previous snapshot's vectors.
+        """
+        if getattr(self._thread, "item_als_generation", None) == generation:
+            return
+        raw = self.client.get(_key(generation, "item_als", ITEM_ALS_ALL))
+        catalog: dict[str, list[float]] = (
+            json.loads(_decode_record(raw).get("vectors", "{}")) if raw else {}
+        )
+        con.execute(
+            "CREATE OR REPLACE TABLE item_als_current AS SELECT "
+            "json_extract_string(value, '$.business_id') AS business_id, "
+            "json_extract(value, '$.value')::FLOAT[] AS value "
+            "FROM json_each(?::JSON)",
+            [_rows_json(("business_id", "value"), list(catalog.items()))],
+        )
+        self._thread.item_als_generation = generation
 
     @staticmethod
     def _load_relations(
@@ -570,7 +586,6 @@ class OnlineFeatureStore:
         items: Mapping[str, Mapping[str, str]],
         businesses: Mapping[str, Mapping[str, str]],
         user_als: Mapping[str, Mapping[str, str]] | None = None,
-        item_als: Mapping[str, Mapping[str, str]] | None = None,
     ) -> None:
         query_rows = [
             (query.query_id, query.user_id, query.business_id, as_of) for query in queries
@@ -659,31 +674,25 @@ class OnlineFeatureStore:
             [_rows_json(("user_id", "category", "cum_count"), category_rows)],
         )
 
-        # ALS slice vectors (D27). Redis holds the newest slice per entity, so the
-        # current path joins on identity alone — the temporal selection already
-        # happened when the snapshot was published.
-        for relation, key_column, records in (
-            ("user_als_current", "user_id", user_als or {}),
-            ("item_als_current", "business_id", item_als or {}),
-        ):
-            als_rows: list[tuple[object, ...]] = [
-                (entity_id, json.loads(state["value"]))
-                for entity_id, state in records.items()
-                if state
-            ]
-            con.execute(
-                f"CREATE OR REPLACE TABLE {relation} AS SELECT "
-                f"json_extract_string(value, '$.{key_column}') AS {key_column}, "
-                # FLOAT[], not DOUBLE[]: the offline state is FLOAT[64], and
-                # list_dot_product accumulates at the element type. Widening here
-                # would make the online path compute the same definition at higher
-                # precision and disagree with the offline one in the eighth
-                # significant digit — which the skew check duly flagged. One
-                # definition means one *type* as well as one expression.
-                "json_extract(value, '$.value')::FLOAT[] AS value "
-                "FROM json_each(?::JSON)",
-                [_rows_json((key_column, "value"), als_rows)],
-            )
+        # Only the user side varies per request. The catalog's ALS vectors are built
+        # once per (connection, generation) by `_ensure_item_als`; rebuilding them
+        # here per request was the dominant cost in feature lookup (I29).
+        user_als_rows: list[tuple[object, ...]] = [
+            (entity_id, json.loads(state["value"]))
+            for entity_id, state in (user_als or {}).items()
+            if state
+        ]
+        con.execute(
+            "CREATE OR REPLACE TABLE user_als_current AS SELECT "
+            "json_extract_string(value, '$.user_id') AS user_id, "
+            # FLOAT[], not DOUBLE[]: the offline state is FLOAT[64] and
+            # list_dot_product accumulates at the element type, so widening here
+            # made the online path disagree with the offline one in the eighth
+            # significant digit — which the skew check duly flagged.
+            "json_extract(value, '$.value')::FLOAT[] AS value "
+            "FROM json_each(?::JSON)",
+            [_rows_json(("user_id", "value"), user_als_rows)],
+        )
 
         business_rows: list[tuple[object, ...]] = []
         for business_id, state in businesses.items():
