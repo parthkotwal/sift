@@ -15,6 +15,9 @@
 # Both reviewers are read-only: Claude's tool allowlist has no Write/Edit,
 # and Codex's `review` subcommand only ever produces a written review in
 # every observed run, even though its sandbox is workspace-write.
+#
+# Every run opens the resulting .md (macOS `open`, default handler) and
+# fires a notification. To act on a review's findings, see apply-review.sh.
 set -euo pipefail
 
 SHA="${1:-$(git rev-parse HEAD)}"
@@ -33,6 +36,10 @@ SUBJECT="$(git log -1 --format=%s "$SHA")"
 notify() {
   osascript -e 'on run argv' -e 'display notification (item 2 of argv) with title (item 1 of argv)' -e 'end run' \
     -- "$1" "$2" >/dev/null 2>&1 || true
+}
+
+open_review() {
+  open "$1" >/dev/null 2>&1 || true
 }
 
 run_codex_review() {
@@ -56,6 +63,7 @@ run_codex_review() {
     echo "cross-review: codex review of $SHA written to $out (tokens: $usage)" >&2
   fi
   notify "Codex reviewed $SHA" "$SUBJECT"
+  open_review "$out"
 }
 
 run_claude_review() {
@@ -81,6 +89,7 @@ run_claude_review() {
   cost="$(jq -r '.total_cost_usd' "$json" 2>/dev/null || echo 0)"
   echo "cross-review: claude review of $SHA written to $out (tokens: ${input_tok:-0} in / ${output_tok:-0} out, cost: \$${cost:-0})" >&2
   notify "Claude reviewed $SHA" "$SUBJECT"
+  open_review "$out"
 }
 
 case "$FORCE_REVIEWER" in
