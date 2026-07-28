@@ -18,10 +18,20 @@
 #
 # Every run opens the resulting .md (macOS `open`, default handler) and
 # fires a notification. To act on a review's findings, see apply-review.sh.
+#
+# Toggle automatic (hook-triggered) review on/off without touching the hook:
+#   git config sift.cross-review-enabled false   # turn off
+#   git config --unset sift.cross-review-enabled  # back to default (on)
+# This only gates the hook's auto-detect path -- an explicit
+# `scripts/cross-review.sh <sha> <reviewer>` always runs regardless.
 set -euo pipefail
 
-SHA="${1:-$(git rev-parse HEAD)}"
 FORCE_REVIEWER="${2:-}"
+if [ -z "$FORCE_REVIEWER" ] && [ "$(git config --bool sift.cross-review-enabled 2>/dev/null || echo true)" = "false" ]; then
+  exit 0
+fi
+
+SHA="${1:-$(git rev-parse HEAD)}"
 REPO_ROOT="$(git rev-parse --show-toplevel)"
 REVIEW_DIR="$REPO_ROOT/.agents/reviews"
 mkdir -p "$REVIEW_DIR"
