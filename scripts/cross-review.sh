@@ -21,7 +21,13 @@
 # its own disposable copy it can only read and report, never modify.
 #
 # Every run opens the resulting .md (macOS `open`, default handler) and
-# fires a notification. To act on a review's findings, see apply-review.sh.
+# fires a notification. In the automatic (hook-triggered) path, a successful
+# review is also handed straight to apply-review.sh -- so review AND fix
+# happen unattended. It still never commits: you get a notification, the
+# working tree has the (uncommitted) fix, and you inspect with `git diff`
+# before committing. Manual `scripts/cross-review.sh <sha> <reviewer>` runs
+# don't auto-apply, since an old commit's fix may no longer make sense
+# against the current tree -- run apply-review.sh yourself if you want it.
 #
 # Toggle automatic (hook-triggered) review on/off without touching the hook
 # -- e.g. if you just don't want the notification/cost right now:
@@ -55,6 +61,17 @@ notify() {
 
 open_review() {
   open "$1" >/dev/null 2>&1 || true
+}
+
+auto_apply() {
+  local reviewer="$1"
+  local log="$REVIEW_DIR/${SHA}-${reviewer}-apply.log"
+  if "$REPO_ROOT/scripts/apply-review.sh" "$SHA" "$reviewer" > "$log" 2>&1; then
+    notify "Fix applied for $SHA" "Inspect with git diff, then commit yourself"
+    echo "cross-review: auto-applied $reviewer's review of $SHA — see $log, then git diff" >&2
+  else
+    echo "cross-review: auto-apply skipped for $SHA (see $log) — dirty tree, missing CLI, or nothing to apply" >&2
+  fi
 }
 
 make_worktree() {
@@ -148,9 +165,9 @@ case "$FORCE_REVIEWER" in
     fi
     TRAILERS="$(git log -1 --format=%B "$SHA" | git interpret-trailers --parse)"
     if echo "$TRAILERS" | grep -qi "^Co-Authored-By: *Claude"; then
-      run_codex_review
+      run_codex_review && auto_apply codex
     elif echo "$TRAILERS" | grep -qi "^Co-Authored-By: *Codex"; then
-      run_claude_review
+      run_claude_review && auto_apply claude
     else
       # Manual commit, not authored by either agent — nothing to do.
       exit 0
