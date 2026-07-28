@@ -11,17 +11,14 @@
 # reviewer doesn't. A codex review gets applied by claude; a claude review
 # gets applied by codex. Mirrors the cross-review.sh author/reviewer pairing.
 #
-# If <sha> carries a Claude-Session-Id trailer (stamped by the
-# prepare-commit-msg hook whenever CLAUDE_CODE_SESSION_ID is set, i.e. the
-# commit was made from inside an active `claude` session), a codex review
-# gets applied by *forking* that exact session (`claude --resume
-# --fork-session`) instead of a stateless new one -- same reasoning context
-# the original commit was written with, without mutating or touching the
-# live session in case it's still open elsewhere. No equivalent exists for
-# Codex: `codex fork` is interactive/TUI-only and `codex exec resume` would
-# write back into the original session's transcript, which is unsafe if
-# that session might still be live -- so a claude review always applies via
-# a fresh codex session.
+# Always a fresh session, not a resumed/forked one. Tried forking the
+# original authoring session via `claude --resume --fork-session` for full
+# conversational context; in practice it surfaced as a live turn in that
+# same conversation (not an invisible background run) and its permission
+# flags didn't behave the same as in a fresh session (Edit/Bash got denied
+# despite an explicit --disallowedTools-only allowlist). Not reliable enough
+# to build on -- a fresh session with the diff + review as context is
+# slower to "get" prior reasoning but predictable.
 set -euo pipefail
 
 SHA="${1:?usage: scripts/apply-review.sh <sha> <codex|claude>}"
@@ -63,21 +60,10 @@ case "$REVIEWER" in
   codex)
     # Codex reviewed a Claude commit -> Claude (the author) applies the fix.
     command -v claude >/dev/null 2>&1 || { echo "apply-review: claude CLI not found" >&2; exit 1; }
-    SESSION_ID="$(git log -1 --format=%B "$SHA" | git interpret-trailers --parse \
-      | grep -i "^Claude-Session-Id:" | sed 's/^[^:]*: *//' | head -1)"
-    if [ -n "$SESSION_ID" ]; then
-      echo "apply-review: forking original session $SESSION_ID" >&2
-      claude -r "$SESSION_ID" --fork-session -p "$PROMPT" \
-        --model sonnet \
-        --permission-mode dontAsk \
-        --disallowedTools "Bash(git commit:*) Bash(git push:*)"
-    else
-      echo "apply-review: no Claude-Session-Id on $SHA, using a fresh session" >&2
-      claude -p "$PROMPT" \
-        --model sonnet \
-        --permission-mode dontAsk \
-        --disallowedTools "Bash(git commit:*) Bash(git push:*)"
-    fi
+    claude -p "$PROMPT" \
+      --model sonnet \
+      --permission-mode dontAsk \
+      --disallowedTools "Bash(git commit:*) Bash(git push:*)"
     ;;
   claude)
     # Claude reviewed a Codex commit -> Codex (the author) applies the fix.

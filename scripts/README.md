@@ -1,7 +1,6 @@
 # Cross-review tooling
 
-Claude Code and Codex review each other's commits automatically, and can apply
-each other's findings back to the working tree for you to approve.
+Claude Code and Codex review each other's pushed work automatically.
 
 ## Setup
 
@@ -9,41 +8,59 @@ each other's findings back to the working tree for you to approve.
 scripts/install-hooks.sh
 ```
 
-Installs two git hooks (`.git/hooks/` isn't tracked, so this needs to be
-re-run after every fresh clone):
-
-- `prepare-commit-msg` — stamps a `Claude-Session-Id` trailer on commits made
-  from inside an active `claude` session, so a later fix can be applied back
-  into that same session's context.
-- `post-commit` — fires `cross-review.sh` in the background after every
-  commit.
+Installs a `pre-push` hook (`.git/hooks/` isn't tracked, so this needs to be
+re-run after every fresh clone). It backgrounds the review and returns
+immediately — pushing is never delayed.
 
 ## What happens automatically
 
-Every commit's `Co-Authored-By` trailer says who wrote it (Claude tags its
-own; `.agents/AGENTS.md` tells Codex to do the same). The *other* tool then
-reviews it, inside a throwaway `git worktree` checked out at that exact
-commit — isolated from your live working tree, so it's safe even if another
-agent is actively editing at the same time. Read-only: neither reviewer gets
-`Write`/`Edit`.
+On `git push`, the hook looks at the trailer on the tip commit being pushed
+(`Co-Authored-By: Claude` or `Co-Authored-By: Codex` — Claude tags its own
+commits; `.agents/AGENTS.md` tells Codex to do the same) and has the *other*
+tool review everything between the previous remote tip and the new one, in
+one shot — not commit-by-commit, so it doesn't fire on every local commit
+while you're still iterating.
 
-If the review turns anything up, it's handed straight to
-`apply-review.sh`, which edits the working tree accordingly — never
-commits. You get a macOS notification either way; the review `.md` opens
-automatically; check `git diff` before committing whatever landed.
+The review runs inside a throwaway `git worktree` checked out at the pushed
+tip (detached HEAD, deleted when it finishes) — isolated from your live
+working tree, so it's safe to keep working while it runs. Neither reviewer
+has the `Write`/`Edit` tools, so it can only read and report — though for
+Claude that means specifically those two tools are blocked, not that it's
+sandboxed to read-only filesystem access (it still has Bash). For Codex,
+`review` mode has only ever produced a written review in every observed run,
+but nothing stops it at the tool level the way Claude's tool block does.
 
-Skipped automatically for: commits with neither trailer (manual commits),
-commits that only touch `scripts/` (this tooling itself), or when
+Output lands in `.agents/reviews/<sha>-<reviewer>.md` (gitignored) plus a
+quiet macOS notification — nothing opens automatically.
+
+Skipped automatically for: a tip commit with neither trailer (a manual
+push), a push that only touches `scripts/` (this tooling itself), or when
 `git config sift.cross-review-enabled false` is set.
+
+## Acting on a review
+
+Nothing applies itself — read `.agents/reviews/<sha>-<reviewer>.md` and
+decide. To have the original author apply the findings:
+
+```bash
+scripts/apply-review.sh <sha> <codex|claude>
+```
+
+Hands the review to whichever tool *wrote* `<sha>` (it has the context),
+has it edit the working tree, but never commits or pushes — Claude's side
+is tool-blocked from `git commit`/`git push`, Codex's side is
+instruction-only. Always a fresh session (an earlier version tried forking
+the original authoring session for full context; in practice it surfaced as
+a live turn in that conversation instead of running invisibly, and its
+permission flags didn't behave predictably — not solid enough to keep).
+Requires a clean working tree, since the point is a diff you can read.
+Inspect with `git diff`, then commit yourself.
 
 ## Manual use
 
 ```bash
-scripts/cross-review.sh <sha> codex     # force Codex to review any past commit
-scripts/cross-review.sh <sha> claude    # force Claude to review any past commit
-scripts/apply-review.sh <sha> <codex|claude>   # apply an existing review's findings
+scripts/cross-review.sh <sha> codex             # force Codex to review <sha>^..<sha>
+scripts/cross-review.sh <sha> claude             # force Claude to review <sha>^..<sha>
+scripts/cross-review.sh <new-sha> codex <old-sha>   # force a review of a range
+scripts/apply-review.sh <sha> <codex|claude>     # apply an existing review's findings
 ```
-
-Manual review runs don't auto-apply — an old commit's fix may not make sense
-against the current tree anymore, so `apply-review.sh` is a separate,
-deliberate step.
