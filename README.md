@@ -64,3 +64,8 @@ uv run python -m sift.retrieval.online --samples 100
 ```
 
 Set `SIFT_REDIS_URL` to use a non-default Redis endpoint.
+
+## Agent workflow
+
+Claude Code and Codex review each other's commits automatically; see
+[scripts/README.md](scripts/README.md).
