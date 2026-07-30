@@ -46,7 +46,14 @@ hit contribution measured so no source rides for free.
 
 **Rerank** applies hard filters — `is_open` *now* (a serving-time filter, deliberately never a training feature — see the skew section), already-reviewed — and a simple diversity pass to reach the final 10.
 
-**Latency budget** (re-baselined against measurement, `DECISIONS.md` D28): retrieval ≤ 10ms, online feature lookup ≤ 60ms, ranker inference ≤ 10ms, rerank + overhead ≤ 20ms — and **end-to-end p99 < 100ms at up to 4 concurrent requests per process**. Instrumented per stage from day one; an end-to-end number with no breakdown is a footgun (`AGENTS.md`), and a per-stage number with no concurrency level is not a contract at all — the same code measured 18ms and 162ms p50 on offered load alone (`ISSUES.md` I31). The initial allocation was 30/20/30/20, apportioned before anything was timed; measurement found retrieval and ranking using ~15% of their share and feature lookup starved.
+**Latency budget** (re-baselined against measurement, `DECISIONS.md` D28). Two different things, deliberately not one:
+
+- **Regression tripwires**, at concurrency 1 where numbers are reproducible: retrieval ≤ 10ms, online feature lookup ≤ 40ms, ranker inference ≤ 15ms, rerank + overhead ≤ 20ms.
+- **The contract**: end-to-end **p99 < 100ms at up to 4 concurrent requests per process**.
+
+They are not required to sum, because per-stage p99s are not additive — at concurrency 4 the stage p99s total ~103ms while end-to-end p99 is ~79ms, since each stage's unluckiest 1% are mostly different requests. The original 30/20/30/20 = 100ms allocation encoded that arithmetic error, and was apportioned before anything was timed.
+
+Instrumented per stage from day one: an end-to-end number with no breakdown is a footgun (`AGENTS.md`), a per-stage number with no concurrency level is not a contract (the same code measured 18ms and 162ms p50 on offered load alone), and a p99 over too few samples on a loaded host is not a measurement (the same build gave 50ms and 99ms minutes apart at load 8.6 on 4 cores). `python -m sift.api.bench --check` is what verifies all three — it gates on ≥1,000 samples and refuses to gate on a contended host. See `ISSUES.md` I31.
 
 ## Offline path
 

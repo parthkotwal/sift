@@ -68,14 +68,25 @@ the endpoint runs on a threadpool, so p99 degrades badly under concurrency
 (`.agents/ISSUES.md` I31). The measurement is the deliverable here, including when it
 says no.
 
-For a latency distribution rather than one request:
+To check the latency contract, drive the running endpoint at a stated concurrency:
+
+```bash
+uv run python -m sift.api.bench --concurrency 4 --check
+```
+
+It reports per-stage p50/p95/p99 from the response's own breakdown plus client-side
+wall time, and gates on the budget. It also refuses to produce a verdict it cannot
+support — under 1,000 samples, or on a host busy enough that the numbers describe the
+machine rather than the code. Point `--url` at any deployment to measure it the same way.
+
+For the in-process per-stage profile of a single warm thread:
 
 ```bash
 uv run python -m sift.retrieval.online --samples 500
 ```
 
-Note that this is a single-threaded loop against a warm process, so it profiles one
-thread rather than the server — I31 is the record of what that hides.
+That loop is single-threaded, so it profiles one thread rather than the server — I31
+is the record of what that hides, and why the benchmark above exists.
 
 Set `SIFT_REDIS_URL` to use a non-default Redis endpoint.
 
