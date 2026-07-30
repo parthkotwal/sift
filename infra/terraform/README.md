@@ -35,7 +35,8 @@ Resources will be added in reviewable slices, not as one uninspectable apply:
    artifact bucket and private ECR;
 3. Redis and observability (implemented, not applied): single-node ElastiCache
    and CloudWatch log groups;
-4. IAM: separate ECS execution and task roles with resource-scoped policies;
+4. IAM (implemented, not applied): separate ECS execution and task roles with
+   resource-scoped policies;
 5. ECS and ALB: cluster, task definitions, one-task service, target group,
    listener, and one-off materialization command support;
 6. GitHub OIDC: repository-scoped build/push/deploy role.
@@ -97,3 +98,16 @@ group relationship; no cache password is stored in Terraform.
 Separate API and materialization CloudWatch log groups use standard log storage
 with three-day retention by default. They are intentionally deleted during
 Terraform teardown after non-sensitive evidence has been preserved.
+
+## ECS IAM contract
+
+The execution and application roles are separate. Both trust only
+`ecs-tasks.amazonaws.com`, constrained to this AWS account and ECS source ARNs
+in the configured region.
+
+The execution role can obtain the account-scoped ECR authorization token, pull
+layers only from the Sift ECR repository, and create/write streams only below
+the two planned task log groups. The application role can only call
+`s3:GetObject` below `sift/artifacts/*`. It cannot list the bucket or call
+ElastiCache APIs because startup fetches exact artifact keys and cache access is
+network-level.

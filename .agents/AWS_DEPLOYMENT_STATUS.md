@@ -352,6 +352,45 @@ Cost boundary:
 - there is no replica, snapshot storage, customer-managed KMS key, or NAT
   Gateway in this slice.
 
+### Phase 3 — ECS IAM boundary
+
+Implemented on the current `aws` branch without applying it:
+
+- separate task-execution and application task roles;
+- both trust only the `ecs-tasks.amazonaws.com` service principal;
+- both trust policies require `aws:SourceAccount` to equal account
+  `442042531996` and `aws:SourceArn` to be an ECS ARN in `us-west-2` for that
+  account, following AWS's confused-deputy guidance;
+- a custom execution policy replaces the broader managed execution policy:
+  it obtains an ECR authorization token, pulls only from the planned Sift ECR
+  repository, and writes only to streams under the two planned log groups;
+- the application role can only call `s3:GetObject` below
+  `sift/artifacts/*` in the planned private bucket;
+- the application role cannot list the bucket and neither role has ElastiCache
+  API permissions;
+- outputs expose only the two role ARNs required by later task definitions.
+
+Saved-plan audit:
+
+- the combined plan reported `39 to add, 0 to change, 0 to destroy`, exactly
+  four additions beyond the previous plan: two roles and two inline policies;
+- there are no wildcard allow-actions;
+- the only wildcard allow-resource is `*` for
+  `ecr:GetAuthorizationToken`, whose authorization token is not
+  repository-resource-scopable;
+- ECR image actions reference only `aws_ecr_repository.api.arn`;
+- CloudWatch write actions reference only `aws_cloudwatch_log_group.tasks`;
+- `s3:GetObject` references only the artifact bucket ARN plus
+  `local.artifact_prefix`;
+- each inline policy is attached to its intended role, with no cross-role
+  attachment;
+- the saved plan was deleted after JSON inspection so it cannot become a stale
+  apply artifact;
+- no `terraform apply` was run and no AWS resources were created.
+
+IAM roles and policies have no separate hourly AWS resource charge. Their
+permissions authorize later billable service activity but do not create it.
+
 ## AWS resource state
 
 No AWS infrastructure has been created by this lane yet:
@@ -370,23 +409,24 @@ deployment-generated AWS service charges to preserve.
 
 ## Exact next action
 
-Add the Phase 3 ECS IAM roles and policies without applying them:
+Add the Phase 3 ALB configuration without applying it:
 
-1. create separate ECS task-execution and application task roles, each trusted
-   only by `ecs-tasks.amazonaws.com`;
-2. let the execution role obtain an ECR authorization token, pull only from the
-   planned Sift repository, and write only to the two planned task log groups;
-3. let the application task role read only objects below the planned
-   `sift/artifacts` S3 prefix;
-4. do not grant S3 listing because the artifact entrypoint fetches exact keys
-   and does not call `ListBucket`;
-5. grant no ElastiCache API permissions because cache access is network-level;
-6. expose only the role ARNs needed by the later ECS task definitions;
-7. format, validate, and inspect a saved plan for wildcard actions/resources,
-   trust principals, cross-role privilege, and unexpected resources.
+1. create one internet-facing Application Load Balancer in the two public
+   subnets using only the existing ALB security group;
+2. create an `ip` target group for Fargate on HTTP port 8000;
+3. configure `/health` as the target-group health check with thresholds and
+   timing appropriate to ordinary process startup;
+4. keep the health check independent of catalog initialization: the first
+   `/recommend` cold cost must not be hidden by changing `/health`;
+5. create one public HTTP port 80 listener forwarding to that target group;
+6. keep deletion protection off for the one-day showcase and expose the ALB DNS
+   name/zone plus target-group ARN for the later ECS service;
+7. format, validate, and inspect a saved plan for subnet tier, target type,
+   public listener count, health path, security group, deletion behavior,
+   unexpected resources, and current hourly/LCU/public-IPv4 cost categories.
 
-Do not add the GitHub OIDC role in this slice; its repository/ref trust boundary
-belongs with the deployment workflow.
+Do not add an ECS service or apply the ALB yet. This keeps the next review slice
+independent of the image tag and current `main` integration.
 
 ## Remaining phases
 

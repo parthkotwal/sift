@@ -74,3 +74,11 @@ output "task_log_groups" {
   description = "CloudWatch log groups consumed by the later ECS task definitions."
   value       = { for purpose, log_group in aws_cloudwatch_log_group.tasks : purpose => log_group.name }
 }
+
+output "ecs_role_arns" {
+  description = "Least-privilege IAM roles consumed by the later ECS task definitions."
+  value = {
+    execution = aws_iam_role.ecs_execution.arn
+    task      = aws_iam_role.ecs_task.arn
+  }
+}
