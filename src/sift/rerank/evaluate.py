@@ -31,7 +31,7 @@ from sift.config import SPLIT_T, sql_path
 from sift.eval.holdout import load_ground_truth
 from sift.eval.run import evaluate
 from sift.offline.dim_business import DIM_BUSINESS
-from sift.offline.ingest import EVENTS_DIR, events_glob
+from sift.offline.ingest import EVENTS_DIR, REVIEW_EVENT, events_glob
 from sift.ranking.rank import SERVING_POOL, reranked_candidate_lists
 from sift.ranking.train import ALS_RANKER_MODEL
 from sift.rerank.rerank import CATEGORY_CAP, RERANK_POOL, Candidate, rerank
@@ -65,13 +65,18 @@ def load_pre_t_reviewed(
 ) -> dict[str, set[str]]:
     """Businesses each user reviewed strictly before T — right-exclusive, like every
     other training-time read. Deliberately not the online set; see the module docstring.
+
+    Filtered to review events for the same reason the publisher is: the canonical event
+    table is designed to carry tips and check-ins later (D2), and an unfiltered query
+    would start calling a tipped business "reviewed" the day one lands. The offline and
+    online definitions have to widen together or the eval stops describing serving.
     """
     con = duckdb.connect()
     try:
         rows = con.execute(
             "SELECT DISTINCT user_id, business_id FROM "
             f"read_parquet({sql_path(Path(events_glob(events_dir)))}) "
-            f"WHERE ts < TIMESTAMP '{cutoff}'"
+            f"WHERE event_type = '{REVIEW_EVENT}' AND ts < TIMESTAMP '{cutoff}'"
         ).fetchall()
     finally:
         con.close()
@@ -232,12 +237,18 @@ def main() -> None:
         "\n  average one. The pre-rerank row is therefore a weaker claim about discovery"
         "\n  than it looks (D29 / I5)."
     )
+    # Read the closed filter's cost off this run rather than quoting it. A number typed
+    # into an explanation is a number that goes stale the next time the data moves, and
+    # this sentence already shipped once claiming "well under 1%" against a measured
+    # 1.7% — the exact failure the surrounding decision is about.
+    closed_only = next(report for label, report in rows if label == "closed filter only")
+    closed_cost = 100 * (1 - closed_only.recall[10] / base10)
     print(
         f"\n  Closed businesses are {closed_targets:,}/{pairs:,} "
         f"({100 * closed_targets / pairs:.2f}%) of holdout targets, unreachable once filtered,"
-        "\n  yet cost well under 1% of recall@10 — the model was rarely finding them anyway"
-        "\n  (I12). Both numbers are reported so a dataset-vintage artifact cannot read as a"
-        "\n  ranking regression."
+        f"\n  yet cost only {closed_cost:.1f}% of recall@10 — the model was rarely finding them"
+        "\n  anyway (I12). Both numbers are reported so a dataset-vintage artifact cannot read"
+        "\n  as a ranking regression."
     )
 
 

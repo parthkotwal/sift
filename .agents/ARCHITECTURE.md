@@ -107,7 +107,7 @@ As-of `t`, right-exclusive windows. Hazard taxonomy lives in `DATA.md`.
 
 ## Build order — backwards, one stage at a time
 
-Each step ends with something that runs end to end; nothing lands without beating the thing before it.
+Each step ends with something that runs end to end; nothing lands without beating the thing before it — except where a decision entry argues otherwise, which so far means step 6 alone (D29: rerank lowers recall@10 by 41% and lands, because the drop is the metric losing credit for repeat-visit prediction rather than the stage performing badly). The rule stops a change being kept because it *feels* better; it does not require the final number to always rise.
 
 1. **Dumb path:** FastAPI endpoint; retrieval = most-reviewed businesses in the city; no ML, no store. The temporal split (train < T, eval ≥ T) is defined here and frozen forever.
 2. **Eval harness:** recall@k and NDCG@10 against the holdout + per-stage latency measurement. Every later change is judged against this.

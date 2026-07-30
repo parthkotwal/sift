@@ -41,7 +41,7 @@ from sift.features.definitions import (
     online_features,
 )
 from sift.offline.dim_business import DIM_BUSINESS
-from sift.offline.ingest import EVENTS_DIR, events_glob
+from sift.offline.ingest import EVENTS_DIR, REVIEW_EVENT, events_glob
 from sift.store.materialize import HISTORICAL_DIR, state_path
 from sift.store.read import attach_store, read_current_features
 
@@ -344,10 +344,17 @@ def materialize_online(
         # reviews that *are* the eval targets, so evaluating through it would filter
         # away the ground truth and report recall near zero. `rerank.evaluate` reads
         # pre-T pairs directly for that reason.
+        # `event_type = 'review'` is load-bearing even though ingest emits nothing else
+        # today. The canonical event table exists so tips and check-ins can land as
+        # pure ingest additions (D2), and the moment one does, an unfiltered query here
+        # would treat a tipped business as reviewed and silently suppress it from every
+        # recommendation — a filter widening itself as a side effect of an unrelated
+        # ingest change, with no test failing. "Reviewed" is a claim about reviews.
         reviewed_rows = con.execute(
             "SELECT user_id, list(DISTINCT business_id) AS seen "
             f"FROM read_parquet({sql_path(Path(events_glob(events_dir)))}) "
-            "WHERE ts < ? GROUP BY user_id ORDER BY user_id",
+            f"WHERE event_type = '{REVIEW_EVENT}' AND ts < ? "
+            "GROUP BY user_id ORDER BY user_id",
             [as_of],
         )
         while batch := reviewed_rows.fetchmany(PIPELINE_SIZE):
@@ -538,12 +545,33 @@ class OnlineFeatureStore:
         self._thread.manifest = manifest
         return manifest
 
+    def snapshot(self) -> OnlineManifest:
+        """Pin the active generation for the life of one request.
+
+        Every read below resolves the active generation independently unless handed a
+        snapshot, so a publication landing mid-request would let one request retrieve
+        with one generation, rank with the next, and filter with a third — serving a
+        list whose user embedding, features, and filters come from three different
+        atomic snapshots, with nothing raised.
+
+        The generation switch is a single Redis `SET` and the store is explicitly
+        designed around that atomicity, so the fix is not more locking: it is capturing
+        the generation *once per request* and requiring every read to name it. That is
+        the same property the per-generation item-ALS relations gave the DuckDB side —
+        an in-flight request finishes against the snapshot it started on.
+        """
+        return self.manifest()
+
     def lookup_user_embedding(
-        self, user_id: str, name: str = USER_BEHAVIORAL_EMBEDDING
+        self,
+        user_id: str,
+        name: str = USER_BEHAVIORAL_EMBEDDING,
+        *,
+        snapshot: OnlineManifest | None = None,
     ) -> list[float] | None:
         """Read one registered user vector from the active atomic snapshot."""
         definition = get_embedding(name)
-        manifest = self.manifest()
+        manifest = snapshot or self.manifest()
         if (name, definition.version) not in manifest.embeddings:
             raise OnlineStoreUnavailable(
                 f"{name} is not materialized in Redis; rematerialize with that definition"
@@ -564,7 +592,13 @@ class OnlineFeatureStore:
             )
         return vector
 
-    def rerank_inputs(self, user_id: str, business_ids: Sequence[str]) -> RerankInputs:
+    def rerank_inputs(
+        self,
+        user_id: str,
+        business_ids: Sequence[str],
+        *,
+        snapshot: OnlineManifest | None = None,
+    ) -> RerankInputs:
         """Read the rerank stage's serving-only inputs from the active generation.
 
         One `mget` of the user's reviewed set plus the candidates' business records —
@@ -576,7 +610,7 @@ class OnlineFeatureStore:
         closed is the safe direction: the alternative surfaces a business the store
         knows nothing about, and rerank's job is to be the last thing that can say no.
         """
-        manifest = self.manifest()
+        manifest = snapshot or self.manifest()
         generation = manifest.generation
         unique = tuple(dict.fromkeys(business_ids))
         keys = [_key(generation, "user_reviewed", user_id)]
@@ -614,11 +648,13 @@ class OnlineFeatureStore:
         self,
         queries: Sequence[FeatureQuery],
         features: Sequence[str] | None = None,
+        *,
+        snapshot: OnlineManifest | None = None,
     ) -> list[tuple[object, ...]]:
         """Return current features for arbitrary user/business query pairs."""
         if not queries:
             return []
-        manifest = self.manifest()
+        manifest = snapshot or self.manifest()
         generation = manifest.generation
         users = tuple(dict.fromkeys(query.user_id for query in queries))
         businesses = tuple(dict.fromkeys(query.business_id for query in queries))

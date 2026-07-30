@@ -117,12 +117,30 @@ requirement next to `uv sync`.
 
 ## Open
 
-### I33 — One request reads the active generation twice   [open, narrow]
+### I33 — One request read the active generation three times   [fixed]
 
-`OnlineALSRetriever.recommend` calls the store twice: `lookup()` for the ranker's
-features and `rerank_inputs()` for the filters. Each resolves the active generation
-independently, so a publish landing between them serves a list whose features came
-from one snapshot and whose `is_open`/reviewed filters came from the next.
+**I logged this as "twice" and as "narrow". Cross-review found it is three times, and
+the third one is what makes it not narrow.** `recommend` called
+`lookup_user_embedding` (retrieval's input), `lookup` (the ranker's features), and
+`rerank_inputs` (the filters) — each resolving the active generation independently. A
+publication landing mid-request could therefore retrieve with one snapshot, rank with
+the next, and filter with a third.
+
+Missing the embedding read is what made my severity assessment wrong. I reasoned about
+two catalog-scale reads that drift slowly between generations and concluded the
+consequence was mild. But the embedding is the *user's* vector: mixing it with another
+generation's item features is precisely the user-state/item-vector mixture the
+per-generation item-ALS relation fix had just closed one layer down — the same bug, one
+call site up, which I had just finished writing about and still under-counted.
+
+**Fixed.** `OnlineFeatureStore.snapshot()` captures the manifest once; all three reads
+take a `snapshot=` argument and use it. `recommend` pins one at the top. Two tests
+cover it: a unit test asserting one resolution and three reads sharing it, and a store
+test that flips the active pointer between reads and proves the pinned snapshot still
+returns the old generation's values while an unpinned read follows the pointer.
+
+**Rule:** when counting the call sites of a bug, enumerate them from the code rather
+than from memory of the code. The one I forgot was the one that mattered.
 
 This is the same class the cross-review fix for the item-ALS relation closed one layer
 down — an in-flight request straddling a generation switch — and it survives here
@@ -502,6 +520,29 @@ Unifying them requires remeasuring both baselines, not editing one line.
 ---
 
 ## Fixed — kept because the failure mode recurs
+
+### I34 — "Already reviewed" meant any event type   [fixed]
+
+Both reviewed-history queries — the Redis publisher and the offline rerank harness —
+selected user/business pairs from the canonical event table with no `event_type`
+filter. Correct today by accident: ingest emits only `'review'`.
+
+The trap is that it is designed not to stay that way. D2 chose one canonical event
+table precisely so tips and check-ins can land as *pure ingest additions* — same
+schema, new `event_type` — and `ingest.py`'s own docstring says so. The day one lands,
+both queries silently widen: a business the user merely tipped becomes "reviewed" and
+is suppressed from every recommendation they ever see. Nothing raises, no test fails,
+and the symptom is a slightly worse recall that looks like model drift.
+
+**Fixed** by filtering both on `event_type = REVIEW_EVENT`, with the constant defined
+in `ingest.py` next to the writer that emits it so the literal cannot drift from the
+producer. A test writes a mixed-event partition and asserts a tipped business is not
+treated as reviewed.
+
+**Rule:** a query against the canonical event table that omits `event_type` is making a
+claim about *all future event types*, not just today's. The schema was designed to grow;
+consumers have to say what they mean now, while there is only one answer and the
+omission is invisible.
 
 ### I32 — An ablation row measured a disabled variant   [fixed]
 

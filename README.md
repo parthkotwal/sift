@@ -28,7 +28,9 @@ Offline, a batch job builds point-in-time-correct training examples from the rev
 
 ## Build order
 
-Backwards, one stage at a time: dumb popularity baseline end-to-end first, then the eval harness, then ranking, then the feature store, then learned retrieval (ALS first; a two-tower lands only if it beats ALS at recall@500), then rerank, then scale. Nothing lands without beating the thing before it.
+Backwards, one stage at a time: dumb popularity baseline end-to-end first, then the eval harness, then ranking, then the feature store, then learned retrieval (ALS first; a two-tower lands only if it beats ALS at recall@500), then rerank, then scale. Nothing lands without beating the thing before it — with one deliberate, documented exception.
+
+**The exception is rerank (D29)**, which lowers recall@10 by 41% and lands anyway. The rule exists to stop a change being kept because it feels better; it is not a rule that the final number must always rise. Rerank's drop is almost entirely the already-reviewed filter removing credit the ranker was earning for predicting return visits, and knowing that is worth more than the number it cost. An exception that has to be argued in the decision log is the rule working, not the rule being broken.
 
 The fixed two-tower has now been run through that gate and did not replace ALS.
 Its code and versioned artifacts remain reproducible for inspection; the selected

@@ -4,14 +4,17 @@ version = "0.0.0"
 description = "Two-stage retrieval and ranking service over the Yelp Open Dataset."
 readme = "README.md"
 requires-python = ">=3.12"
+# What a serving container needs, and nothing more. `lightgbm` is here because the
+# ranker runs at request time (D27); `duckdb` because the online store projects the
+# registry's SQL expressions on the serving path. The training-only libraries moved to
+# the `training` group below — asserting that the API does not *import* them is not the
+# same as not *installing* them, and only the second one shrinks the image.
 dependencies = [
     "duckdb>=1.5.5",
     "fastapi>=0.115",
-    "implicit>=0.7.2",
     "lightgbm>=4.7.0",
     "numpy>=2.5.1",
     "redis>=5.2",
-    "torch>=2.13.0",
     "uvicorn[standard]>=0.34",
 ]
 
@@ -24,6 +27,24 @@ dev = [
     "pytest>=8.3",
     "httpx>=0.28",
 ]
+
+# Fitting the artifacts, never reading them. `implicit` fits the ALS factors (D25) and
+# the yearly slices (D27); `torch` trained the two-tower that lost its gate (D26) and is
+# kept only so that rejection stays reproducible. Serving reads the .npy files both
+# produced and calls neither library.
+#
+# `scipy` is not listed: LightGBM depends on it, so it arrives with a required serving
+# dependency. The boundary drawn here is Sift's own imports, not its libraries'.
+training = [
+    "implicit>=0.7.2",
+    "torch>=2.13.0",
+]
+
+[tool.uv]
+# Local work is unchanged: `uv sync` still installs everything, so training, tests and
+# the notebook-style modules all run. A serving image opts out with
+# `uv sync --no-default-groups --no-dev`, which is the only place the split pays off.
+default-groups = ["dev", "training"]
 
 [build-system]
 requires = ["hatchling"]

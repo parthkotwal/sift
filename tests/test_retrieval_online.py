@@ -37,17 +37,36 @@ class _Store:
         self.categories = categories or {}
         self.queried: list[list[str]] = []
         self.rerank_queried: list[list[str]] = []
+        self.snapshots_taken = 0
+        self.snapshots_seen: list[object] = []
 
-    def lookup_user_embedding(self, user_id: str) -> list[float] | None:
+    def snapshot(self) -> object:
+        """A fresh object per call, so a request that captured one snapshot and a
+        request that re-resolved would be distinguishable below."""
+        self.snapshots_taken += 1
+        return f"generation-{self.snapshots_taken}"
+
+    def lookup_user_embedding(
+        self, user_id: str, name: str = "", *, snapshot: object = None
+    ) -> list[float] | None:
+        self.snapshots_seen.append(snapshot)
         return self.vectors.get(user_id)
 
     def lookup(
-        self, queries: Sequence[FeatureQuery], features: Sequence[str] | None = None
+        self,
+        queries: Sequence[FeatureQuery],
+        features: Sequence[str] | None = None,
+        *,
+        snapshot: object = None,
     ) -> list[tuple[object, ...]]:
+        self.snapshots_seen.append(snapshot)
         self.queried.append([query.business_id for query in queries])
         return [(query.query_id, self.values[query.business_id]) for query in queries]
 
-    def rerank_inputs(self, user_id: str, business_ids: Sequence[str]) -> RerankInputs:
+    def rerank_inputs(
+        self, user_id: str, business_ids: Sequence[str], *, snapshot: object = None
+    ) -> RerankInputs:
+        self.snapshots_seen.append(snapshot)
         self.rerank_queried.append(list(business_ids))
         return RerankInputs(
             reviewed=frozenset(self.reviewed.get(user_id, set())),
@@ -229,3 +248,24 @@ def test_diversity_caps_one_category_from_dominating_the_served_list(tmp_path: P
     # lowest-scored candidate takes the slot instead — that swap is the whole stage.
     kept = [entry.business_id for entry in retriever.recommend("warm", 3).results]
     assert kept == ["p1", "p2", "c1"]
+
+
+def test_every_read_in_one_request_uses_a_single_pinned_generation(tmp_path: Path) -> None:
+    """P1: the embedding, feature, and rerank reads each resolved the active generation
+    independently, so a publication landing mid-request could retrieve with one
+    snapshot, rank with the next, and filter with a third — three atomic snapshots in
+    one response, with nothing raised. `recommend` now pins one and passes it down."""
+    store = _Store({"warm": _warm_vector()}, {"b1": 10.0, "b2": 5.0, "b3": 1.0})
+    _retriever(tmp_path, store).recommend("warm", 3)
+
+    assert store.snapshots_taken == 1, "the generation must be resolved once per request"
+    assert len(store.snapshots_seen) == 3, "embedding, feature and rerank reads"
+    assert set(store.snapshots_seen) == {"generation-1"}, store.snapshots_seen
+
+
+def test_the_cold_path_also_pins_its_generation(tmp_path: Path) -> None:
+    """The cold branch skips the feature read but still does two, and they must agree."""
+    store = _Store({}, {})
+    _retriever(tmp_path, store).recommend("cold", 2)
+    assert store.snapshots_taken == 1
+    assert set(store.snapshots_seen) == {"generation-1"}

@@ -76,12 +76,18 @@ class OnlineALSRetriever:
     def recommend(self, user_id: str, k: int = 10) -> OnlineRecommendation:
         started = time.perf_counter()
 
+        # Pin the generation once, for the whole request. The three store reads below
+        # each resolve the active generation independently otherwise, so a publication
+        # landing mid-request would retrieve with one snapshot, rank with the next, and
+        # filter with a third — three atomic snapshots in one response, silently.
+        snapshot = self.store.snapshot()
+
         # The embedding lookup is retrieval's own input, so it is charged to the
         # retrieval stage — matching how D25 reported "Redis vector lookup + exact
         # retrieval" as one number. `feature_lookup_ms` below is the ranker's
         # candidate feature fetch, which is what the 20ms allocation was written for.
         retrieval_started = time.perf_counter()
-        vector = self.store.lookup_user_embedding(user_id)
+        vector = self.store.lookup_user_embedding(user_id, snapshot=snapshot)
         cold = vector is None
         if cold:
             # RERANK_POOL, not k: the cold path is filtered too, so it needs slack to
@@ -108,7 +114,8 @@ class OnlineALSRetriever:
                 [
                     FeatureQuery(position, user_id, business_id)
                     for position, business_id in enumerate(candidate_ids)
-                ]
+                ],
+                snapshot=snapshot,
             )
             feature_done = time.perf_counter()
 
@@ -139,7 +146,9 @@ class OnlineALSRetriever:
         # `lookup()`: `is_open` is legitimate online and unconstructible historically
         # (D13), so it must not be reachable as a feature. See D29.
         rerank_started = time.perf_counter()
-        inputs = self.store.rerank_inputs(user_id, [business_id for business_id, _ in chosen])
+        inputs = self.store.rerank_inputs(
+            user_id, [business_id for business_id, _ in chosen], snapshot=snapshot
+        )
         final = rerank(
             [
                 Candidate(

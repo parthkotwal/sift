@@ -11,15 +11,23 @@ The same reasoning covers the already-reviewed filter. Both inputs therefore sit
 outside the training/serving skew check by construction — there is no training-side
 value to compare against. That is a property of the stage, not a gap in the check.
 
-**Both filters were measured before being adopted, and one result was a surprise.**
-Businesses the user already reviewed are 1.3% of the ranker's 500-candidate pool but
-**13.0%** of its top-10 — a 10x concentration, because `ui_als_score` and
-`ui_category_affinity` both spike hardest on a pair the user actually visited. So
-dropping them frees 13% of the final slots while forfeiting the ~1.6% of holdout
-targets that are repeat visits (D18). Closed businesses are 27.6% of the catalog and
-27.9% of the pool, but only 10.9% of the top-10 — the ranker has already partially
-learned that signal through review recency, so the filter is less destructive than
-the catalog share suggests. Full reasoning in DECISIONS.md D29.
+**This stage lowers the headline metric, and that is the finding rather than a
+defect.** Measured on the frozen holdout (26,489 users): the already-reviewed filter
+costs **42.0%** of recall@10, the closed filter **1.7%**, the diversity cap **1.8%**.
+
+The repeats figure is large because **949 of the ranker's 2,579 top-10 hits (36.8%)
+are businesses the user had already reviewed**, drawn from ~1.3% of the candidate
+pool — a repeat converts at roughly 28x an average candidate, since a return visit is
+the easiest thing in this dataset to predict. So the filter removes the *densest*
+slice of the model's success, and more than a third of the pre-rerank number was
+credit for predicting that people go back to their regular places.
+
+An earlier version of this docstring justified the filter by arguing it frees 13% of
+the final slots to forfeit only ~1.6% of holdout targets. That argument is wrong and
+is kept here as a warning: it treats the freed slots as converting at the average
+rate, when the slots a good model puts at the top are by construction the best ones.
+Share-of-slots and share-of-hits are not interchangeable. Full reasoning, and the
+decision to keep the filter anyway, in DECISIONS.md D29 and ISSUES.md I5.
 
 Diversity is deliberately the simplest thing that works: a cap on how many of the
 final list may share a primary category. It never shortens the list — capped

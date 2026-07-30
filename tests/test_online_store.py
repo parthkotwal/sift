@@ -533,3 +533,65 @@ def test_a_generation_written_under_an_older_schema_is_refused(tmp_path: Path) -
     store = OnlineFeatureStore(_redis(fake))
     with pytest.raises(OnlineStoreUnavailable, match="schema"):
         store.rerank_inputs("u1", ["b1"])
+
+
+def test_a_pinned_snapshot_survives_a_publication_mid_request(tmp_path: Path) -> None:
+    """P1: a request must finish against the generation it started on.
+
+    The active pointer is flipped between reads here, which is exactly what a
+    publication does. Without a pinned snapshot the second read would silently follow
+    the pointer and the response would mix two atomic generations.
+    """
+    historical, dim, events = _artifacts(tmp_path)
+    fake = _MemoryRedis()
+    first = materialize_online(
+        client=_redis(fake), historical_dir=historical, dim_file=dim, events_dir=events
+    )
+    store = OnlineFeatureStore(_redis(fake))
+    pinned = store.snapshot()
+    assert pinned.generation == first.generation
+
+    # A publication lands mid-request: new generation, pointer flipped.
+    second = materialize_online(
+        client=_redis(fake), historical_dir=historical, dim_file=dim, events_dir=events
+    )
+    assert second.generation != first.generation
+    # Make the two generations distinguishable, so "read the old one" is observable
+    # rather than merely plausible.
+    newer = fake.values[f"{KEY_PREFIX}:{second.generation}:business:b1"]
+    assert isinstance(newer, str)
+    record = json.loads(newer)
+    record["is_open"] = "0"
+    fake.values[f"{KEY_PREFIX}:{second.generation}:business:b1"] = json.dumps(record)
+
+    assert store.rerank_inputs("u1", ["b1"], snapshot=pinned).is_open["b1"] is True
+    assert store.lookup([FeatureQuery(1, "u1", "b1")], snapshot=pinned)[0][0] == 1
+
+    # And without the pin, the same client follows the pointer to the new generation —
+    # which is the behaviour the pin exists to prevent mid-request.
+    assert store.rerank_inputs("u1", ["b1"]).is_open["b1"] is False
+
+
+def test_reviewed_history_counts_reviews_only(tmp_path: Path) -> None:
+    """P2: the canonical event table is designed to carry tips and check-ins later
+    (D2). An unfiltered query would call a tipped business "reviewed" the day one
+    lands and silently suppress it from every recommendation, with no test failing."""
+    historical, dim, events = _artifacts(tmp_path)
+    # Append a non-review event for a user who reviewed nothing else in this partition.
+    con = duckdb.connect()
+    try:
+        con.execute(
+            f"COPY (SELECT 'u2' AS user_id, 'b3' AS business_id, 'tip' AS event_type, "
+            f"TIMESTAMP '2018-06-01 12:00:00' AS ts, NULL::SMALLINT AS stars) "
+            f"TO {sql_path(events / 'year=2018' / 'tips.parquet')} (FORMAT PARQUET)"
+        )
+    finally:
+        con.close()
+
+    fake = _MemoryRedis()
+    materialize_online(
+        client=_redis(fake), historical_dir=historical, dim_file=dim, events_dir=events
+    )
+    seen = OnlineFeatureStore(_redis(fake)).rerank_inputs("u2", ["b3"]).reviewed
+    assert "b3" not in seen, "a tip is not a review; filtering on it would hide b3"
+    assert seen == frozenset({"b1"}), "u2's actual review must still be there"

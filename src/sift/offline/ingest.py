@@ -35,6 +35,12 @@ from sift.config import (
 SILVER_DIR = DATA_DIR / "silver"
 EVENTS_DIR = SILVER_DIR / "events"
 
+# The only `event_type` emitted today. Named because consumers must filter on it:
+# the canonical table is designed so tips and check-ins land later as pure ingest
+# additions (D2), and a consumer that reads every row would silently widen its meaning
+# the day one does. Defined next to the writer so the literal cannot drift from it.
+REVIEW_EVENT = "review"
+
 # Columns read from each raw file — naming them keeps DuckDB from scanning the
 # heavy `text` field it doesn't need.
 _BUSINESS_COLS = "{'business_id':'VARCHAR','city':'VARCHAR','state':'VARCHAR'}"
@@ -78,7 +84,7 @@ def build_events(
                 SELECT
                     r.user_id                              AS user_id,
                     r.business_id                          AS business_id,
-                    'review'                               AS event_type,
+                    '{REVIEW_EVENT}'                       AS event_type,
                     CAST(r.date AS TIMESTAMP)              AS ts,
                     CAST(r.stars AS SMALLINT)              AS stars,
                     CAST(EXTRACT(year FROM CAST(r.date AS TIMESTAMP)) AS INTEGER) AS year

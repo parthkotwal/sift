@@ -84,3 +84,39 @@ def test_training_paths_still_resolve_through_their_original_modules() -> None:
     assert artifacts.ITEM_FACTORS.name == "item_embedding_behavioral_v1.npy"
     assert artifacts.ITEM_IDS.name == "item_ids.json"
     assert artifacts.ALS_DIR.name == "als"
+
+
+def test_training_libraries_are_not_runtime_dependencies() -> None:
+    """Asserting the API does not *import* implicit is not the same claim as not
+    *installing* it, and only the second shrinks the deployed image.
+
+    The import tests above would all pass with `torch` still in `[project]
+    .dependencies`, quietly pulling the whole CUDA stack into a Fargate task that
+    re-pulls its image on every start. This asserts the packaging half.
+    """
+    import tomllib
+    from pathlib import Path
+
+    manifest = tomllib.loads(
+        (Path(__file__).resolve().parents[1] / "pyproject.toml").read_text()
+    )
+    runtime = {
+        name.split(">")[0].split("[")[0].strip()
+        for name in manifest["project"]["dependencies"]
+    }
+    training = {
+        name.split(">")[0].split("[")[0].strip()
+        for name in manifest["dependency-groups"]["training"]
+    }
+
+    assert not (runtime & set(TRAINING_ONLY)), (
+        f"training-only libraries are runtime dependencies: {sorted(runtime & set(TRAINING_ONLY))}"
+    )
+    assert set(TRAINING_ONLY) <= training, (
+        "training libraries must stay declared somewhere, or `uv sync` stops being able "
+        f"to fit the artifacts: missing {sorted(set(TRAINING_ONLY) - training)}"
+    )
+    # LightGBM is a *serving* dependency — the ranker scores every warm request (D27) —
+    # so it must not drift into the training group on the assumption that all ML
+    # libraries are training-only.
+    assert "lightgbm" in runtime
