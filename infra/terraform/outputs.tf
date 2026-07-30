@@ -41,3 +41,21 @@ output "security_group_ids" {
     redis     = aws_security_group.redis.id
   }
 }
+
+output "artifact_bucket" {
+  description = "Private S3 bucket holding immutable serving generations."
+  value = {
+    arn    = aws_s3_bucket.artifacts.arn
+    name   = aws_s3_bucket.artifacts.id
+    prefix = local.artifact_prefix
+  }
+}
+
+output "ecr_repository" {
+  description = "Private ECR repository consumed by CI and ECS."
+  value = {
+    arn  = aws_ecr_repository.api.arn
+    name = aws_ecr_repository.api.name
+    url  = aws_ecr_repository.api.repository_url
+  }
+}

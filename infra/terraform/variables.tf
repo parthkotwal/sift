@@ -66,3 +66,9 @@ variable "alb_ingress_cidrs" {
     error_message = "alb_ingress_cidrs must contain at least one valid IPv4 CIDR."
   }
 }
+
+variable "allow_asset_deletion" {
+  description = "Allow Terraform to delete a non-empty artifact bucket and ECR repository during teardown."
+  type        = bool
+  default     = false
+}

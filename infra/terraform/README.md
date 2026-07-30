@@ -31,7 +31,8 @@ Resources will be added in reviewable slices, not as one uninspectable apply:
 
 1. network (implemented, not applied): VPC, internet gateway, two public and two
    private subnets, route tables, and narrowly scoped security groups;
-2. storage and registry: private versioned S3 artifact bucket and private ECR;
+2. storage and registry (implemented, not applied): private versioned S3
+   artifact bucket and private ECR;
 3. Redis and observability: single-node ElastiCache and CloudWatch log groups;
 4. IAM: separate ECS execution and task roles with resource-scoped policies;
 5. ECS and ALB: cluster, task definitions, one-task service, target group,
@@ -57,3 +58,23 @@ Security-group relationships are deliberately directional:
 
 The public HTTPS egress is required because this no-NAT design uses public-IP
 Fargate tasks to pull from ECR, download artifacts from S3, and publish logs.
+
+## Artifact storage and registry contract
+
+The S3 bucket name includes the AWS account ID and remains private through all
+four Block Public Access settings, bucket-owner-enforced ownership, and a
+TLS-only bucket policy. Versioning and AES-256 encryption are enabled. Lifecycle
+rules abort incomplete multipart uploads after one day and expire only
+noncurrent object versions after seven days; current immutable generation
+objects do not expire automatically.
+
+The ECR repository uses AES-256 encryption and immutable tags. Basic scanning is
+enabled per repository on push. Registry-level scanning would alter behavior for
+unrelated repositories in the account, so this intentionally uses the scoped
+repository setting. The lifecycle expires untagged images after one day and
+keeps the ten newest tagged images.
+
+`allow_asset_deletion` defaults to `false`. A destroy therefore refuses to
+empty a populated bucket or repository until Phase 8 explicitly chooses
+deletion and changes that input. The artifacts and images are reproducible, but
+their deletion should still be an intentional teardown decision.

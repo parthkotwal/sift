@@ -6,6 +6,9 @@ project_name = "sift"
 environment  = "showcase"
 vpc_cidr     = "10.42.0.0/20"
 
+# Keep false until Phase 8 explicitly decides to delete deployment assets.
+allow_asset_deletion = false
+
 additional_tags = {
   Purpose = "portfolio-showcase"
 }

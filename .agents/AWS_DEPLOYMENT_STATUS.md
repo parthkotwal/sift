@@ -145,8 +145,7 @@ These are smoke observations, not the Phase 7 Fargate benchmark.
 
 ### Phase 2 — S3 startup boundary
 
-Implemented on the current `aws` branch and intended to be committed with this
-status update:
+Commit `14cbedb` (`deploy: verify S3 artifact generations at task startup`):
 
 - one container entrypoint wraps both the default API command and ECS command
   overrides;
@@ -243,6 +242,54 @@ Cost boundary as of 2026-07-30:
 - data transfer can also accrue once traffic exists. Re-check the inspected
   full plan before apply rather than treating this categorical note as a quote.
 
+### Phase 3 — private artifact storage and registry
+
+Implemented on the current `aws` branch without applying it:
+
+- one account-unique private S3 bucket under the fixed
+  `sift/artifacts` application prefix;
+- all four S3 Block Public Access controls enabled and ownership fixed to
+  `BucketOwnerEnforced`;
+- S3 versioning and AES-256 server-side encryption enabled;
+- a deny-only bucket policy rejects non-TLS requests and grants no principal
+  access;
+- lifecycle rules abort incomplete multipart uploads after one day and delete
+  noncurrent versions after seven days, with no expiration of current artifact
+  objects;
+- one private ECR repository with AES-256 encryption, immutable tags, and
+  repository-scoped basic scan-on-push;
+- ECR lifecycle expires untagged images after one day and retains the ten
+  newest tagged images;
+- `allow_asset_deletion` defaults to `false`, so Terraform cannot silently
+  empty a populated bucket or repository. Phase 8 must explicitly opt in when
+  the showcase assets are ready for teardown;
+- outputs expose only the artifact bucket name/ARN/prefix and ECR repository
+  name/ARN/URL needed by later phases.
+
+Saved-plan audit:
+
+- the combined network, storage, and registry plan reported
+  `31 to add, 0 to change, 0 to destroy`;
+- exactly nine additions belong to S3 or ECR;
+- the planned bucket has all public-access controls enabled, versioning
+  enabled, AES-256 encryption, and no current-object expiration;
+- the planned ECR repository has `force_delete = false`,
+  `image_tag_mutability = "IMMUTABLE"`, and `scan_on_push = true`;
+- the generated lifecycle JSON selects all tagged images with `["*"]` and
+  expires only those beyond the newest ten;
+- the saved plan was deleted after JSON inspection so it cannot become a stale
+  apply artifact;
+- no `terraform apply` was run and no AWS resources were created.
+
+Cost boundary:
+
+- this slice adds only S3 and ECR storage/request categories once applied;
+- it deliberately uses service-managed AES-256 encryption rather than a
+  customer-managed KMS key;
+- basic ECR scanning is used, not enhanced Inspector scanning;
+- actual storage, request, transfer, and scan behavior must be checked after
+  publication rather than estimated from empty resources.
+
 ## AWS resource state
 
 No AWS infrastructure has been created by this lane yet:
@@ -261,21 +308,24 @@ deployment-generated AWS service charges to preserve.
 
 ## Exact next action
 
-Add the Phase 3 private storage and registry configuration without applying it:
+Add the Phase 3 Redis and CloudWatch configuration without applying it:
 
-1. create one account-unique, private S3 artifact bucket;
-2. enable Block Public Access, bucket-owner-enforced ownership, versioning, and
-   server-side encryption;
-3. create one private ECR repository with immutable tags, scan-on-push, and
-   encryption;
-4. add bounded lifecycle policies appropriate to a one-day showcase without
-   deleting the selected generation during validation;
-5. expose only the bucket name/ARN and ECR repository URL/ARN needed later;
-6. format, validate, and inspect a saved plan for public access, retention,
-   destructive teardown behavior, and unexpected resources.
+1. confirm a currently supported, low-cost ElastiCache Redis/Valkey engine and
+   ARM-compatible single-node class in `us-west-2`;
+2. place one rebuildable cache node in a subnet group made from the two private
+   subnets and attach only the existing Redis security group;
+3. disable Multi-AZ, automatic failover, and durable snapshots while retaining
+   encryption and a safe maintenance/upgrade posture appropriate to the
+   showcase;
+4. define short-retention CloudWatch log groups for the API and one-off
+   materialization task;
+5. expose only the cache connection information and log-group names consumed
+   by the later task definitions;
+6. format, validate, and inspect a saved plan for public exposure, node count,
+   persistence, retention, unexpected resources, and expected cost categories.
 
-Do not run `terraform apply` yet. First report the planned resource count,
-internet-facing rules, absence of NAT, and expected one-day cost categories.
+Do not run `terraform apply` yet. Do not place credentials or a generated cache
+endpoint in tracked configuration.
 
 ## Remaining phases
 
