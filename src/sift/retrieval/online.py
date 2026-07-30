@@ -76,17 +76,23 @@ class OnlineALSRetriever:
     def recommend(self, user_id: str, k: int = 10) -> OnlineRecommendation:
         started = time.perf_counter()
 
+        # The embedding lookup is retrieval's own input, so it is charged to the
+        # retrieval stage — matching how D25 reported "Redis vector lookup + exact
+        # retrieval" as one number. `feature_lookup_ms` below is the ranker's
+        # candidate feature fetch, which is what the 20ms allocation was written for.
+        #
+        # Pinning the generation is charged here too. It is a real Redis round trip
+        # (~1.1ms) that every stage depends on, and leaving it before the first timer
+        # put it in `overhead` — a bucket that had meant "routing and serialization"
+        # and was quietly carrying a network call. An unattributed millisecond is the
+        # thing per-stage instrumentation exists to prevent.
+        retrieval_started = time.perf_counter()
+
         # Pin the generation once, for the whole request. The three store reads below
         # each resolve the active generation independently otherwise, so a publication
         # landing mid-request would retrieve with one snapshot, rank with the next, and
         # filter with a third — three atomic snapshots in one response, silently.
         snapshot = self.store.snapshot()
-
-        # The embedding lookup is retrieval's own input, so it is charged to the
-        # retrieval stage — matching how D25 reported "Redis vector lookup + exact
-        # retrieval" as one number. `feature_lookup_ms` below is the ranker's
-        # candidate feature fetch, which is what the 20ms allocation was written for.
-        retrieval_started = time.perf_counter()
         vector = self.store.lookup_user_embedding(user_id, snapshot=snapshot)
         cold = vector is None
         if cold:

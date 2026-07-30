@@ -20,6 +20,7 @@ from sift.offline.ingest import build_events
 from sift.store.materialize import materialize_historical
 from sift.store.online import (
     ACTIVE_GENERATION_KEY,
+    CATALOG_RECORD,
     ITEM_ALS_ALL,
     KEY_PREFIX,
     FeatureQuery,
@@ -435,8 +436,8 @@ def test_item_als_relations_are_pinned_to_the_request_generation(tmp_path: Path)
     second_row = store.lookup([FeatureQuery(0, "u1", "b1")])
     assert second_row[0][-2] == 20.0
 
-    first_relation = store._item_als_relations[first.generation]
-    second_relation = store._item_als_relations[second.generation]
+    first_relation = store._catalog_relations_by_generation[first.generation]["item_als"]
+    second_relation = store._catalog_relations_by_generation[second.generation]["item_als"]
     assert first_relation != second_relation
     assert store._database.execute(
         f"SELECT value FROM {first_relation} WHERE business_id = 'b1'"
@@ -558,11 +559,12 @@ def test_a_pinned_snapshot_survives_a_publication_mid_request(tmp_path: Path) ->
     assert second.generation != first.generation
     # Make the two generations distinguishable, so "read the old one" is observable
     # rather than merely plausible.
-    newer = fake.values[f"{KEY_PREFIX}:{second.generation}:business:b1"]
+    newer_key = f"{KEY_PREFIX}:{second.generation}:business:{CATALOG_RECORD}"
+    newer = fake.values[newer_key]
     assert isinstance(newer, str)
-    record = json.loads(newer)
-    record["is_open"] = "0"
-    fake.values[f"{KEY_PREFIX}:{second.generation}:business:b1"] = json.dumps(record)
+    catalog = json.loads(json.loads(newer)["rows"])
+    catalog["b1"]["is_open"] = False
+    fake.values[newer_key] = json.dumps({"rows": json.dumps(catalog)})
 
     assert store.rerank_inputs("u1", ["b1"], snapshot=pinned).is_open["b1"] is True
     assert store.lookup([FeatureQuery(1, "u1", "b1")], snapshot=pinned)[0][0] == 1

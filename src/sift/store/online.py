@@ -49,7 +49,11 @@ DEFAULT_REDIS_URL = "redis://localhost:6379/0"
 KEY_PREFIX = "sift:online"
 ACTIVE_GENERATION_KEY = f"{KEY_PREFIX}:active"
 GENERATION_INDEX_KEY = f"{KEY_PREFIX}:generations"
-ITEM_ALS_ALL = "__catalog__"
+# The entity id under which a catalog-wide record is stored. Item state, the business
+# dimension and the item ALS vectors all use it: each is one Redis record per
+# generation rather than one per business (I31).
+CATALOG_RECORD = "__catalog__"
+ITEM_ALS_ALL = CATALOG_RECORD  # historical name, kept for existing imports
 # Intra-request DuckDB parallelism, deliberately 1. A lookup projects a few hundred
 # rows out of relations small enough that parallelism buys nothing per request, while
 # DuckDB's default (one thread per core) multiplies against request concurrency: at 8
@@ -62,7 +66,12 @@ LOOKUP_THREADS = 1
 # no reviewed records, filter nothing, and serve the user businesses they have already
 # been to — with no error raised. Silent degradation is exactly what this guard exists
 # to convert into a refusal.
-SCHEMA_VERSION = 6
+# 7: item state and the business dimension became one catalog record each (I31). Not
+# additive — a schema-6 generation stores them per business, so a schema-7 reader would
+# find nothing under the catalog key and project an empty relation, returning NULL for
+# every item-side feature. That is the same silent-degradation shape, which is why the
+# version is what stops it rather than a runtime check somewhere downstream.
+SCHEMA_VERSION = 7
 PIPELINE_SIZE = 1_000
 OLD_GENERATION_TTL_SECONDS = 3_600
 
@@ -283,14 +292,25 @@ def materialize_online(
                 )
                 counts["users"] += 1
 
-        item_rows = con.execute(_last_rows("item_state", "business_id"))
-        while batch := item_rows.fetchmany(PIPELINE_SIZE):
-            for business_id, ts, count, stars in batch:
-                write_record(
-                    _key(generation, "item", str(business_id)),
-                    _mapping(ts=ts, cum_count=count, cum_sum=stars),
-                )
-                counts["items"] += 1
+        # Item state goes in ONE record, like the ALS vectors above and for the same
+        # reason (I31): it is catalog-wide and immutable within a generation, so a
+        # 500-candidate request was fetching and decoding 500 records that are identical
+        # for every request. Only the user side genuinely varies per request.
+        item_catalog = {
+            str(business_id): {
+                "ts": _string(ts),
+                "cum_count": _string(count),
+                "cum_sum": _string(stars),
+            }
+            for business_id, ts, count, stars in con.execute(
+                _last_rows("item_state", "business_id")
+            ).fetchall()
+        }
+        write_record(
+            _key(generation, "item", CATALOG_RECORD),
+            {"rows": json.dumps(item_catalog, ensure_ascii=False)},
+        )
+        counts["items"] = len(item_catalog)
 
         # One record per user, one field per category. This keeps a user's taste
         # vector to one Redis value rather than one key per category.
@@ -312,22 +332,27 @@ def materialize_online(
         if current_user is not None:
             write_record(_key(generation, "user_category", current_user), category_values)
 
-        business_rows = con.execute(
-            "SELECT business_id, name, latitude, longitude, categories, price_tier, "
-            "is_open FROM dim_business ORDER BY business_id"
+        # Same treatment for the business dimension, which is quasi-static by
+        # construction (D21) and so even more obviously per-generation than per-request.
+        business_catalog = {
+            str(business_id): {
+                "name": name,
+                "latitude": lat,
+                "longitude": lng,
+                "categories": list(categories or []),
+                "price_tier": price,
+                "is_open": bool(is_open),
+            }
+            for business_id, name, lat, lng, categories, price, is_open in con.execute(
+                "SELECT business_id, name, latitude, longitude, categories, price_tier, "
+                "is_open FROM dim_business ORDER BY business_id"
+            ).fetchall()
+        }
+        write_record(
+            _key(generation, "business", CATALOG_RECORD),
+            {"rows": json.dumps(business_catalog, ensure_ascii=False, default=_string)},
         )
-        while batch := business_rows.fetchmany(PIPELINE_SIZE):
-            for business_id, name, lat, lng, categories, price, is_open in batch:
-                values = _mapping(
-                    name=name,
-                    latitude=lat,
-                    longitude=lng,
-                    price_tier=price,
-                    is_open=is_open,
-                )
-                values["categories"] = json.dumps(categories or [], ensure_ascii=False)
-                write_record(_key(generation, "business", str(business_id)), values)
-                counts["businesses"] += 1
+        counts["businesses"] = len(business_catalog)
 
         # Businesses the user has already reviewed, for the rerank filter (D29).
         #
@@ -390,7 +415,7 @@ def materialize_online(
                 for business_id, _ts, vector in item_als_rows
             }
             write_record(
-                _key(generation, "item_als", ITEM_ALS_ALL),
+                _key(generation, "item_als", CATALOG_RECORD),
                 {"vectors": json.dumps(catalog)},
             )
             counts["item_als"] = len(catalog)
@@ -493,8 +518,9 @@ class OnlineFeatureStore:
         # every worker the threadpool creates (I31).
         self._database = duckdb.connect()
         self._database.execute(f"SET threads TO {LOOKUP_THREADS}")
-        self._item_als_lock = Lock()
-        self._item_als_relations: dict[str, str] = {}
+        self._catalog_lock = Lock()
+        self._catalog_relations_by_generation: dict[str, dict[str, str]] = {}
+        self._rerank_catalog_by_generation: dict[str, dict[str, tuple[bool, tuple[str, ...]]]] = {}
 
     def manifest(self) -> OnlineManifest:
         try:
@@ -612,23 +638,25 @@ class OnlineFeatureStore:
         """
         manifest = snapshot or self.manifest()
         generation = manifest.generation
-        unique = tuple(dict.fromkeys(business_ids))
-        keys = [_key(generation, "user_reviewed", user_id)]
-        keys.extend(_key(generation, "business", business_id) for business_id in unique)
+        unique = list(dict.fromkeys(business_ids))
+
+        # One Redis key: the user's own history. `is_open` and categories come from the
+        # per-generation business relation, already built once per process — so this
+        # stage reads one record per request rather than one per candidate (I31).
         try:
-            responses = self.client.mget(keys)
+            raw = self.client.get(_key(generation, "user_reviewed", user_id))
         except RedisError as exc:
             raise OnlineStoreUnavailable(f"cannot read Redis: {exc}") from exc
-
-        seen_raw = _decode_record(responses[0]).get("seen")
+        seen_raw = _decode_record(raw).get("seen")
         reviewed = frozenset(json.loads(seen_raw)) if seen_raw else frozenset()
-        is_open: dict[str, bool] = {}
-        categories: dict[str, tuple[str, ...]] = {}
-        for business_id, raw in zip(unique, responses[1:], strict=True):
-            record = _decode_record(raw)
-            is_open[business_id] = record.get("is_open") == "1"
-            encoded = record.get("categories")
-            categories[business_id] = tuple(json.loads(encoded)) if encoded else ()
+
+        found = self._rerank_catalog(generation)
+
+        # A business missing from the catalog fails **closed**. That is the safe
+        # direction: the alternative surfaces one the store knows nothing about, and
+        # rerank is the last stage that can say no.
+        is_open = {business_id: found.get(business_id, (False, ()))[0] for business_id in unique}
+        categories = {business_id: found.get(business_id, (False, ()))[1] for business_id in unique}
         return RerankInputs(reviewed=reviewed, is_open=is_open, categories=categories)
 
     def _connection(self) -> duckdb.DuckDBPyConnection:
@@ -657,16 +685,17 @@ class OnlineFeatureStore:
         manifest = snapshot or self.manifest()
         generation = manifest.generation
         users = tuple(dict.fromkeys(query.user_id for query in queries))
-        businesses = tuple(dict.fromkeys(query.business_id for query in queries))
 
+        # Only the user side is fetched per request. Item state, the business dimension
+        # and the ALS vectors are catalog-wide within a generation, so they live in
+        # per-generation relations built once per process instead of being re-fetched
+        # and re-decoded for every candidate — that was 1,000 of the 1,003 records a
+        # 500-candidate lookup pulled, and ~16ms of a ~19ms stage (I31).
         keys: list[str] = []
         for user_id in users:
             keys.append(_key(generation, "user", user_id))
             keys.append(_key(generation, "user_category", user_id))
             keys.append(_key(generation, "user_als", user_id))
-        for business_id in businesses:
-            keys.append(_key(generation, "item", business_id))
-            keys.append(_key(generation, "business", business_id))
         try:
             responses = self.client.mget(keys)
         except RedisError as exc:
@@ -681,89 +710,154 @@ class OnlineFeatureStore:
             user_categories[user_id] = _decode_record(responses[cursor + 1])
             user_als[user_id] = _decode_record(responses[cursor + 2])
             cursor += 3
-        item_state: dict[str, dict[str, str]] = {}
-        business_state: dict[str, dict[str, str]] = {}
-        for business_id in businesses:
-            item_state[business_id] = _decode_record(responses[cursor])
-            business_state[business_id] = _decode_record(responses[cursor + 1])
-            cursor += 2
 
         con = self._connection()
-        item_als_relation = self._ensure_item_als(generation)
-        self._load_relations(
+        catalog = self._catalog_relations(generation)
+        self._load_relations(con, queries, manifest.as_of, user_state, user_categories, user_als)
+        return read_current_features(
             con,
-            queries,
-            manifest.as_of,
-            user_state,
-            user_categories,
-            item_state,
-            business_state,
-            user_als,
+            features,
+            item_state=catalog["item"],
+            dim=catalog["business"],
+            item_als_state=catalog["item_als"],
         )
-        return read_current_features(con, features, item_als_state=item_als_relation)
 
-    def _ensure_item_als(self, generation: str) -> str:
-        """Build and return one immutable item-ALS relation per generation.
+    # The catalog-wide groups, and the SQL that projects each Redis record into a
+    # relation. All three share one property that makes them cacheable: they are facts
+    # about the *catalog* within a generation, identical for every request, so fetching
+    # them per request meant a 500-candidate lookup pulled 1,000 records that never
+    # differ. Only the three user-side records genuinely vary (I31).
+    _CATALOG_PROJECTIONS: dict[str, str] = {
+        "item_als": (
+            "SELECT key AS business_id, value::FLOAT[] AS value FROM json_each(?::JSON)"
+        ),
+        "item": (
+            "SELECT key AS business_id, "
+            "json_extract(value, '$.ts')::TIMESTAMP AS ts, "
+            "json_extract(value, '$.cum_count')::BIGINT AS cum_count, "
+            "json_extract(value, '$.cum_sum')::BIGINT AS cum_sum "
+            "FROM json_each(?::JSON)"
+        ),
+        "business": (
+            "SELECT key AS business_id, "
+            "json_extract_string(value, '$.name') AS name, "
+            "json_extract(value, '$.latitude')::DOUBLE AS latitude, "
+            "json_extract(value, '$.longitude')::DOUBLE AS longitude, "
+            "json_extract(value, '$.categories')::VARCHAR[] AS categories, "
+            "json_extract(value, '$.price_tier')::SMALLINT AS price_tier, "
+            "json_extract(value, '$.is_open')::BOOLEAN AS is_open "
+            "FROM json_each(?::JSON)"
+        ),
+    }
+    # Each record stores its payload under this field. `item_als` predates the
+    # generalisation and kept "vectors"; the rest use "rows".
+    _CATALOG_FIELD: dict[str, str] = {"item_als": "vectors"}
 
-        The catalog's ALS vectors do not vary by request, so fetching and parsing them
-        per request was pure waste and the dominant cost in feature lookup (I29). They
-        also do not vary by *thread*, which the first fix missed: caching them per
-        thread re-paid a ~640ms build for every worker the threadpool created and
-        collapsed p99 under concurrency (I31).
+    def _catalog_relations(self, generation: str) -> dict[str, str]:
+        """Build the catalog relations once per (process, generation); return their names.
 
-        The generation is part of the relation name. This is required by Redis's
-        snapshot contract: an old request may still be reading the previous generation
-        after the active pointer changes. Replacing one global relation would let that
-        request and a new request swap the table underneath each other, mixing snapshot
-        generations. Immutable per-generation relations let both finish safely.
+        These do not vary by request, and they do not vary by *thread* either — the
+        first fix missed that and re-paid a ~640ms build for every worker the threadpool
+        created, collapsing p99 under concurrency (I31).
 
-        The Redis payload is already a JSON object of `business_id -> vector`, so
-        DuckDB parses it directly. The previous route parsed it in Python, re-encoded
-        it with `_rows_json`, and had `json_each` parse it a third time — three passes
-        over 19.6MB, of which two bought nothing (638ms -> ~215ms).
+        The generation is part of every relation name, which Redis's snapshot contract
+        requires: an old request may still be reading the previous generation after the
+        active pointer changes. Replacing one global relation would let that request and
+        a new one swap the table underneath each other, mixing generations. Immutable
+        per-generation relations let both finish safely.
+
+        Each Redis payload is already a JSON object keyed by `business_id`, so DuckDB
+        parses it directly. The route this replaced decoded in Python, re-encoded with
+        `_rows_json`, and had `json_each` parse a third time — three passes for two that
+        bought nothing.
         """
-        relation = self._item_als_relations.get(generation)
-        if relation is not None:
-            return relation
-        with self._item_als_lock:
+        relations = self._catalog_relations_by_generation.get(generation)
+        if relations is not None:
+            return relations
+        with self._catalog_lock:
             # Re-check inside the lock: several threads can arrive together on a cold
             # process, and only the first should pay for the build.
-            relation = self._item_als_relations.get(generation)
-            if relation is not None:
-                return relation
+            relations = self._catalog_relations_by_generation.get(generation)
+            if relations is not None:
+                return relations
             # Redis generations are opaque external values, so do not interpolate one
             # into SQL. A digest gives DuckDB a safe, deterministic identifier.
-            relation = f"item_als_{hashlib.sha256(generation.encode()).hexdigest()}"
-            raw = self.client.get(_key(generation, "item_als", ITEM_ALS_ALL))
-            blob = _decode_record(raw).get("vectors", "{}") if raw else "{}"
-            self._database.execute(
-                f"CREATE TABLE {relation} AS "
-                "SELECT key AS business_id, value::FLOAT[] AS value FROM json_each(?::JSON)",
-                [blob],
+            digest = hashlib.sha256(generation.encode()).hexdigest()
+            built: dict[str, str] = {}
+            try:
+                for group, projection in self._CATALOG_PROJECTIONS.items():
+                    relation = f"{group}_{digest}"
+                    raw = self.client.get(_key(generation, group, CATALOG_RECORD))
+                    field = self._CATALOG_FIELD.get(group, "rows")
+                    blob = _decode_record(raw).get(field, "{}") if raw else "{}"
+                    self._database.execute(
+                        f"CREATE TABLE {relation} AS {projection}", [blob]
+                    )
+                    built[group] = relation
+                self._check_item_als(built["item_als"], generation)
+            except Exception:
+                # A half-built set must not be cached, or every later request in this
+                # process would query relations that do not exist.
+                for relation in built.values():
+                    with suppress(duckdb.Error):
+                        self._database.execute(f"DROP TABLE IF EXISTS {relation}")
+                raise
+            self._catalog_relations_by_generation[generation] = built
+            return built
+
+    def _rerank_catalog(self, generation: str) -> dict[str, tuple[bool, tuple[str, ...]]]:
+        """`business_id -> (is_open, categories)` for the whole catalog, once per process.
+
+        Rerank needs these for ~50 candidates per request. Querying the DuckDB relation
+        for them costs a scan of all 14,568 rows per request — measurably worse than the
+        per-candidate Redis reads it replaced (2.9ms -> 5.0ms p50). A plain dict built
+        once from the same relation makes the stage ~50 hash lookups instead, and the
+        catalog is small enough that holding it twice is not worth a smarter join.
+        """
+        cached = self._rerank_catalog_by_generation.get(generation)
+        if cached is not None:
+            return cached
+        # Resolve the relation *before* taking the lock: `_catalog_relations` acquires
+        # the same lock, and `Lock` is not reentrant, so calling it from inside the
+        # critical section below would deadlock the first request on a cold process.
+        relation = self._catalog_relations(generation)["business"]
+        with self._catalog_lock:
+            cached = self._rerank_catalog_by_generation.get(generation)
+            if cached is not None:
+                return cached
+            rows = self._database.execute(
+                f"SELECT business_id, is_open, categories FROM {relation}"
+            ).fetchall()
+            cached = {
+                str(business_id): (bool(open_now), tuple(cats or ()))
+                for business_id, open_now, cats in rows
+            }
+            self._rerank_catalog_by_generation[generation] = cached
+            return cached
+
+    def _check_item_als(self, relation: str, generation: str) -> None:
+        """Structural guard, per I26: a NULL vector is invisible downstream.
+
+        `ui_als_score` simply comes back NULL for the affected businesses and nothing
+        raises. Assert the marshalling worked rather than trusting it, using
+        `list_filter(... IS NULL)` — `list_contains(value, NULL)` returns NULL rather
+        than true and so can never fire (I27).
+
+        Width is checked for *self-consistency*, not against a constant: the definition
+        works at any matching length by design, so hardcoding 64 would reject a
+        legitimately narrower slice (see tests/conftest.py).
+        """
+        broken = self._database.execute(
+            "SELECT count(*) FILTER ("
+            "  value IS NULL OR len(list_filter(value, x -> x IS NULL)) > 0"
+            f"), count(DISTINCT len(value)) FROM {relation}"
+        ).fetchone()
+        if broken is not None and (broken[0] or broken[1] > 1):
+            raise OnlineStoreUnavailable(
+                f"item ALS state in generation {generation} is unusable: "
+                f"{broken[0]} vectors are NULL or contain NULLs, and "
+                f"{broken[1]} distinct widths are present; rematerialize"
             )
-            # Structural guard, per I26: a NULL vector here is invisible downstream —
-            # `ui_als_score` simply comes back NULL for the affected businesses and
-            # nothing raises. Assert the marshalling worked rather than trusting it.
-            # `list_filter(... IS NULL)`, not `list_contains(value, NULL)`, which
-            # returns NULL rather than true and so can never fire (I27).
-            #
-            # Width is checked for *self-consistency*, not against a constant: the
-            # definition works at any matching length by design, so hardcoding 64
-            # here would reject a legitimately narrower slice (see tests/conftest.py).
-            broken = self._database.execute(
-                "SELECT count(*) FILTER ("
-                "  value IS NULL OR len(list_filter(value, x -> x IS NULL)) > 0"
-                f"), count(DISTINCT len(value)) FROM {relation}"
-            ).fetchone()
-            if broken is not None and (broken[0] or broken[1] > 1):
-                self._database.execute(f"DROP TABLE {relation}")
-                raise OnlineStoreUnavailable(
-                    f"item ALS state in generation {generation} is unusable: "
-                    f"{broken[0]} vectors are NULL or contain NULLs, and "
-                    f"{broken[1]} distinct widths are present; rematerialize"
-                )
-            self._item_als_relations[generation] = relation
-            return relation
 
     @staticmethod
     def _load_relations(
@@ -772,10 +866,14 @@ class OnlineFeatureStore:
         as_of: datetime,
         users: Mapping[str, Mapping[str, str]],
         user_categories: Mapping[str, Mapping[str, str]],
-        items: Mapping[str, Mapping[str, str]],
-        businesses: Mapping[str, Mapping[str, str]],
         user_als: Mapping[str, Mapping[str, str]] | None = None,
     ) -> None:
+        """Build the per-request relations — the user side only.
+
+        Item state and the business dimension used to be built here too, from records
+        fetched per candidate. They are catalog-wide within a generation, so they moved
+        to `_catalog_relations` (I31).
+        """
         query_rows = [
             (query.query_id, query.user_id, query.business_id, as_of) for query in queries
         ]
@@ -834,21 +932,6 @@ class OnlineFeatureStore:
             ],
         )
 
-        item_rows = [
-            (business_id, state["ts"], int(state["cum_count"]), int(state["cum_sum"]))
-            for business_id, state in items.items()
-            if state
-        ]
-        con.execute(
-            "CREATE OR REPLACE TEMP TABLE item_current AS SELECT "
-            "json_extract_string(value, '$.business_id') AS business_id, "
-            "json_extract(value, '$.ts')::TIMESTAMP AS ts, "
-            "json_extract(value, '$.cum_count')::BIGINT AS cum_count, "
-            "json_extract(value, '$.cum_sum')::BIGINT AS cum_sum "
-            "FROM json_each(?::JSON)",
-            [_rows_json(("business_id", "ts", "cum_count", "cum_sum"), item_rows)],
-        )
-
         category_rows = [
             (user_id, category, int(count))
             for user_id, state in user_categories.items()
@@ -883,45 +966,6 @@ class OnlineFeatureStore:
             [_rows_json(("user_id", "value"), user_als_rows)],
         )
 
-        business_rows: list[tuple[object, ...]] = []
-        for business_id, state in businesses.items():
-            if state:
-                business_rows.append(
-                    (
-                        business_id,
-                        state.get("name"),
-                        float(state["latitude"]) if "latitude" in state else None,
-                        float(state["longitude"]) if "longitude" in state else None,
-                        json.loads(state.get("categories", "[]")),
-                        int(state["price_tier"]) if "price_tier" in state else None,
-                        state.get("is_open") == "1",
-                    )
-                )
-        con.execute(
-            "CREATE OR REPLACE TEMP TABLE business_current AS SELECT "
-            "json_extract_string(value, '$.business_id') AS business_id, "
-            "json_extract_string(value, '$.name') AS name, "
-            "json_extract(value, '$.latitude')::DOUBLE AS latitude, "
-            "json_extract(value, '$.longitude')::DOUBLE AS longitude, "
-            "json_extract(value, '$.categories')::VARCHAR[] AS categories, "
-            "json_extract(value, '$.price_tier')::SMALLINT AS price_tier, "
-            "json_extract(value, '$.is_open')::BOOLEAN AS is_open "
-            "FROM json_each(?::JSON)",
-            [
-                _rows_json(
-                    (
-                        "business_id",
-                        "name",
-                        "latitude",
-                        "longitude",
-                        "categories",
-                        "price_tier",
-                        "is_open",
-                    ),
-                    business_rows,
-                )
-            ],
-        )
 
 
 def main() -> None:

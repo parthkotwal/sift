@@ -383,3 +383,24 @@ ablations. PyTorch remains isolated to the explicitly attempted 5b offline stage
 **This does not make the rule absolute, and deliberately keeps the exception legible.** D29 landed rerank while lowering recall@10 by 41%, with an argument. `--accept` is how that is expressed: the flag exists so an exception is a decision someone takes and records here, rather than a default nobody notices. The failure message says so.
 
 **Costs, accepted.** The ledger is local, so a fresh clone starts with no baseline and its first run establishes one — correct, but it means the guard protects a *machine's* history rather than the project's, and two developers can hold different baselines. That is the honest consequence of numbers that cannot be committed; the shared record stays `DECISIONS.md` and `data/RESULTS.md`, and this catches the case those two cannot: a change nobody thought to re-measure.
+
+## D31 — Catalog-wide state is one record per generation, not one per business   [accepted] (2026-07-30)
+
+**Context:** I31's remaining lever. A 500-candidate request fetched **1,003 Redis records** — 3 for the user, and 2 (item state, business dimension) for every candidate. Measured directly: the `mget` plus Python decode of those 1,003 records was **16.1ms of a ~19ms feature-lookup stage**. But 1,000 of them are identical for every request in a generation: item state is catalog-wide, and the business dimension is quasi-static by construction (D21). Only the three user-side records genuinely vary.
+
+**Choice:** publish item state and the business dimension the way item ALS vectors already were (D27/I29) — one Redis record each per generation, parsed once per process into an immutable per-generation DuckDB relation. Redis schema 6 -> 7.
+
+**Result, single-threaded:** feature lookup **19.3 -> 9.3ms p50** (32 -> 15ms p99); end-to-end **33.0 -> 22.4ms p50**.
+
+**The result that matters more: the concurrency envelope doubled.** D28 stated the contract at up to 4 concurrent requests because 8 breached it. Measured now at 1,000 requests per level: concurrency 4 is 42.4ms p99 (was 82.2), and **concurrency 8 is 67.9ms p99 with 0/1000 over the contract, where it was 118ms with 57/300 over**. `SUPPORTED_CONCURRENCY` moves 4 -> 8. That is the honest payoff — the stage got faster, but what the deployment gets is twice the load at the same promise.
+
+**Why the schema bump is not optional.** This one is *not* additive, unlike 5 -> 6. A schema-6 generation stores item and business state per business, so a schema-7 reader would find nothing under the catalog key, project an empty relation, and return NULL for every item-side feature — a request that succeeds and is silently wrong. The version is what converts that into a refusal; a runtime check further downstream would be looking for an absence it cannot distinguish from a genuinely empty catalog.
+
+**Two things measurement caught that the design did not predict**, both recorded because the pattern is the point:
+
+- **Rerank got *slower* at first (2.9 -> 5.0ms p50).** Reading `is_open` and categories for ~50 candidates from the DuckDB relation costs a scan of all 14,568 rows per request — worse than the 51 Redis reads it replaced. Fixed by materialising the same data as a plain dict once per generation, which makes the stage ~50 hash lookups: **1.4ms p50, better than before the change**. Moving data closer is not automatically faster; the access pattern decides.
+- **1.1ms appeared in `overhead`.** Pinning the request's generation (D-I33) is a real Redis round trip and sat before the first timer, so it landed in the bucket that had meant "routing and serialization". It is now charged to retrieval. An unattributed millisecond is exactly what per-stage instrumentation exists to prevent, and `overhead` reading 0.01ms again is the check that it worked.
+
+**Stage tripwires re-tightened with the stage.** Feature lookup's line moves 40 -> 30ms and rerank's 10 -> 8ms, each about 2x the measured p99. A 40ms tripwire on a 15ms stage would let it regress to 39ms unnoticed — which is precisely how I29's 2ms -> 49ms was caught, so leaving the line where it was would have retired the alarm that justified the work.
+
+**Costs, accepted.** The process now holds the business catalog twice — once as a DuckDB relation for the feature join, once as a Python dict for rerank. That is a few MB against a 19.6MB ALS payload already resident, and the alternative was a per-request scan. Publication is also slightly slower and more memory-hungry, since three catalog records are assembled in memory before being written; at 14,568 businesses this is not close to mattering, and it is the same trade D27 already accepted for the ALS vectors.

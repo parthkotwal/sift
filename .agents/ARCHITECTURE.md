@@ -50,10 +50,10 @@ It is the one stage that *lowers* the headline metric, and measuring why produce
 
 **Latency budget** (re-baselined against measurement, `DECISIONS.md` D28). Two different things, deliberately not one:
 
-- **Regression tripwires**, at concurrency 1 where numbers are reproducible: retrieval ≤ 10ms, online feature lookup ≤ 40ms, ranker inference ≤ 15ms, rerank ≤ 10ms, overhead ≤ 5ms. (Rerank and overhead shared one 20ms line while rerank was unbuilt; now both are measured — 4.8ms and 0.02ms p99 — a shared budget would have let overhead regress a hundredfold and still pass.)
-- **The contract**: end-to-end **p99 < 100ms at up to 4 concurrent requests per process**.
+- **Regression tripwires**, at concurrency 1 where numbers are reproducible: retrieval ≤ 10ms, online feature lookup ≤ 30ms, ranker inference ≤ 15ms, rerank ≤ 8ms, overhead ≤ 5ms — each about 2x its measured p99. They move *down* with the stage: feature lookup's line went 40 → 30 when D31 halved the stage, because a 40ms tripwire on a 15ms stage would let it regress to 39ms unnoticed, which is exactly how I29's 2ms → 49ms was caught.
+- **The contract**: end-to-end **p99 < 100ms at up to 8 concurrent requests per process** (D28, envelope doubled by D31 — measured 67.9ms p99 with 0/1000 over the contract at 8, where it was 118ms with 57/300 over).
 
-They are not required to sum, because per-stage p99s are not additive — at concurrency 4 the stage p99s total ~103ms while end-to-end p99 is ~79ms, since each stage's unluckiest 1% are mostly different requests. The original 30/20/30/20 = 100ms allocation encoded that arithmetic error, and was apportioned before anything was timed.
+They are not required to sum, because per-stage p99s are not additive — each stage's unluckiest 1% are mostly different requests, so adding the stage p99s over-provisions every stage and still does not bound the total. The original 30/20/30/20 = 100ms allocation encoded that arithmetic error, and was apportioned before anything was timed.
 
 Instrumented per stage from day one: an end-to-end number with no breakdown is a footgun (`AGENTS.md`), a per-stage number with no concurrency level is not a contract (the same code measured 18ms and 162ms p50 on offered load alone), and a p99 over too few samples on a loaded host is not a measurement (the same build gave 50ms and 99ms minutes apart at load 8.6 on 4 cores). `python -m sift.api.bench --check` is what verifies all three — it gates on ≥1,000 samples and refuses to gate on a contended host. See `ISSUES.md` I31.
 

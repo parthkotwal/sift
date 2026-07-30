@@ -117,6 +117,55 @@ requirement next to `uv sync`.
 
 ## Open
 
+One entry, and it is a deliberate deferral rather than a backlog. Resolved entries used
+to accumulate here marked `[fixed]`, which made the section unreadable as a to-do list —
+they now move to *Fixed — kept because the failure mode recurs* as soon as they close,
+so anything appearing under this heading is genuinely outstanding.
+
+### I6 — Tie-breaking in the ranker is arbitrary   [deferred, deliberately]
+
+With a shallow model the ranker produces far fewer distinct scores than candidates
+(measured: 18 distinct scores over 500). `np.argsort` breaks the ties by whatever
+order it lands on, so the top-k can be an arbitrary slice of a large tie group
+rather than the incumbent's ordering. A stable fallback to retrieval's own order is
+the correct funnel behaviour.
+
+**Deferred on purpose:** adding it now would drag the ranker's numbers toward
+popularity's and disguise the finding that the ranker has no personalization
+signal. Revisit once the ranker has real score resolution.
+
+**The two rank paths deliberately differ (2026-07-27, from review of 26cfe46).**
+`reranked_lists` (popularity pool) keeps the unstable `np.argsort` this entry
+defers; `reranked_candidate_lists` (personalized pool) uses `kind="stable"`, so
+ties fall back to the candidate order the provider supplied — for ALS that *is*
+retrieval's own ranking, which is the correct funnel behaviour described above.
+The divergence was undocumented when it landed; it is intentional, and the reason
+is that the deferral's rationale does not transfer. Popularity's pool is a fixed
+global list, so stable tie-breaking there means "fall back to global popularity" —
+exactly the incumbent the ranker must beat, which is what would hide the ranker's
+lack of resolution. ALS's pool is per-user, so stable tie-breaking is a personalized
+fallback and hides nothing. Both call sites now carry that reasoning inline.
+Unifying them requires remeasuring both baselines, not editing one line.
+
+**The deferral's stated condition has now been met, and the entry stays open anyway
+(2026-07-30).** "Revisit once the ranker has real score resolution" was written when the
+ranker had 18 distinct scores over 500 candidates and no personalization signal. D27 gave
+it `ui_als_score` and it now beats ALS's own ordering outright, so the condition is
+satisfied — the reason to leave this open is no longer the original one.
+
+What remains is narrower. The path that serves is already stable (`retrieval/online.py`
+and `reranked_candidate_lists`), so **serving is not affected**; the open question is
+whether `reranked_lists`, the popularity-pool path, should be unified with it. That path
+exists only as the build-step-4 baseline, and D20 makes candidate source part of the
+ranker's training contract, so changing its tie-break means remeasuring a baseline whose
+whole job is to be a fixed comparison point. Low value, real cost, and the ledger (D30)
+would now catch it moving — which is a better reason to leave it alone than the one this
+entry was opened with.
+
+---
+
+## Fixed — kept because the failure mode recurs
+
 ### I33 — One request read the active generation three times   [fixed]
 
 **I logged this as "twice" and as "narrow". Cross-review found it is three times, and
@@ -160,7 +209,7 @@ with whether the store should expose an explicit `snapshot()` handle that a requ
 holds for its whole life — which would make the property structural instead of
 remembered, the same way the per-generation relation names did.
 
-### I31 — The online feature path collapses under concurrency   [fixed, partially]
+### I31 — The online feature path collapses under concurrency   [fixed]
 
 Wiring the ranker into the API (I30) made the API call `store.lookup()` for the
 first time, which exposed a latent defect in the I29 fix: **it was validated on a
@@ -256,15 +305,22 @@ The tail at concurrency 8 improved ~31x and concurrency 4 is now fully inside th
 concurrency 2 (18 -> 23 -> 34 -> 70 -> 162ms), which is CPU saturation on 4
 performance cores, not cold start.
 
-**The remaining lever is the same insight one layer out.** Per request the store still
-fetches ~1000 Redis records (500 `item` + 500 `business`) and pushes them through the
-identical three-pass JSON route that `item_als` just escaped: decode in Python,
-re-encode with `_rows_json`, re-parse in `json_each`. But `item` and `business` current
-state is *also* catalog-wide and immutable within a generation — only the user side
-(`user`, `user_category`, `user_als`, three records) genuinely varies per request.
-Publishing the item side as catalog-wide records built once per process would cut
-per-request marshalling from ~1000 records to 3. That is a materialization-format
-change and a schema bump, so it is a decision, not a follow-up patch.
+**The remaining lever, now taken (D31).** Per request the store fetched ~1000 Redis
+records (500 `item` + 500 `business`) — measured at **16.1ms of the ~19ms stage** — and
+pushed them through the identical three-pass JSON route `item_als` had escaped. But
+`item` and `business` current state is *also* catalog-wide and immutable within a
+generation; only the three user-side records genuinely vary. Both are now one record
+per generation, parsed once per process, and the per-request fetch is 3 records.
+
+Feature lookup **19.3 -> 9.3ms p50**; end-to-end **33.0 -> 22.4ms p50**. The payoff that
+matters is the envelope: concurrency 8 went from 118ms p99 with 57/300 requests over the
+contract to **67.9ms p99 with 0/1000 over**, so the supported concurrency doubled.
+
+Two surprises worth keeping, both in D31: rerank got *slower* first, because reading 50
+candidates out of a 14,568-row DuckDB relation scans the whole thing — moving data
+closer is not automatically faster, the access pattern decides. And 1.1ms silently
+appeared in `overhead`, which turned out to be the generation-pinning Redis round trip
+sitting before the first timer.
 
 **Rule this earns:** a per-stage latency number measured single-threaded does not
 describe a threaded server. Benchmark the transport the service actually uses, at
@@ -276,7 +332,7 @@ the maximum, with no statistical content. Every `--samples 100` p99 in this log 
 under-powered, including I29's headline 26.874ms; at n=600 the same single-threaded
 path measures p99 35.39ms.
 
-### I29 — Online feature lookup regressed on ALS state   [fixed, partially]
+### I29 — Online feature lookup regressed on ALS state   [fixed → D31]
 
 Publishing ALS state (D27) took online feature lookup from ~2ms to **49ms p50** —
 over its 20ms allocation, though end-to-end p99 still fit under 100ms. The
@@ -423,7 +479,7 @@ only ever meets rows where both vectors exist, and LEFT JOINing the result back 
 `query_id` — the same shape `ui_category_affinity` already uses for `uc`. The
 definition's expression is therefore `als.score`, not a dot product written inline.
 
-### I24 — No regression test pins the headline retrieval metrics   [deferred]
+### I24 — No regression test pins the headline retrieval metrics   [fixed → D30]
 
 ALS's 0.2519 recall@500 and the two-tower's 0.2399 (D25/D26) exist only as prose in
 `DECISIONS.md`. Nothing fails if a refactor moves them: the suite covers component
@@ -516,35 +572,6 @@ already knows. Serving filters them; the unfiltered number stays published besid
 filtered one so the gap is legible rather than hidden. D18 and the frozen holdout are
 untouched — this is a serving decision reported alongside them, not a redefinition of
 ground truth.
-
-### I6 — Tie-breaking in the ranker is arbitrary   [deferred, deliberately]
-
-With a shallow model the ranker produces far fewer distinct scores than candidates
-(measured: 18 distinct scores over 500). `np.argsort` breaks the ties by whatever
-order it lands on, so the top-k can be an arbitrary slice of a large tie group
-rather than the incumbent's ordering. A stable fallback to retrieval's own order is
-the correct funnel behaviour.
-
-**Deferred on purpose:** adding it now would drag the ranker's numbers toward
-popularity's and disguise the finding that the ranker has no personalization
-signal. Revisit once the ranker has real score resolution.
-
-**The two rank paths deliberately differ (2026-07-27, from review of 26cfe46).**
-`reranked_lists` (popularity pool) keeps the unstable `np.argsort` this entry
-defers; `reranked_candidate_lists` (personalized pool) uses `kind="stable"`, so
-ties fall back to the candidate order the provider supplied — for ALS that *is*
-retrieval's own ranking, which is the correct funnel behaviour described above.
-The divergence was undocumented when it landed; it is intentional, and the reason
-is that the deferral's rationale does not transfer. Popularity's pool is a fixed
-global list, so stable tie-breaking there means "fall back to global popularity" —
-exactly the incumbent the ranker must beat, which is what would hide the ranker's
-lack of resolution. ALS's pool is per-user, so stable tie-breaking is a personalized
-fallback and hides nothing. Both call sites now carry that reasoning inline.
-Unifying them requires remeasuring both baselines, not editing one line.
-
----
-
-## Fixed — kept because the failure mode recurs
 
 ### I34 — "Already reviewed" meant any event type   [fixed]
 
