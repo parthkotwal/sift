@@ -18,12 +18,15 @@ import duckdb
 import numpy as np
 from scipy.sparse import csr_matrix  # type: ignore[import-untyped]
 
-from sift.config import DERIVED_DIR, SPLIT_T, sql_path
+from sift.config import SPLIT_T, sql_path
 from sift.offline.dim_business import DIM_BUSINESS
 from sift.offline.ingest import EVENTS_DIR
+from sift.retrieval.artifacts import ALS_DIR, INTERACTIONS
 
-ALS_DIR = DERIVED_DIR / "als"
-INTERACTIONS = ALS_DIR / "interactions.parquet"
+# Re-exported for the existing training imports. The definitions moved to `artifacts`
+# so that reading an artifact path no longer costs a `scipy.sparse` import: this module
+# builds the CSR matrix ALS is fitted on, which serving never touches.
+__all__ = ["ALS_DIR", "INTERACTIONS", "InteractionData", "build_interactions", "load_interactions"]
 
 
 @dataclass(frozen=True)

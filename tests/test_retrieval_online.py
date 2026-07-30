@@ -12,7 +12,7 @@ import numpy as np
 from numpy.typing import NDArray
 
 from sift.offline.popularity import PopularityEntry
-from sift.retrieval.als import FACTORS
+from sift.retrieval.artifacts import FACTORS
 from sift.retrieval.index import ExactItemIndex
 from sift.retrieval.online import OnlineALSRetriever
 from sift.store.online import FeatureQuery, OnlineFeatureStore, RerankInputs

@@ -8,7 +8,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from sift.retrieval.als import FACTORS
+from sift.retrieval.artifacts import FACTORS
 from sift.retrieval.index import ExactItemIndex, exact_top_k, validate_index
 
 

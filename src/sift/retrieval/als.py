@@ -19,22 +19,48 @@ from implicit.als import AlternatingLeastSquares  # type: ignore[import-untyped]
 from numpy.typing import NDArray
 
 from sift.config import sql_path
-from sift.features.definitions import BEHAVIORAL_EMBEDDING_DIM
-from sift.retrieval.interactions import ALS_DIR, InteractionData, load_interactions
+from sift.retrieval.artifacts import (
+    ALS_DIR,
+    ALS_MANIFEST,
+    FACTORS,
+    ITEM_FACTOR_PARQUET,
+    ITEM_FACTORS,
+    ITEM_IDS,
+    USER_FACTOR_PARQUET,
+    USER_FACTORS,
+    USER_IDS,
+)
+from sift.retrieval.interactions import InteractionData, load_interactions
 
-FACTORS = BEHAVIORAL_EMBEDDING_DIM
+# Re-exported so existing training imports (`from sift.retrieval.als import FACTORS`,
+# als_slices, evaluate, two_tower) keep working. The paths now live in `artifacts`, a
+# module with no training-only dependency, so the exact index can read them without
+# pulling `implicit` into a serving container — see that module's docstring.
+__all__ = [
+    "ALPHA",
+    "ALS_DIR",
+    "ALS_MANIFEST",
+    "FACTORS",
+    "ITEM_FACTORS",
+    "ITEM_FACTOR_PARQUET",
+    "ITEM_IDS",
+    "ITERATIONS",
+    "REGULARIZATION",
+    "SEED",
+    "USER_FACTORS",
+    "USER_FACTOR_PARQUET",
+    "USER_IDS",
+    "fit_factors",
+    "train_als",
+    "write_factor_parquet",
+]
+
+# Hyperparameters stay here: they are properties of *this* fitting procedure, not facts
+# about the artifact, and nothing on the serving path needs them (D25).
 REGULARIZATION = 0.01
 ALPHA = 40.0
 ITERATIONS = 15
 SEED = 42
-
-USER_FACTORS = ALS_DIR / "user_embedding_behavioral_v1.npy"
-ITEM_FACTORS = ALS_DIR / "item_embedding_behavioral_v1.npy"
-USER_IDS = ALS_DIR / "user_ids.json"
-ITEM_IDS = ALS_DIR / "item_ids.json"
-USER_FACTOR_PARQUET = ALS_DIR / "user_embedding_behavioral_v1.parquet"
-ITEM_FACTOR_PARQUET = ALS_DIR / "item_embedding_behavioral_v1.parquet"
-ALS_MANIFEST = ALS_DIR / "manifest.json"
 
 
 def write_factor_parquet(

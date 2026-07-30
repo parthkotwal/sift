@@ -20,7 +20,13 @@ import numpy as np
 from numpy.typing import NDArray
 
 from sift.eval.metrics import percentile
-from sift.retrieval.als import FACTORS, ITEM_FACTORS, ITEM_IDS, USER_FACTORS, USER_IDS
+from sift.retrieval.artifacts import (
+    FACTORS,
+    ITEM_FACTORS,
+    ITEM_IDS,
+    USER_FACTORS,
+    USER_IDS,
+)
 
 VALIDATION_USERS = 100
 VALIDATION_K = 500
