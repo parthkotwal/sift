@@ -1,0 +1,10 @@
+# Defaults already target the agreed one-day showcase environment.
+# Copy to terraform.tfvars only to override them; that local file is ignored.
+
+aws_region   = "us-west-2"
+project_name = "sift"
+environment  = "showcase"
+
+additional_tags = {
+  Purpose = "portfolio-showcase"
+}

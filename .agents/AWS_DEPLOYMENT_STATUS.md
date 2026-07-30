@@ -164,6 +164,34 @@ Verification:
 Actual S3 transfer against AWS remains intentionally untested until Terraform
 creates the private bucket in Phase 3.
 
+### Phase 3 — Terraform foundation
+
+Implemented on the current `aws` branch:
+
+- added `infra/terraform/` as the single Terraform root;
+- constrained Terraform to `1.15.x` and the official AWS provider to `6.57.x`;
+- locked the installed provider to signed release `6.57.1`;
+- fixed the provider region default at `us-west-2` while retaining a validated
+  input;
+- defined a shared `sift-showcase` naming prefix and required ownership tags;
+- allowed additional non-sensitive tags without permitting them to override
+  the required tags;
+- added local state, plan, override, crash-log, and local variable-file
+  exclusions to `.gitignore`;
+- documented the local-state safety boundary and the planned resource slices.
+
+Verification:
+
+- `terraform -chdir=infra/terraform init -backend=false` succeeded;
+- `terraform -chdir=infra/terraform fmt -check -recursive` succeeded;
+- `terraform -chdir=infra/terraform validate` reported that the configuration
+  is valid;
+- a read-only, unsaved `terraform plan -refresh=false` proposed only the three
+  local outputs and explicitly reported no real infrastructure changes;
+- the generated `.terraform/` provider directory is ignored while
+  `.terraform.lock.hcl` is tracked;
+- no `terraform apply` was run and no AWS resources were created.
+
 ## AWS resource state
 
 No AWS infrastructure has been created by this lane yet:
@@ -182,19 +210,20 @@ deployment-generated AWS service charges to preserve.
 
 ## Exact next action
 
-Begin Phase 3 with one reviewable Terraform foundation slice:
+Add the Phase 3 network configuration without applying it:
 
-1. add `infra/terraform/` with pinned Terraform/provider requirements;
-2. configure the `us-west-2` AWS provider, naming inputs, and common tags;
-3. add Terraform state and plan-file exclusions to `.gitignore`;
-4. declare variables/outputs needed by later resource slices without creating
-   speculative services;
-5. run `terraform fmt` and `terraform init -backend=false`;
-6. run `terraform validate`.
+1. define one small VPC in `us-west-2` across two available AZs;
+2. add two public subnets for the ALB and public-IP Fargate tasks;
+3. add two private subnets for ElastiCache;
+4. add one internet gateway and public route table, with no NAT Gateway;
+5. add separate ALB, ECS-task, and Redis security groups with only the planned
+   traffic relationships;
+6. expose IDs needed by later storage, Redis, ECS, and ALB slices;
+7. run format and validation, then inspect a saved `terraform plan` for public
+   exposure and unexpected resources.
 
-Propose the resource breakdown before adding live infrastructure. Do not run
-`terraform apply` until the plan has been inspected for resource count, public
-exposure, and expected one-day cost.
+Do not run `terraform apply` yet. First report the planned resource count,
+internet-facing rules, absence of NAT, and expected one-day cost categories.
 
 ## Remaining phases
 
