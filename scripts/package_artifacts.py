@@ -12,42 +12,21 @@ from collections.abc import Iterable
 from datetime import UTC, datetime
 from pathlib import Path
 
-from sift.config import DATA_DIR
-from sift.features.definitions import (
-    USER_BEHAVIORAL_EMBEDDING,
-    get,
-    get_embedding,
-    online_features,
+from scripts.artifact_contract import (
+    EVENTS_PREFIX,
+    MANIFEST_SCHEMA_VERSION,
+    expected_embedding_versions,
+    expected_feature_versions,
+    expected_selected_models,
+    required_fixed_bundle_paths,
 )
-from sift.offline.dim_business import DIM_BUSINESS
-from sift.offline.ingest import EVENTS_DIR
-from sift.offline.popularity import POPULARITY_ARTIFACT
-from sift.ranking.train import ALS_RANKER_MODEL
-from sift.retrieval.artifacts import FACTORS, ITEM_FACTORS, ITEM_IDS
-from sift.store.materialize import HISTORICAL_DIR, state_path
+from sift.config import DATA_DIR
 from sift.store.online import SCHEMA_VERSION
-
-MANIFEST_SCHEMA_VERSION = 1
-STATE_GROUPS = ("user", "item", "user_category", "user_als", "item_als")
-
-
-def _relative_to_data(path: Path) -> Path:
-    return path.relative_to(DATA_DIR)
 
 
 def required_artifacts(source_data: Path) -> tuple[tuple[Path, Path], ...]:
     """Return ``(source, bundle-relative path)`` for the serving generation."""
-    configured = (
-        ITEM_FACTORS,
-        ITEM_IDS,
-        get_embedding(USER_BEHAVIORAL_EMBEDDING).artifact,
-        POPULARITY_ARTIFACT,
-        ALS_RANKER_MODEL,
-        DIM_BUSINESS,
-        *(state_path(group, HISTORICAL_DIR) for group in STATE_GROUPS),
-    )
-    relative = tuple(_relative_to_data(path) for path in configured)
-    events_relative = _relative_to_data(EVENTS_DIR)
+    events_relative = EVENTS_PREFIX.relative_to("data")
     event_files = tuple(sorted((source_data / events_relative).glob("year=*/*.parquet")))
     if not event_files:
         event_root = source_data / events_relative
@@ -56,7 +35,8 @@ def required_artifacts(source_data: Path) -> tuple[tuple[Path, Path], ...]:
         (path, Path("data") / path.relative_to(source_data)) for path in event_files
     )
     configured_pairs = tuple(
-        (source_data / path, Path("data") / path) for path in relative
+        (source_data / path.relative_to("data"), path)
+        for path in required_fixed_bundle_paths()
     )
     return configured_pairs + event_pairs
 
@@ -113,7 +93,6 @@ def package_generation(
             f"required deployment artifact is not a regular file: {missing[0]}"
         )
 
-    embedding = get_embedding(USER_BEHAVIORAL_EMBEDDING)
     with tempfile.TemporaryDirectory(prefix=f".{generation_id}-", dir=output_root) as staging:
         staging_dir = Path(staging)
         files = []
@@ -135,24 +114,9 @@ def package_generation(
             "git_commit": git_sha,
             "created_at": (created_at or datetime.now(UTC)).astimezone(UTC).isoformat(),
             "redis_schema_version": SCHEMA_VERSION,
-            "selected_models": {
-                "retrieval": {
-                    "kind": "exact_als",
-                    "item_embedding": "item_embedding_behavioral_v1",
-                    "dimensions": FACTORS,
-                },
-                "ranker": {
-                    "kind": "lightgbm",
-                    "artifact": (
-                        Path("data") / _relative_to_data(ALS_RANKER_MODEL)
-                    ).as_posix(),
-                },
-                "rerank": {"decision": "D29"},
-            },
-            "feature_versions": {
-                name: get(name).version for name in online_features()
-            },
-            "embedding_versions": {embedding.name: embedding.version},
+            "selected_models": expected_selected_models(),
+            "feature_versions": expected_feature_versions(),
+            "embedding_versions": expected_embedding_versions(),
             "file_count": len(files),
             "total_bytes": total_bytes,
             "files": files,

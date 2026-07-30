@@ -26,8 +26,12 @@ RUN uv sync --frozen --no-default-groups --no-editable \
     && useradd --create-home --uid 10001 sift \
     && chown -R sift:sift /app/data
 
+COPY scripts/__init__.py scripts/artifact_contract.py scripts/artifact_entrypoint.py ./scripts/
+
 USER sift
 
 EXPOSE 8000
+
+ENTRYPOINT ["python", "-m", "scripts.artifact_entrypoint"]
 
 CMD ["uvicorn", "sift.api.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]

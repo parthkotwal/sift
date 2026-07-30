@@ -8,7 +8,7 @@ the source commit, serving schema/model versions, byte sizes, and SHA-256
 digests:
 
 ```bash
-python scripts/package_artifacts.py \
+python -m scripts.package_artifacts \
   --source-data data \
   --output-root data/deployment \
   --generation "$(date -u +%Y%m%dT%H%M%SZ)-$(git rev-parse --short HEAD)"
@@ -18,6 +18,23 @@ The destination generation must not already exist. Packaging happens in a
 temporary sibling directory and is renamed into place only after every file and
 the manifest have been written, so a failed run does not expose a partial
 generation.
+
+The container's `artifact_entrypoint.py` uses the default boto3 credential
+chain. In ECS that means task-role credentials; no static AWS key is passed to
+the container. When both variables below are set, it downloads the manifest and
+its declared files from
+`s3://$SIFT_ARTIFACT_BUCKET/sift/artifacts/$SIFT_ARTIFACT_GENERATION/`, rejects
+unsafe paths or incompatible manifest/Redis schema versions, verifies every
+size and SHA-256 digest, and only then executes the task command:
+
+```text
+SIFT_ARTIFACT_BUCKET
+SIFT_ARTIFACT_GENERATION
+```
+
+Set neither variable for local runs that mount an already-populated `data/`
+directory. Setting only one is an error. The entrypoint wraps both the default
+API command and command overrides such as `python -m sift.store.online`.
 
 ## Cross-review tooling
 
