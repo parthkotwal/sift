@@ -72,3 +72,36 @@ variable "allow_asset_deletion" {
   type        = bool
   default     = false
 }
+
+variable "elasticache_engine_version" {
+  description = "Valkey major/minor version for the rebuildable serving cache."
+  type        = string
+  default     = "8.0"
+
+  validation {
+    condition     = can(regex("^8\\.[0-9]+$", var.elasticache_engine_version))
+    error_message = "elasticache_engine_version must select a Valkey 8.x version."
+  }
+}
+
+variable "elasticache_node_type" {
+  description = "Single ElastiCache node type; resize when deployment measurements require it."
+  type        = string
+  default     = "cache.t4g.micro"
+
+  validation {
+    condition     = can(regex("^cache\\.[a-z0-9]+\\.[a-z0-9]+$", var.elasticache_node_type))
+    error_message = "elasticache_node_type must be a cache.* ElastiCache node type."
+  }
+}
+
+variable "cloudwatch_log_retention_days" {
+  description = "Short retention for API and materialization task logs."
+  type        = number
+  default     = 3
+
+  validation {
+    condition     = contains([1, 3, 5, 7, 14, 30], var.cloudwatch_log_retention_days)
+    error_message = "cloudwatch_log_retention_days must be one of 1, 3, 5, 7, 14, or 30."
+  }
+}

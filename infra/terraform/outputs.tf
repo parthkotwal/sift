@@ -59,3 +59,18 @@ output "ecr_repository" {
     url  = aws_ecr_repository.api.repository_url
   }
 }
+
+output "redis_connection" {
+  description = "Private TLS connection information for ECS task configuration."
+  sensitive   = true
+  value = {
+    endpoint = aws_elasticache_replication_group.redis.primary_endpoint_address
+    port     = aws_elasticache_replication_group.redis.port
+    url      = "rediss://${aws_elasticache_replication_group.redis.primary_endpoint_address}:${aws_elasticache_replication_group.redis.port}/0"
+  }
+}
+
+output "task_log_groups" {
+  description = "CloudWatch log groups consumed by the later ECS task definitions."
+  value       = { for purpose, log_group in aws_cloudwatch_log_group.tasks : purpose => log_group.name }
+}

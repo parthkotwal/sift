@@ -33,7 +33,8 @@ Resources will be added in reviewable slices, not as one uninspectable apply:
    private subnets, route tables, and narrowly scoped security groups;
 2. storage and registry (implemented, not applied): private versioned S3
    artifact bucket and private ECR;
-3. Redis and observability: single-node ElastiCache and CloudWatch log groups;
+3. Redis and observability (implemented, not applied): single-node ElastiCache
+   and CloudWatch log groups;
 4. IAM: separate ECS execution and task roles with resource-scoped policies;
 5. ECS and ALB: cluster, task definitions, one-task service, target group,
    listener, and one-off materialization command support;
@@ -78,3 +79,21 @@ keeps the ten newest tagged images.
 empty a populated bucket or repository until Phase 8 explicitly chooses
 deletion and changes that input. The artifacts and images are reproducible, but
 their deletion should still be an intentional teardown decision.
+
+## Rebuildable cache and task-log contract
+
+ElastiCache uses one Valkey 8 node in the private subnet group. Valkey preserves
+the Redis protocol used by Sift while avoiding a legacy Redis OSS choice. The
+default `cache.t4g.micro` is a low-cost starting point, not a performance claim;
+change `elasticache_node_type` if materialization or ALB measurements require
+more memory or sustained CPU.
+
+The replication group has exactly one node, no replica, no Multi-AZ failover,
+and no snapshots. At-rest encryption and required in-transit encryption are
+enabled. ECS must therefore pass a `rediss://` URL through `SIFT_REDIS_URL`.
+Access remains network-authorized through the existing ECS-to-Redis security
+group relationship; no cache password is stored in Terraform.
+
+Separate API and materialization CloudWatch log groups use standard log storage
+with three-day retention by default. They are intentionally deleted during
+Terraform teardown after non-sensitive evidence has been preserved.

@@ -49,6 +49,7 @@ bundles, private endpoints, or credentials in this file.
 | Compute | ECS on Fargate, one API task initially, one Uvicorn worker per task. Size from measurement rather than inheriting the plan's 0.5 vCPU / 1 GB example. |
 | Network | ALB in public subnets; ECS API tasks use public IPs for AWS egress; ElastiCache is private; no NAT Gateway. |
 | Durable artifacts | Private S3 immutable generation prefixes. Redis remains rebuildable and non-durable. |
+| Managed cache | One private Valkey 8 node, initially `cache.t4g.micro`, using the Redis protocol over TLS. No replica, Multi-AZ failover, or snapshots. Resize if measurement requires it. |
 | Registry | Private ECR repository with Git-SHA image tags. |
 | AWS credentials in tasks | ECS task-role credentials through boto3's default credential chain. No static AWS keys in images or task configuration. |
 | CI/CD | GitHub Actions with AWS OIDC; no CodePipeline or CodeBuild. |
@@ -290,6 +291,67 @@ Cost boundary:
 - actual storage, request, transfer, and scan behavior must be checked after
   publication rather than estimated from empty resources.
 
+### Phase 3 — rebuildable cache and task logs
+
+Implemented on the current `aws` branch without applying it:
+
+- one ElastiCache subnet group referencing only the two private subnets;
+- one node-based Valkey 8.0 replication group using the Redis protocol expected
+  by Sift;
+- a configurable `cache.t4g.micro` initial node, with exactly one cache node,
+  no replicas, automatic failover disabled, and Multi-AZ disabled;
+- snapshot retention set to zero with no final snapshot identifier, because S3
+  is authoritative and the serving state is rebuilt by the materialization
+  task;
+- service-managed at-rest encryption and required in-transit encryption;
+- no cache password in Terraform. Access is private and limited by the existing
+  ECS-to-Redis security-group relationship;
+- a sensitive connection output emits a `rediss://` URL for the later
+  `SIFT_REDIS_URL` task environment;
+- separate standard CloudWatch log groups for the API and materialization task,
+  with configurable three-day retention and deletion during teardown.
+
+Choice and compatibility evidence on 2026-07-30:
+
+- the live ElastiCache API in `us-west-2` reported Valkey versions 7.2, 8.0,
+  8.1, 8.2, 9.0, and 9.1;
+- AWS documents `cache.t4g.micro` as a current-generation Valkey/Redis OSS node
+  with 0.5 GiB memory and burstable CPU. This is a low-cost starting envelope,
+  not a claim that it will pass materialization or ALB performance validation;
+- the AWS Price List API returned one `us-west-2` Valkey
+  `cache.t4g.micro` product at `$0.0128` per node-hour or partial hour, about
+  `$0.31` for 24 hours before other services and transfer. Re-check immediately
+  before apply because pricing can change;
+- Sift constructs its client with `Redis.from_url`, so the deployment boundary
+  already accepts the required `rediss://` URL. No core application change is
+  currently needed.
+
+Saved-plan audit:
+
+- the combined plan reported `35 to add, 0 to change, 0 to destroy`, exactly
+  four additions beyond the previous network/storage/registry plan;
+- those additions are one subnet group, one single-node replication group, and
+  two log groups;
+- the cache references only `aws_subnet.private` and
+  `aws_security_group.redis`;
+- the planned cache has Valkey 8.0, `cache.t4g.micro`, one node, zero snapshot
+  retention, both encryption modes enabled, and no auth token;
+- each log group has three-day retention and `skip_destroy = false`;
+- no NAT resource appeared and the only public CIDR rules remain ALB port 80
+  ingress and ECS port 443 egress;
+- the cache connection output is marked sensitive;
+- the saved plan was deleted after JSON inspection so it cannot become a stale
+  apply artifact;
+- no `terraform apply` was run and no AWS resources were created.
+
+Cost boundary:
+
+- once applied, the cache is billed by each full or partial node-hour;
+- CloudWatch Logs adds ingestion and retained-storage categories once tasks
+  emit logs;
+- there is no replica, snapshot storage, customer-managed KMS key, or NAT
+  Gateway in this slice.
+
 ## AWS resource state
 
 No AWS infrastructure has been created by this lane yet:
@@ -308,24 +370,23 @@ deployment-generated AWS service charges to preserve.
 
 ## Exact next action
 
-Add the Phase 3 Redis and CloudWatch configuration without applying it:
+Add the Phase 3 ECS IAM roles and policies without applying them:
 
-1. confirm a currently supported, low-cost ElastiCache Redis/Valkey engine and
-   ARM-compatible single-node class in `us-west-2`;
-2. place one rebuildable cache node in a subnet group made from the two private
-   subnets and attach only the existing Redis security group;
-3. disable Multi-AZ, automatic failover, and durable snapshots while retaining
-   encryption and a safe maintenance/upgrade posture appropriate to the
-   showcase;
-4. define short-retention CloudWatch log groups for the API and one-off
-   materialization task;
-5. expose only the cache connection information and log-group names consumed
-   by the later task definitions;
-6. format, validate, and inspect a saved plan for public exposure, node count,
-   persistence, retention, unexpected resources, and expected cost categories.
+1. create separate ECS task-execution and application task roles, each trusted
+   only by `ecs-tasks.amazonaws.com`;
+2. let the execution role obtain an ECR authorization token, pull only from the
+   planned Sift repository, and write only to the two planned task log groups;
+3. let the application task role read only objects below the planned
+   `sift/artifacts` S3 prefix;
+4. do not grant S3 listing because the artifact entrypoint fetches exact keys
+   and does not call `ListBucket`;
+5. grant no ElastiCache API permissions because cache access is network-level;
+6. expose only the role ARNs needed by the later ECS task definitions;
+7. format, validate, and inspect a saved plan for wildcard actions/resources,
+   trust principals, cross-role privilege, and unexpected resources.
 
-Do not run `terraform apply` yet. Do not place credentials or a generated cache
-endpoint in tracked configuration.
+Do not add the GitHub OIDC role in this slice; its repository/ref trust boundary
+belongs with the deployment workflow.
 
 ## Remaining phases
 
