@@ -32,6 +32,8 @@ Backwards, one stage at a time: dumb popularity baseline end-to-end first, then 
 
 **The exception is rerank (D29)**, which lowers recall@10 by 41% and lands anyway. The rule exists to stop a change being kept because it feels better; it is not a rule that the final number must always rise. Rerank's drop is almost entirely the already-reviewed filter removing credit the ranker was earning for predicting return visits, and knowing that is worth more than the number it cost. An exception that has to be argued in the decision log is the rule working, not the rule being broken.
 
+The rule is enforced, not just stated: every eval entrypoint diffs its numbers against a local ledger and exits non-zero on a regression rather than recording it, so an exception has to be taken deliberately with `--accept` (D30). The numbers stay out of git — they're dataset-derived and Yelp's terms restrict publishing them — so a fresh clone's first run establishes its own baseline and says so.
+
 The fixed two-tower has now been run through that gate and did not replace ALS.
 Its code and versioned artifacts remain reproducible for inspection; the selected
 online path is unchanged.

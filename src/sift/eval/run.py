@@ -10,11 +10,13 @@ Run: python -m sift.eval.run
 
 from __future__ import annotations
 
+import argparse
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 
 from sift.eval.holdout import load_ground_truth
+from sift.eval.ledger import report_and_exit_code
 from sift.eval.metrics import ndcg_at_k, percentile, recall_at_k
 from sift.offline.popularity import load_ranking
 
@@ -102,11 +104,19 @@ def popularity_recommender() -> Recommender:
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--accept",
+        action="store_true",
+        help="record a regression as the new baseline; say why in DECISIONS.md",
+    )
+    args = parser.parse_args()
     ground_truth = load_ground_truth()
     report = evaluate(
         popularity_recommender(), ground_truth, name="popularity (pre-T review count)"
     )
     print(report.render())
+    raise SystemExit(report_and_exit_code([report], accept=args.accept))
 
 
 if __name__ == "__main__":

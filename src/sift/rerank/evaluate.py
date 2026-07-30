@@ -20,6 +20,7 @@ Run: ``python -m sift.rerank.evaluate``
 
 from __future__ import annotations
 
+import argparse
 from collections.abc import Mapping, Sequence
 from datetime import date
 from pathlib import Path
@@ -29,6 +30,7 @@ import lightgbm as lgb
 
 from sift.config import SPLIT_T, sql_path
 from sift.eval.holdout import load_ground_truth
+from sift.eval.ledger import report_and_exit_code
 from sift.eval.run import evaluate
 from sift.offline.dim_business import DIM_BUSINESS
 from sift.offline.ingest import EVENTS_DIR, REVIEW_EVENT, events_glob
@@ -152,6 +154,13 @@ def repeat_hit_share(
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--accept",
+        action="store_true",
+        help="record a regression as the new baseline; say why in DECISIONS.md",
+    )
+    args = parser.parse_args()
     ground_truth = load_ground_truth()
     users = list(ground_truth)
     retriever = ALSRetriever.load()
@@ -213,7 +222,11 @@ def main() -> None:
             (
                 label,
                 evaluate(
-                    recommend, ground_truth, name=label, ks=EVAL_KS, measure_latency=False
+                    recommend,
+                    ground_truth,
+                    name=f"rerank: {label}",
+                    ks=EVAL_KS,
+                    measure_latency=False,
                 ),
             )
         )
@@ -249,6 +262,9 @@ def main() -> None:
         f"\n  yet cost only {closed_cost:.1f}% of recall@10 — the model was rarely finding them"
         "\n  anyway (I12). Both numbers are reported so a dataset-vintage artifact cannot read"
         "\n  as a ranking regression."
+    )
+    raise SystemExit(
+        report_and_exit_code([report for _, report in rows], accept=args.accept)
     )
 
 

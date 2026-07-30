@@ -445,6 +445,31 @@ and have the eval entrypoint diff against the previous run and refuse to overwri
 a regression without an explicit flag. That belongs to the build step that touches
 eval next, not to a review fix.
 
+**Fixed, built to that shape (D30).** `sift/eval/ledger.py` keeps
+`data/derived/eval_ledger.json` — gitignored with the rest of the dataset-derived
+numbers — and every eval entrypoint diffs against it, prints the verdict, and exits
+non-zero on a regression. `--accept` records the new value deliberately.
+
+The deferral's constraint is respected rather than worked around: the mechanism is
+unit-tested with synthetic reports and runs anywhere, while the numbers live in a
+local artifact. No test asserts 0.2519, so nothing reintroduces I1's hidden dependency
+on machine state, and no synthetic fixture is asked to reproduce a property of the
+real distribution (I8).
+
+Three behaviours the tests pin, because each is a way this could pass while doing
+nothing:
+
+- **A first run establishes rather than passes.** A fresh clone has no ledger, and
+  "no baseline" must not look like "no regression" — otherwise the first run of a
+  broken model reads clean.
+- **A regression is not written.** The way a ratchet fails is by ratcheting the wrong
+  way once: record a bad run and the *next* run is judged against it, so the loss
+  disappears silently.
+- **A changed eval set is fatal, not a regression, and `--accept` cannot silence it.**
+  D18 froze the holdout; if `n_users` moves, the runs did not measure the same thing
+  and an *improvement* is exactly as untrustworthy as a decline. That is a different
+  failure from "the model got worse" and must not share an escape hatch with it.
+
 ### I5 — Repeats vs. the already-reviewed rerank filter   [resolved at step 6 → D29]
 
 D18 choice 3 counts a business reviewed both before and after T as a valid target;

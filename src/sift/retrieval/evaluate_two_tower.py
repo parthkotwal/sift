@@ -5,9 +5,11 @@ Run: ``python -m sift.retrieval.evaluate_two_tower``.
 
 from __future__ import annotations
 
+import argparse
 from collections.abc import Sequence
 
 from sift.eval.holdout import load_ground_truth
+from sift.eval.ledger import report_and_exit_code
 from sift.eval.run import evaluate
 from sift.retrieval import two_tower
 from sift.retrieval.evaluate import ALSRetriever, marginal_hits
@@ -29,6 +31,13 @@ class _CachedRecommendations:
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--accept",
+        action="store_true",
+        help="record a regression as the new baseline; say why in DECISIONS.md",
+    )
+    args = parser.parse_args()
     ground_truth = load_ground_truth()
     als_cached = _CachedRecommendations(ALSRetriever.load())
     tower_cached = _CachedRecommendations(
@@ -54,6 +63,12 @@ def main() -> None:
     print(tower_report.render())
     print("two-tower vs ALS")
     print(marginal.render(500, first="two-tower", second="ALS"))
+    # The challenger is tracked too. D26 rejected it, but "nothing lands without
+    # beating its predecessor" is a rule about candidates as much as incumbents, and a
+    # rejected model whose number silently drifts makes the rejection unverifiable.
+    raise SystemExit(
+        report_and_exit_code([als_report, tower_report], accept=args.accept)
+    )
 
 
 if __name__ == "__main__":
