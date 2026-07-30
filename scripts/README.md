@@ -1,4 +1,25 @@
-# Cross-review tooling
+# Repository scripts
+
+## Serving artifact generations
+
+`package_artifacts.py` copies only the files required by the API and Redis
+materializer into a new immutable generation. It writes a manifest containing
+the source commit, serving schema/model versions, byte sizes, and SHA-256
+digests:
+
+```bash
+python scripts/package_artifacts.py \
+  --source-data data \
+  --output-root data/deployment \
+  --generation "$(date -u +%Y%m%dT%H%M%SZ)-$(git rev-parse --short HEAD)"
+```
+
+The destination generation must not already exist. Packaging happens in a
+temporary sibling directory and is renamed into place only after every file and
+the manifest have been written, so a failed run does not expose a partial
+generation.
+
+## Cross-review tooling
 
 Claude Code and Codex review each other's pushed work automatically.
 
