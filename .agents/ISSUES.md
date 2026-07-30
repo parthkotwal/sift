@@ -117,6 +117,31 @@ requirement next to `uv sync`.
 
 ## Open
 
+### I33 — One request reads the active generation twice   [open, narrow]
+
+`OnlineALSRetriever.recommend` calls the store twice: `lookup()` for the ranker's
+features and `rerank_inputs()` for the filters. Each resolves the active generation
+independently, so a publish landing between them serves a list whose features came
+from one snapshot and whose `is_open`/reviewed filters came from the next.
+
+This is the same class the cross-review fix for the item-ALS relation closed one layer
+down — an in-flight request straddling a generation switch — and it survives here
+because the generation is resolved per *call* rather than captured per *request*.
+
+**Consequences are mild and bounded**, which is why it is logged rather than rushed:
+both reads are catalog-scale state that changes slowly between generations, so the
+realistic outcome is filtering against a slightly fresher catalog than the features
+were scored on, not the user-state/item-vector mixture the other bug produced. The
+window is also narrow — the manifest is cached per generation per thread, so it only
+opens when the active pointer flips between the two calls.
+
+**The fix is a small refactor, not a patch:** capture the snapshot once at the top of
+`recommend` and pass the generation into both reads, which means `lookup` has to return
+or accept a generation rather than resolving one. Worth doing deliberately, together
+with whether the store should expose an explicit `snapshot()` handle that a request
+holds for its whole life — which would make the property structural instead of
+remembered, the same way the per-generation relation names did.
+
 ### I31 — The online feature path collapses under concurrency   [fixed, partially]
 
 Wiring the ranker into the API (I30) made the API call `store.lookup()` for the
@@ -169,10 +194,14 @@ and LightGBM both default to using all cores, so 8 concurrent requests oversubsc
 **Fixed, in three parts — and not fully closed.**
 
 *One DuckDB database per store, one cursor per thread.* Cursors share the catalog and
-buffer pool, so `item_als_current` is a regular table built once per process and read
-by every thread. Verified before relying on it: a regular table is visible across
-cursors, TEMP tables are cursor-scoped, same-named TEMP tables stay independent, and
-8 threads x 300 TEMP round-trips produced zero cross-talk.
+buffer pool, so each immutable item-ALS generation relation is built once and read
+by every thread. The generation must be part of the relation identity: Redis keeps
+the previous snapshot alive for in-flight requests, and replacing one global table
+would mix old request state with new vectors during activation. Verified before
+relying on it: regular tables are visible across cursors, TEMP tables are
+cursor-scoped, same-named TEMP tables stay independent, concurrent same-generation
+lookups do not cross-talk, and old/new generation relations remain independently
+addressable across a pointer swap.
 
 *Per-request relations became TEMP.* This is a **correctness** requirement, not a
 performance one, and it is the part worth remembering: all six per-request relations
@@ -264,7 +293,7 @@ which is what `main()` prints. The data was correct and the report was not — w
 recording because a report that under-states is more dangerous than one that
 errors: it sends the next reader to debug something that works.
 
-### I30 — The API does not serve the ranker that now lands   [open]
+### I30 — The API does not serve the ranker that now lands   [fixed]
 
 `retrieval/online.py` serves ALS order directly, and its docstring still states the
 reason: "The ALS-conditioned ranker did not beat ALS's own ordering, so it does not
@@ -290,6 +319,12 @@ without a feature lookup at all.
 from the API for the first time surfaced a per-thread cache that collapses under
 concurrency. The original I29 gate turned out to be the less important one: the 2.5x
 figure was single-threaded, and single-threaded was never the serving condition.
+
+**Fixed (4132a6f).** I31's shared catalog cache, cursor-local request relations, and
+bounded DuckDB/LightGBM threads removed the cold-thread collapse that blocked the
+intended path. The transport-level benchmark added in `affa429` is now the contract
+check; the single-threaded loop remains only an in-process profile, and the binding
+verdict belongs to uncontended deployment hardware.
 
 **On the stale docstring:** it claimed the ranker does not land, which D27 falsified
 three commits earlier. The same falsified fact was live in four places at once — this
@@ -392,13 +427,52 @@ and have the eval entrypoint diff against the previous run and refuse to overwri
 a regression without an explicit flag. That belongs to the build step that touches
 eval next, not to a review fix.
 
-### I5 — Repeats vs. the already-reviewed rerank filter   [deferred to build step 6]
+### I5 — Repeats vs. the already-reviewed rerank filter   [resolved at step 6 → D29]
 
 D18 choice 3 counts a business reviewed both before and after T as a valid target;
 ARCHITECTURE's rerank stage plans an already-reviewed hard filter that would make
 those structurally unreachable, capping final-stage metrics. Recorded in D18 as
 open. Resolve at step 6 — drop the filter, soften to a demotion, or keep it and
 document the ceiling. Do not resolve silently.
+
+**Resolved: keep the hard filter, and report both numbers (D29).** But the cost is an
+order of magnitude larger than this entry implied, and the way it was got wrong is
+worth more than the decision.
+
+**The wrong argument, made first.** Repeats are ~1.6% of holdout targets but occupy
+**13.0%** of the ranker's served top-10 — so the filter looked like it freed 13% of
+the final slots to forfeit 1.6% of the reachable targets, an 8x favourable trade. That
+reasoning was recommended, accepted, and is wrong. It treats the freed slots as
+converting at the *average* rate.
+
+**What measurement showed.** Isolating each mechanism on the full holdout (26,489
+users):
+
+| variant | recall@10 | vs ranker |
+|---|---:|---:|
+| ALS -> ranker, no rerank | 0.0386 | — |
+| closed filter only | 0.0379 | −1.7% |
+| repeats filter only | 0.0224 | **−42.0%** |
+| all three (serving) | 0.0228 | −41.0% |
+
+The mechanism, measured directly: **949 of the ranker's 2,579 top-10 hits (36.8%) are
+businesses the user had already reviewed** — from ~1.3% of the candidate pool. A
+repeat converts at roughly 28x the rate of an average candidate, because a return
+visit is the easiest thing in this dataset to predict. The filter therefore removes
+the *densest* slice of the model's success, not a representative one.
+
+**The rule this earns:** a share-of-slots figure and a share-of-hits figure are not
+interchangeable, and swapping them silently inverts a trade-off by more than an order
+of magnitude. Any argument of the form "this frees X% of positions to lose Y% of
+targets" is incomplete until the conversion rate of those positions is measured. The
+slots a good model puts at the top are, by construction, not average slots.
+
+**Why keep the filter anyway.** The 42% is real but it is not all discovery: a third
+of the pre-rerank number was credit for predicting return visits to places the user
+already knows. Serving filters them; the unfiltered number stays published beside the
+filtered one so the gap is legible rather than hidden. D18 and the frozen holdout are
+untouched — this is a serving decision reported alongside them, not a redefinition of
+ground truth.
 
 ### I6 — Tie-breaking in the ranker is arbitrary   [deferred, deliberately]
 
@@ -428,6 +502,25 @@ Unifying them requires remeasuring both baselines, not editing one line.
 ---
 
 ## Fixed — kept because the failure mode recurs
+
+### I32 — An ablation row measured a disabled variant   [fixed]
+
+`rerank.evaluate` reports each filter in isolation so the recall change can be
+attributed. The "diversity cap only" row passed `no_cap` — the sentinel that *disables*
+diversity — instead of `CATEGORY_CAP`, so it reran the baseline and reported it as a
+measurement of the cap.
+
+It printed **+0.0%**, identical to the baseline at four decimals across recall@10,
+recall@50 and NDCG@10. That is the signature: an ablation that exactly reproduces its
+control is almost never a finding about the mechanism, it is a report that the
+mechanism was not switched on. A sampled run had shown the cap moving recall@10 by
+−3.2%, which is what made the zero suspicious enough to check.
+
+**Fixed** by passing the real cap, with the sentinel's role commented at the call site.
+**Rule:** in an ablation table, a difference of exactly zero is a bug report until
+proven otherwise — verify the knob moved before believing the row. Same family as I8
+(a test that passes vacuously) and I27 (a check that cannot fire): the failure is
+always a mechanism that never engaged while its output looked legitimate.
 
 ### I19 — Online decoding assumed a nullable aggregate was present   [fixed]
 
@@ -659,9 +752,33 @@ about. Harmless today because only price is extracted, but it will bite whenever
 another attribute is parsed. `ast.literal_eval` handles the nested dicts (zero
 failures across the metro); the `u'...'` scalars need stripping separately.
 
-### I12 — `is_open` will remove a substantial share of the catalog   [accepted]
+### I12 — `is_open` will remove a substantial share of the catalog   [resolved at step 6 → D29]
 
 Rerank's `is_open` filter drops roughly a quarter of the metro catalog (exact
 figure in `data/PROFILE.md`). Not a bug — but it's a large, planned reduction that
 will move final-stage metrics, and it interacts with I5. Expect it rather than
 discover it.
+
+**Resolved: filter at serving, report both numbers (D29). It costs far less than the
+catalog share suggests — and the reason is the interesting part.**
+
+Measured: closed businesses are 27.6% of the catalog, 27.9% of the ranker's
+500-candidate pool, but only **10.9%** of its top-10 — the ranker had already learned
+much of the signal indirectly through review recency, since a closed business stops
+accruing reviews. And **7,732 of 89,519 holdout target pairs (8.64%) are businesses
+that are now closed**, which looked like an 8.64% ceiling loss.
+
+It is not. Filtering them costs **1.7%** of recall@10 (0.0386 → 0.0379): those targets
+were mostly never being surfaced anyway. The gap between "8.64% of targets become
+unreachable" and "1.7% of recall is lost" is the difference between a target existing
+and a model finding it — worth stating, because the pessimistic figure was the one on
+record here and it overstated the damage fivefold.
+
+**Why both numbers are still reported.** The loss is small but it is *not* ranking
+quality: `is_open` records whether a business trades in 2022 while the ground truth is
+2019 behaviour, so a business the user visited in 2019 and that has since closed is
+simultaneously a correct suppression today and a permanently unreachable target. That
+is the same dump-vintage hazard D13 cites for keeping `is_open` out of training
+entirely, surfacing one stage later in the eval instead of in the model.
+`python -m sift.rerank.evaluate` prints the filtered and unfiltered rows together so
+the artifact cannot be mistaken for a regression.

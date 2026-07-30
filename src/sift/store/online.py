@@ -14,6 +14,7 @@ Run: ``python -m sift.store.online`` after the historical store is materialised.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import warnings
@@ -40,6 +41,7 @@ from sift.features.definitions import (
     online_features,
 )
 from sift.offline.dim_business import DIM_BUSINESS
+from sift.offline.ingest import EVENTS_DIR, events_glob
 from sift.store.materialize import HISTORICAL_DIR, state_path
 from sift.store.read import attach_store, read_current_features
 
@@ -55,7 +57,12 @@ ITEM_ALS_ALL = "__catalog__"
 # enough to dominate the stage (I31). A serving process wants concurrency to come
 # from requests, not from inside one.
 LOOKUP_THREADS = 1
-SCHEMA_VERSION = 5
+# 6: added the `user_reviewed` group for the rerank filter (D29). Additive, but the
+# bump is the point: a rerank-capable reader against a schema-5 generation would find
+# no reviewed records, filter nothing, and serve the user businesses they have already
+# been to — with no error raised. Silent degradation is exactly what this guard exists
+# to convert into a refusal.
+SCHEMA_VERSION = 6
 PIPELINE_SIZE = 1_000
 OLD_GENERATION_TTL_SECONDS = 3_600
 
@@ -72,6 +79,22 @@ class FeatureQuery:
 
 
 @dataclass(frozen=True)
+class RerankInputs:
+    """Serving-time attributes the rerank stage filters on — deliberately not features.
+
+    These reach rerank through their own read path rather than `lookup()`, and that
+    separation is load-bearing. `is_open` is the project's cleanest example of a signal
+    that is legitimate online and unconstructible historically (D13); the moment it can
+    arrive via `FeatureQuery` it is one careless registry entry away from being trained
+    on. Keeping it off that path makes the rule structural instead of remembered.
+    """
+
+    reviewed: frozenset[str]
+    is_open: dict[str, bool]
+    categories: dict[str, tuple[str, ...]]
+
+
+@dataclass(frozen=True)
 class OnlineManifest:
     generation: str
     as_of: datetime
@@ -83,6 +106,7 @@ class OnlineManifest:
     embeddings: tuple[tuple[str, int], ...] = ()
     user_als: int = 0
     item_als: int = 0
+    user_reviewed: int = 0
 
 
 def redis_client(url: str | None = None) -> Redis:
@@ -188,6 +212,7 @@ def materialize_online(
     client: Redis | None = None,
     historical_dir: Path = HISTORICAL_DIR,
     dim_file: Path = DIM_BUSINESS,
+    events_dir: Path = EVENTS_DIR,
     user_embedding_file: Path | None = None,
     user_embedding_name: str = USER_BEHAVIORAL_EMBEDDING,
 ) -> OnlineManifest:
@@ -209,6 +234,7 @@ def materialize_online(
         "user_embeddings": 0,
         "user_als": 0,
         "item_als": 0,
+        "user_reviewed": 0,
     }
     pipe = store.pipeline(transaction=False)
     pending = 0
@@ -303,6 +329,35 @@ def materialize_online(
                 write_record(_key(generation, "business", str(business_id)), values)
                 counts["businesses"] += 1
 
+        # Businesses the user has already reviewed, for the rerank filter (D29).
+        #
+        # Serving-only state. Like `is_open`, it is a business rule applied *after* the
+        # model rather than a signal learned by it (D13), so it has no training-side
+        # counterpart and is deliberately outside the skew check — there is nothing to
+        # compare it against, which is a property of the stage, not a gap in the check.
+        # It is therefore not a state group in `ONLINE_STATE_GROUPS`: no
+        # FeatureDefinition reads it, and listing it there would claim otherwise.
+        #
+        # `ts < as_of` matches every other record in this generation. That means it is
+        # as-of the data's end (2022 here), not as-of T. Serving wants exactly that.
+        # The offline rerank harness must NOT use it: at as_of it contains the post-T
+        # reviews that *are* the eval targets, so evaluating through it would filter
+        # away the ground truth and report recall near zero. `rerank.evaluate` reads
+        # pre-T pairs directly for that reason.
+        reviewed_rows = con.execute(
+            "SELECT user_id, list(DISTINCT business_id) AS seen "
+            f"FROM read_parquet({sql_path(Path(events_glob(events_dir)))}) "
+            "WHERE ts < ? GROUP BY user_id ORDER BY user_id",
+            [as_of],
+        )
+        while batch := reviewed_rows.fetchmany(PIPELINE_SIZE):
+            for user_id, seen in batch:
+                write_record(
+                    _key(generation, "user_reviewed", str(user_id)),
+                    {"seen": json.dumps(sorted(str(b) for b in seen))},
+                )
+                counts["user_reviewed"] += 1
+
         # ALS slice state (D27). Only the newest slice matters online: `_last_rows`
         # picks it per entity, which is the same row the offline as-of read selects
         # for a query at serving "now", so the skew check compares like with like.
@@ -367,6 +422,7 @@ def materialize_online(
             businesses=counts["businesses"],
             user_als=counts["user_als"],
             item_als=counts["item_als"],
+            user_reviewed=counts["user_reviewed"],
             definitions=json.dumps(
                 {name: get(name).version for name in online_features()}, sort_keys=True
             ),
@@ -411,6 +467,7 @@ def materialize_online(
         user_embeddings=counts["user_embeddings"],
         user_als=counts["user_als"],
         item_als=counts["item_als"],
+        user_reviewed=counts["user_reviewed"],
         embeddings=(((definition.name, definition.version),) if user_embedding_file else ()),
     )
 
@@ -430,7 +487,7 @@ class OnlineFeatureStore:
         self._database = duckdb.connect()
         self._database.execute(f"SET threads TO {LOOKUP_THREADS}")
         self._item_als_lock = Lock()
-        self._item_als_generation: str | None = None
+        self._item_als_relations: dict[str, str] = {}
 
     def manifest(self) -> OnlineManifest:
         try:
@@ -476,6 +533,7 @@ class OnlineFeatureStore:
             embeddings=tuple(sorted(raw_embeddings.items())),
             user_als=int(raw.get("user_als", 0)),
             item_als=int(raw.get("item_als", 0)),
+            user_reviewed=int(raw.get("user_reviewed", 0)),
         )
         self._thread.manifest = manifest
         return manifest
@@ -505,6 +563,39 @@ class OnlineFeatureStore:
                 f"stored {name} has {len(vector)} values, expected {definition.shape[0]}"
             )
         return vector
+
+    def rerank_inputs(self, user_id: str, business_ids: Sequence[str]) -> RerankInputs:
+        """Read the rerank stage's serving-only inputs from the active generation.
+
+        One `mget` of the user's reviewed set plus the candidates' business records —
+        the same records `lookup()` reads for location and price, but projected here
+        without going through the feature query, because these fields are not features
+        and must not become reachable as such (see :class:`RerankInputs`).
+
+        A business absent from the catalog record is treated as **closed**. Failing
+        closed is the safe direction: the alternative surfaces a business the store
+        knows nothing about, and rerank's job is to be the last thing that can say no.
+        """
+        manifest = self.manifest()
+        generation = manifest.generation
+        unique = tuple(dict.fromkeys(business_ids))
+        keys = [_key(generation, "user_reviewed", user_id)]
+        keys.extend(_key(generation, "business", business_id) for business_id in unique)
+        try:
+            responses = self.client.mget(keys)
+        except RedisError as exc:
+            raise OnlineStoreUnavailable(f"cannot read Redis: {exc}") from exc
+
+        seen_raw = _decode_record(responses[0]).get("seen")
+        reviewed = frozenset(json.loads(seen_raw)) if seen_raw else frozenset()
+        is_open: dict[str, bool] = {}
+        categories: dict[str, tuple[str, ...]] = {}
+        for business_id, raw in zip(unique, responses[1:], strict=True):
+            record = _decode_record(raw)
+            is_open[business_id] = record.get("is_open") == "1"
+            encoded = record.get("categories")
+            categories[business_id] = tuple(json.loads(encoded)) if encoded else ()
+        return RerankInputs(reviewed=reviewed, is_open=is_open, categories=categories)
 
     def _connection(self) -> duckdb.DuckDBPyConnection:
         """One cursor per serving thread over the store's shared database.
@@ -562,7 +653,7 @@ class OnlineFeatureStore:
             cursor += 2
 
         con = self._connection()
-        self._ensure_item_als(con, generation)
+        item_als_relation = self._ensure_item_als(generation)
         self._load_relations(
             con,
             queries,
@@ -573,10 +664,10 @@ class OnlineFeatureStore:
             business_state,
             user_als,
         )
-        return read_current_features(con, features)
+        return read_current_features(con, features, item_als_state=item_als_relation)
 
-    def _ensure_item_als(self, con: duckdb.DuckDBPyConnection, generation: str) -> None:
-        """Build `item_als_current` once per (process, generation).
+    def _ensure_item_als(self, generation: str) -> str:
+        """Build and return one immutable item-ALS relation per generation.
 
         The catalog's ALS vectors do not vary by request, so fetching and parsing them
         per request was pure waste and the dominant cost in feature lookup (I29). They
@@ -584,27 +675,33 @@ class OnlineFeatureStore:
         thread re-paid a ~640ms build for every worker the threadpool created and
         collapsed p99 under concurrency (I31).
 
-        Two properties make once-per-process safe. The relation is created on the
-        shared database rather than a cursor-local TEMP table, so every thread's
-        cursor sees it; and it is keyed by generation, so a republish rebuilds it
-        instead of serving the previous snapshot's vectors.
+        The generation is part of the relation name. This is required by Redis's
+        snapshot contract: an old request may still be reading the previous generation
+        after the active pointer changes. Replacing one global relation would let that
+        request and a new request swap the table underneath each other, mixing snapshot
+        generations. Immutable per-generation relations let both finish safely.
 
         The Redis payload is already a JSON object of `business_id -> vector`, so
         DuckDB parses it directly. The previous route parsed it in Python, re-encoded
         it with `_rows_json`, and had `json_each` parse it a third time — three passes
         over 19.6MB, of which two bought nothing (638ms -> ~215ms).
         """
-        if self._item_als_generation == generation:
-            return
+        relation = self._item_als_relations.get(generation)
+        if relation is not None:
+            return relation
         with self._item_als_lock:
             # Re-check inside the lock: several threads can arrive together on a cold
             # process, and only the first should pay for the build.
-            if self._item_als_generation == generation:
-                return
+            relation = self._item_als_relations.get(generation)
+            if relation is not None:
+                return relation
+            # Redis generations are opaque external values, so do not interpolate one
+            # into SQL. A digest gives DuckDB a safe, deterministic identifier.
+            relation = f"item_als_{hashlib.sha256(generation.encode()).hexdigest()}"
             raw = self.client.get(_key(generation, "item_als", ITEM_ALS_ALL))
             blob = _decode_record(raw).get("vectors", "{}") if raw else "{}"
             self._database.execute(
-                "CREATE OR REPLACE TABLE item_als_current AS "
+                f"CREATE TABLE {relation} AS "
                 "SELECT key AS business_id, value::FLOAT[] AS value FROM json_each(?::JSON)",
                 [blob],
             )
@@ -620,15 +717,17 @@ class OnlineFeatureStore:
             broken = self._database.execute(
                 "SELECT count(*) FILTER ("
                 "  value IS NULL OR len(list_filter(value, x -> x IS NULL)) > 0"
-                "), count(DISTINCT len(value)) FROM item_als_current"
+                f"), count(DISTINCT len(value)) FROM {relation}"
             ).fetchone()
             if broken is not None and (broken[0] or broken[1] > 1):
+                self._database.execute(f"DROP TABLE {relation}")
                 raise OnlineStoreUnavailable(
                     f"item ALS state in generation {generation} is unusable: "
                     f"{broken[0]} vectors are NULL or contain NULLs, and "
                     f"{broken[1]} distinct widths are present; rematerialize"
                 )
-            self._item_als_generation = generation
+            self._item_als_relations[generation] = relation
+            return relation
 
     @staticmethod
     def _load_relations(
@@ -728,8 +827,8 @@ class OnlineFeatureStore:
             [_rows_json(("user_id", "category", "cum_count"), category_rows)],
         )
 
-        # Only the user side varies per request. The catalog's ALS vectors are built
-        # once per (connection, generation) by `_ensure_item_als`; rebuilding them
+        # Only the user side varies per request. Each generation's catalog ALS
+        # vectors are built once per store by `_ensure_item_als`; rebuilding them
         # here per request was the dominant cost in feature lookup (I29).
         user_als_rows: list[tuple[object, ...]] = [
             (entity_id, json.loads(state["value"]))
@@ -802,6 +901,10 @@ def main() -> None:
     print(f"  user embeddings  {manifest.user_embeddings:,}")
     print(f"  user ALS vectors {manifest.user_als:,}")
     print(f"  item ALS vectors {manifest.item_als:,}")
+    # I29 happened here: a count was added to Redis, to the manifest hash, and to the
+    # read path, but not to this report — so the publish step printed 0 for state that
+    # was correct all along, and the next reader went debugging a working system.
+    print(f"  reviewed history {manifest.user_reviewed:,}")
 
 
 if __name__ == "__main__":

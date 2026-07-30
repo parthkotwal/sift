@@ -44,8 +44,13 @@ from sift.eval.metrics import percentile
 DEFAULT_URL = "http://localhost:8000"
 
 # D28's budget as code rather than prose, so a run can check it. Stage names match the
-# API's `latency` fields; `overhead_ms` carries the "rerank + overhead" line, and rerank
-# is not built, so today it measures only routing and serialization.
+# API's `latency` fields.
+#
+# `rerank_ms` and `overhead_ms` were one 20ms line while rerank was unbuilt. Now that
+# it exists (D29) they are separate and both measured: rerank is 4.8ms p99 (a ~51-key
+# Redis read plus in-process filtering), overhead is 0.02ms p99. The old shared 20ms
+# would have been vacuous for overhead — it could regress a hundredfold and still pass —
+# which is the failure mode D28 was written about, one stage further along.
 #
 # Per-stage lines and the end-to-end contract are deliberately stated at *different*
 # concurrencies, because they do different jobs:
@@ -65,7 +70,8 @@ STAGE_TRIPWIRE_MS: dict[str, float] = {
     "retrieval_ms": 10.0,
     "feature_lookup_ms": 40.0,
     "ranking_ms": 15.0,
-    "overhead_ms": 20.0,
+    "rerank_ms": 10.0,
+    "overhead_ms": 5.0,
 }
 TRIPWIRE_CONCURRENCY = 1
 END_TO_END_P99_MS = 100.0

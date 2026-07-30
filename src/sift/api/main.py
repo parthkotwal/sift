@@ -8,6 +8,7 @@ from functools import lru_cache
 from typing import Annotated
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response
+from lightgbm.basic import LightGBMError
 from pydantic import BaseModel
 from redis.exceptions import RedisError
 
@@ -46,6 +47,7 @@ class LatencyBreakdown(BaseModel):
     retrieval_ms: float
     feature_lookup_ms: float
     ranking_ms: float
+    rerank_ms: float
     overhead_ms: float
     total_ms: float
 
@@ -67,12 +69,13 @@ def get_online_retriever() -> OnlineALSRetriever:
     """Load the winning warm-user path and its explicit cold fallback."""
     try:
         return _load_online_retriever()
-    except (FileNotFoundError, RedisError, OnlineStoreUnavailable) as exc:
+    except (FileNotFoundError, LightGBMError, RedisError, OnlineStoreUnavailable) as exc:
         raise HTTPException(
             status_code=503,
             detail=(
-                "online retriever unavailable; build the popularity/ALS artifacts, "
-                "start Redis, and run `python -m sift.store.online`"
+                "online retriever unavailable; build the popularity, ALS, and "
+                "ALS-conditioned ranker artifacts, start Redis, and run "
+                "`python -m sift.store.online`"
             ),
         ) from exc
 
@@ -98,6 +101,7 @@ def recommend(
         f"retrieval;dur={latency.retrieval_ms:.3f}, "
         f"features;dur={latency.feature_lookup_ms:.3f}, "
         f"ranking;dur={latency.ranking_ms:.3f}, "
+        f"rerank;dur={latency.rerank_ms:.3f}, "
         f"total;dur={latency.total_ms:.3f}"
     )
     return RecommendResponse(
@@ -105,12 +109,14 @@ def recommend(
         metro=f"{METRO_CITY}, {METRO_STATE}",
         path=(
             "Redis user embedding -> exact ALS retrieval -> online features -> "
-            "LightGBM ranker (unranked popularity cold fallback)"
+            "LightGBM ranker -> rerank filters + diversity "
+            "(popularity cold fallback, reranked the same way)"
         ),
         latency=LatencyBreakdown(
             retrieval_ms=latency.retrieval_ms,
             feature_lookup_ms=latency.feature_lookup_ms,
             ranking_ms=latency.ranking_ms,
+            rerank_ms=latency.rerank_ms,
             overhead_ms=latency.overhead_ms,
             total_ms=latency.total_ms,
         ),

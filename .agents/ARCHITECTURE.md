@@ -29,8 +29,8 @@ request: user_id, location
  RANKING      500 → 50       LightGBM over rich user×item         metric: NDCG@10
     │                        features from the online store
     ▼
- RERANK       50 → 10        hard filters (open now, already      metric: eyeballable
-    │                        reviewed) + diversity
+ RERANK       50 → 10        hard filters (open now, already      metric: recall@10,
+    │                        reviewed) + category diversity       reported both ways
     ▼
 response: 10 businesses      end-to-end p99 < 100ms
 ```
@@ -44,11 +44,13 @@ hit contribution measured so no source rides for free.
 
 **Ranking** scores those ~500 with a gradient-boosted model over features the retrieval stage can't afford: distance, category affinity, review velocity, rating trend, price match, plus which retrieval source produced the candidate. Cuts to 50.
 
-**Rerank** applies hard filters — `is_open` *now* (a serving-time filter, deliberately never a training feature — see the skew section), already-reviewed — and a simple diversity pass to reach the final 10.
+**Rerank** applies hard filters — `is_open` *now* (a serving-time filter, deliberately never a training feature — see the skew section), already-reviewed — and a category-diversity cap to reach the final 10. Built in D29; both of its inputs are serving-only state with no training-side counterpart, which is why they reach the stage through their own store read rather than the feature path.
+
+It is the one stage that *lowers* the headline metric, and measuring why produced the sharpest result in the project so far: **949 of the ranker's 2,579 top-10 hits (36.8%) were businesses the user had already reviewed**, drawn from ~1.3% of the candidate pool. Filtering them costs 42% of recall@10 — not because the filter is wrong, but because more than a third of the pre-rerank number was predicting return visits rather than discovery. The closed-business filter, which looked like the expensive one (8.64% of holdout targets are now-closed businesses), costs 1.7%; the diversity cap costs 1.8%. Both the filtered and unfiltered figures are reported side by side so a dataset-vintage artifact cannot read as a ranking regression (`ISSUES.md` I5, I12).
 
 **Latency budget** (re-baselined against measurement, `DECISIONS.md` D28). Two different things, deliberately not one:
 
-- **Regression tripwires**, at concurrency 1 where numbers are reproducible: retrieval ≤ 10ms, online feature lookup ≤ 40ms, ranker inference ≤ 15ms, rerank + overhead ≤ 20ms.
+- **Regression tripwires**, at concurrency 1 where numbers are reproducible: retrieval ≤ 10ms, online feature lookup ≤ 40ms, ranker inference ≤ 15ms, rerank ≤ 10ms, overhead ≤ 5ms. (Rerank and overhead shared one 20ms line while rerank was unbuilt; now both are measured — 4.8ms and 0.02ms p99 — a shared budget would have let overhead regress a hundredfold and still pass.)
 - **The contract**: end-to-end **p99 < 100ms at up to 4 concurrent requests per process**.
 
 They are not required to sum, because per-stage p99s are not additive — at concurrency 4 the stage p99s total ~103ms while end-to-end p99 is ~79ms, since each stage's unluckiest 1% are mostly different requests. The original 30/20/30/20 = 100ms allocation encoded that arithmetic error, and was apportioned before anything was timed.
@@ -101,7 +103,7 @@ As-of `t`, right-exclusive windows. Hazard taxonomy lives in `DATA.md`.
 
 - **Step one is ALS, not a neural net** (`DECISIONS.md` D11): ALS factors are a two-tower without the towers — user/item vectors whose dot product predicts interaction — so the whole serving path (index, union, eval) gets built on a model the author fully owns. The learned two-tower is an *upgrade* that must beat ALS at recall@500 to land; if it doesn't, ALS ships and the system is unchanged.
 - **Two-tower result:** the fixed v1 uses 32-D learned IDs, point-in-time user features, D21-approved static item attributes, 128-unit MLPs, and 64-D normalized outputs. Its sampled-softmax candidates combine in-batch and uniform full-catalog negatives, apply logQ, and mask known positives. It scored 0.2399 recall@500 against ALS's 0.2519, so it does not land (D26). No tuning or hard-negative follow-up: that would turn the project into model experimentation.
-- **Retrieval is evaluated against the full catalog** (did the ~500 contain the user's actual future interaction?), never with sampled negatives — retrieval's job is the catalog, and eval choice flips conclusions (a lesson learned the hard way). Report popularity vs. ALS vs. two-tower, plus per-source marginal contribution and index latency. ALS landed in D25; its candidate-conditioned LightGBM did not, so the online path currently serves ALS order directly.
+- **Retrieval is evaluated against the full catalog** (did the ~500 contain the user's actual future interaction?), never with sampled negatives — retrieval's job is the catalog, and eval choice flips conclusions (a lesson learned the hard way). Report popularity vs. ALS vs. two-tower, plus per-source marginal contribution and index latency. ALS landed in D25; after time-sliced ALS state made its retrieval score point-in-time safe, the candidate-conditioned LightGBM ranker also landed in D27 and now reorders ALS's 500 candidates.
 
 ## Build order — backwards, one stage at a time
 
@@ -112,7 +114,7 @@ Each step ends with something that runs end to end; nothing lands without beatin
 3. **Ranking stage:** hand-computed features + LightGBM, reading features straight from Parquet at request time — deliberately wrong, to isolate whether ranking helps before adding storage.
 4. **Feature store:** pull features behind definitions; materialize to Parquet and Redis; swap the service to Redis reads; land the leak test and the future-invariance test.
 5. **Retrieval stage:** 5a — ALS embeddings → measured index, replace popularity retrieval, measure recall@500. Exact search won at current scale (D25). 5b — the fixed two-tower was measured and did not beat ALS (D26); ALS remains selected.
-6. **Rerank:** filters + diversity.
+6. **Rerank:** filters + diversity. Built (D29). The only stage that lowers the headline metric, and the reason is the finding: a third of the ranker's top-10 hits were repeat visits, so the pre-rerank number was measuring return-visit prediction as much as discovery.
 7. **Scale:** all metros; Spark for training-example generation **if and only if** candidate-pair volume warrants it (measured, not assumed).
 
 ## Stack

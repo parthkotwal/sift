@@ -34,6 +34,7 @@ from sift.ranking.online import (
 )
 from sift.ranking.rank import SERVING_POOL
 from sift.ranking.train import ALS_RANKER_MODEL, to_float
+from sift.rerank.rerank import RERANK_POOL, Candidate, rerank
 from sift.retrieval.index import ExactItemIndex
 from sift.store.online import LOOKUP_THREADS, FeatureQuery, OnlineFeatureStore
 
@@ -83,8 +84,12 @@ class OnlineALSRetriever:
         vector = self.store.lookup_user_embedding(user_id)
         cold = vector is None
         if cold:
-            candidate_ids = [entry.business_id for entry in self.popularity[:k]]
-            fallback_scores = [float(entry.pre_t_reviews) for entry in self.popularity[:k]]
+            # RERANK_POOL, not k: the cold path is filtered too, so it needs slack to
+            # backfill from. A closed restaurant is no better a recommendation for a
+            # user we know nothing about.
+            head = self.popularity[: max(k, RERANK_POOL)]
+            candidate_ids = [entry.business_id for entry in head]
+            fallback_scores = [float(entry.pre_t_reviews) for entry in head]
         else:
             ids, scores = self.index.search_scored(
                 np.asarray(vector, dtype=np.float32), self._pool_size(k)
@@ -121,33 +126,61 @@ class OnlineALSRetriever:
             # behaviour I6 describes, and it matches `reranked_candidate_lists`, the
             # offline path that produced D27's numbers. Serving must not order
             # candidates differently from the run that decided the ranker lands.
-            order = np.argsort(-ranker_scores, kind="stable")[:k]
+            # RERANK_POOL, not k: rerank drops candidates, so truncating to k here
+            # would leave it nothing to backfill from and the response would come back
+            # short exactly when the filters bite hardest.
+            order = np.argsort(-ranker_scores, kind="stable")[:RERANK_POOL]
             chosen = [(candidate_ids[int(i)], float(ranker_scores[int(i)])) for i in order]
             ranking_done = time.perf_counter()
             feature_ms = (feature_done - feature_started) * 1_000
             ranking_ms = (ranking_done - feature_done) * 1_000
 
+        # Build step 6. The stage's inputs come from their own store read, not through
+        # `lookup()`: `is_open` is legitimate online and unconstructible historically
+        # (D13), so it must not be reachable as a feature. See D29.
+        rerank_started = time.perf_counter()
+        inputs = self.store.rerank_inputs(user_id, [business_id for business_id, _ in chosen])
+        final = rerank(
+            [
+                Candidate(
+                    business_id=business_id,
+                    score=score,
+                    is_open=inputs.is_open.get(business_id, False),
+                    categories=inputs.categories.get(business_id, ()),
+                )
+                for business_id, score in chosen
+            ],
+            k,
+            inputs.reviewed,
+        )
+        rerank_done = time.perf_counter()
+
         # `score` is whichever stage decided the order: the ranker's score for warm
-        # users, pre-T review count for the cold popularity fallback.
+        # users, pre-T review count for the cold popularity fallback. Rerank removes
+        # and reorders but never rescores, so these still mean what they meant.
         results = tuple(
             RankedBusiness(
-                business_id=business_id,
-                name=self.metadata[business_id].name,
-                pre_t_reviews=self.metadata[business_id].pre_t_reviews,
-                score=score,
+                business_id=candidate.business_id,
+                name=self.metadata[candidate.business_id].name,
+                pre_t_reviews=self.metadata[candidate.business_id].pre_t_reviews,
+                score=candidate.score,
             )
-            for business_id, score in chosen
+            for candidate in final
         )
         done = time.perf_counter()
         retrieval_ms = (retrieval_done - retrieval_started) * 1_000
+        rerank_ms = (rerank_done - rerank_started) * 1_000
         total_ms = (done - started) * 1_000
-        overhead_ms = max(0.0, total_ms - retrieval_ms - feature_ms - ranking_ms)
+        overhead_ms = max(
+            0.0, total_ms - retrieval_ms - feature_ms - ranking_ms - rerank_ms
+        )
         return OnlineRecommendation(
             results=results,
             latency=StageLatency(
                 retrieval_ms=retrieval_ms,
                 feature_lookup_ms=feature_ms,
                 ranking_ms=ranking_ms,
+                rerank_ms=rerank_ms,
                 overhead_ms=overhead_ms,
                 total_ms=total_ms,
             ),
@@ -175,6 +208,7 @@ def main() -> None:
         "retrieval": [],
         "feature_lookup": [],
         "ranking": [],
+        "rerank": [],
         "overhead": [],
         "total": [],
     }
@@ -183,6 +217,7 @@ def main() -> None:
         samples["retrieval"].append(latency.retrieval_ms)
         samples["feature_lookup"].append(latency.feature_lookup_ms)
         samples["ranking"].append(latency.ranking_ms)
+        samples["rerank"].append(latency.rerank_ms)
         samples["overhead"].append(latency.overhead_ms)
         samples["total"].append(latency.total_ms)
     print(

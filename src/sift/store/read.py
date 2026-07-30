@@ -260,9 +260,13 @@ def read_current_features(
     con: duckdb.DuckDBPyConnection,
     features: Sequence[str] | None = None,
     queries: str = "queries",
+    *,
+    item_als_state: str = "item_als_current",
 ) -> list[tuple[object, ...]]:
     """Project current state; rows are ``(query_id, *features)``."""
-    return con.execute(current_feature_query(features, queries)).fetchall()
+    return con.execute(
+        current_feature_query(features, queries, item_als_state=item_als_state)
+    ).fetchall()
 
 
 def get_asof(

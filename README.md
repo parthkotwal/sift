@@ -14,7 +14,7 @@ retrieval   14.6K → ~500  exact ALS dot product (ANN at scale) recall@500
    ▼
 ranking     500 → 50      LightGBM on user×item features     NDCG@10
    ▼
-rerank      50 → 10       hard filters + diversity
+rerank      50 → 10       hard filters + diversity           recall@10, both ways
    ▼
 response: 10 businesses   p99 < 100ms, budgeted per stage
 ```
@@ -46,15 +46,32 @@ docker compose up -d redis
 uv run python -m sift.store.materialize   # historical timelines -> Parquet
 uv run python -m sift.retrieval.interactions
 uv run python -m sift.retrieval.als
-uv run python -m sift.store.online        # current state + ALS user vectors -> Redis
+uv run python -m sift.retrieval.als_slices
+uv run python -m sift.retrieval.train_ranker
+uv run python -m sift.store.online        # current state, ALS vectors, reviewed history -> Redis
 uv run python -m sift.store.skew          # Redis == Parquet as-of-now
 uv run uvicorn sift.api.main:app --reload
 ```
 
+Redis carries a schema version, and the client refuses a generation written under an
+older one rather than degrading quietly — a rerank-capable reader against a pre-rerank
+generation would find no reviewed history, filter nothing, and serve people places they
+have already been with no error raised. Re-run `sift.store.online` after pulling.
+
 `GET /recommend?user_id=<id>&k=10` reads the versioned user embedding from Redis,
-performs exact ALS retrieval over the full metro catalog to get 500 candidates, and
-orders them with the ALS-conditioned LightGBM ranker. Users absent from the ALS
-artifact fall back explicitly to pre-T popularity, unranked.
+performs exact ALS retrieval over the full metro catalog to get 500 candidates, orders
+them with the ALS-conditioned LightGBM ranker, and reranks the top 50 down to 10 with
+hard filters and a category-diversity cap. Users absent from the ALS artifact fall back
+to pre-T popularity — reranked the same way, since a closed restaurant is no better a
+recommendation for a user we know nothing about.
+
+The rerank stage is the one that *lowers* the headline metric, and finding out why was
+the point of building it: **949 of the ranker's 2,579 top-10 hits (36.8%) were
+businesses the user had already reviewed**, from ~1.3% of the candidate pool. Filtering
+them costs 42% of recall@10 — more than a third of the pre-rerank number was predicting
+return visits rather than discovery. The filter that looked expensive (closed businesses
+are 8.64% of holdout targets) costs 1.7%. Both numbers are reported side by side;
+`.agents/DECISIONS.md` D29 has the reasoning.
 
 The ranker earns that position only because retrieval's own score now reaches it as
 time-sliced ALS state: with that feature it beats ALS's raw ordering (NDCG@10
@@ -62,11 +79,11 @@ time-sliced ALS state: with that feature it beats ALS's raw ordering (NDCG@10
 the label outright, so the slices are what make it usable — see `.agents/DECISIONS.md`
 D27.
 
-**This path is not yet within its latency contract.** Single-threaded it is
-comfortable, but the online store caches catalog-wide ALS vectors per *thread* while
-the endpoint runs on a threadpool, so p99 degrades badly under concurrency
-(`.agents/ISSUES.md` I31). The measurement is the deliverable here, including when it
-says no.
+The catalog-wide ALS state is shared once per process, while request-local DuckDB
+relations remain isolated per worker. The load benchmark checks the stated
+four-request concurrency envelope and refuses a verdict on a contended host; the
+binding result comes from deployment hardware rather than inheriting a noisy desktop
+measurement (`.agents/ISSUES.md` I31).
 
 To check the latency contract, drive the running endpoint at a stated concurrency:
 

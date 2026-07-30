@@ -16,6 +16,7 @@ and the leak tests in `test_spine.py`, and the snapshot blocklist in
 
 from __future__ import annotations
 
+import ast
 from pathlib import Path
 from types import ModuleType
 
@@ -25,20 +26,62 @@ import sift.offline.training_set
 import sift.ranking.online
 import sift.ranking.rank
 import sift.ranking.train
+import sift.rerank.evaluate
+import sift.retrieval.online
 import sift.store.read
 
 # Modules that consume features. Anything added here must read through the store.
+#
+# `rerank.evaluate` is listed even though its own inputs (`is_open`, categories,
+# reviewed history) are deliberately *not* features (D13, D29). That is precisely why
+# it belongs here: a stage that already reads the catalog directly is the likeliest
+# place for someone to compute "just one more signal" inline, and this is the assertion
+# that stops it. `retrieval.online` joined for the same reason once it began scoring.
+#
+# `rerank.rerank` is deliberately absent. It is a pure function with no data access at
+# all, so it cannot violate the chokepoint — and listing it only trips the keyword
+# heuristic below, since it discusses features at length to explain why its inputs are
+# not any. A guard that fires on a module which physically cannot break the rule
+# teaches people to route around the guard.
 CONSUMERS: tuple[ModuleType, ...] = (
     sift.offline.training_set,
     sift.ranking.rank,
     sift.ranking.online,
     sift.ranking.train,
+    sift.retrieval.online,
+    sift.rerank.evaluate,
 )
 
 
 def _source(module: ModuleType) -> str:
     assert module.__file__ is not None
     return Path(module.__file__).read_text()
+
+
+def _code_only(module: ModuleType) -> str:
+    """Source with docstrings and comments stripped, for the keyword scan below.
+
+    `test_feature_reads_go_through_the_store` documents its own weakness — it "would
+    false-positive on a docstring that shouted the keyword" — and `rerank/evaluate.py`
+    is exactly that case: it discusses features at length to explain why `is_open` and
+    reviewed history are deliberately *not* any (D13, D29). Scanning code rather than
+    prose keeps the check pointed at the realistic mistake instead of at an accurate
+    comment, which is the difference between a guard people trust and one they route
+    around.
+    """
+    tree = ast.parse(_source(module))
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Module | ast.ClassDef | ast.FunctionDef | ast.AsyncFunctionDef):
+            continue
+        body = node.body
+        if (
+            body
+            and isinstance(body[0], ast.Expr)
+            and isinstance(body[0].value, ast.Constant)
+            and isinstance(body[0].value.value, str)
+        ):
+            node.body = body[1:] or [ast.Pass()]
+    return ast.unparse(tree)
 
 
 @pytest.mark.parametrize("module", CONSUMERS, ids=lambda m: m.__name__)
@@ -81,7 +124,7 @@ def test_the_as_of_join_exists_in_exactly_one_module() -> None:
 def test_feature_reads_go_through_the_store() -> None:
     """Every consumer that uses features must name the read path it uses."""
     for module in CONSUMERS:
-        source = _source(module)
+        source = _code_only(module)
         if "feature" not in source.lower():
             continue
         assert (

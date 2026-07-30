@@ -120,7 +120,15 @@ def _redis(fake: _MemoryRedis) -> Redis:
     return cast(Redis, fake)
 
 
-def _artifacts(tmp_path: Path) -> tuple[Path, Path]:
+def _artifacts(tmp_path: Path) -> tuple[Path, Path, Path]:
+    """Synthetic historical store, dimension, and *events*.
+
+    The events directory is returned and threaded into `materialize_online` on purpose.
+    It defaults to the real `data/silver/events`, so a test that omits it silently
+    publishes 213k production users into the fake Redis and still passes — the I1
+    defect exactly ("synthetic tests silently read the real dim_business"). The suite
+    tripling in runtime was the only symptom.
+    """
     businesses = [
         {
             "business_id": "b1",
@@ -192,13 +200,15 @@ def _artifacts(tmp_path: Path) -> tuple[Path, Path]:
         {f"b{j}": [1.0, float(j + 1), 0.0] for j in range(0, 8)},
         boundary="2015-01-01 00:00:00",
     )
-    return historical, dim
+    return historical, dim, events
 
 
 def test_online_lookup_matches_parquet_as_of_now(tmp_path: Path) -> None:
-    historical, dim = _artifacts(tmp_path)
+    historical, dim, events = _artifacts(tmp_path)
     fake = _MemoryRedis()
-    manifest = materialize_online(client=_redis(fake), historical_dir=historical, dim_file=dim)
+    manifest = materialize_online(
+        client=_redis(fake), historical_dir=historical, dim_file=dim, events_dir=events
+    )
     rows = OnlineFeatureStore(_redis(fake)).lookup(
         [FeatureQuery(1, "u1", "b1"), FeatureQuery(2, "u1", "b2")]
     )
@@ -215,7 +225,7 @@ def test_online_lookup_matches_parquet_as_of_now(tmp_path: Path) -> None:
 
 
 def test_user_embedding_is_published_and_read_from_same_generation(tmp_path: Path) -> None:
-    historical, dim = _artifacts(tmp_path)
+    historical, dim, events = _artifacts(tmp_path)
     embedding_file = tmp_path / "users.parquet"
     vector = [float(index) for index in range(64)]
     con = duckdb.connect()
@@ -230,6 +240,7 @@ def test_user_embedding_is_published_and_read_from_same_generation(tmp_path: Pat
         client=_redis(fake),
         historical_dir=historical,
         dim_file=dim,
+        events_dir=events,
         user_embedding_file=embedding_file,
     )
     store = OnlineFeatureStore(_redis(fake))
@@ -254,10 +265,14 @@ def test_user_embedding_is_published_and_read_from_same_generation(tmp_path: Pat
 
 
 def test_refresh_publishes_a_new_generation_and_retires_the_old(tmp_path: Path) -> None:
-    historical, dim = _artifacts(tmp_path)
+    historical, dim, events = _artifacts(tmp_path)
     fake = _MemoryRedis()
-    first = materialize_online(client=_redis(fake), historical_dir=historical, dim_file=dim)
-    second = materialize_online(client=_redis(fake), historical_dir=historical, dim_file=dim)
+    first = materialize_online(
+        client=_redis(fake), historical_dir=historical, dim_file=dim, events_dir=events
+    )
+    second = materialize_online(
+        client=_redis(fake), historical_dir=historical, dim_file=dim, events_dir=events
+    )
     assert first.generation != second.generation
     assert fake.values[ACTIVE_GENERATION_KEY] == second.generation
     assert any(f":{first.generation}:" in key for key in fake.expired)
@@ -274,11 +289,15 @@ def test_empty_store_fails_with_an_actionable_error() -> None:
 
 
 def test_skew_check_detects_a_corrupted_online_value(tmp_path: Path) -> None:
-    historical, dim = _artifacts(tmp_path)
+    historical, dim, events = _artifacts(tmp_path)
     fake = _MemoryRedis()
-    materialize_online(client=_redis(fake), historical_dir=historical, dim_file=dim)
+    materialize_online(
+        client=_redis(fake), historical_dir=historical, dim_file=dim, events_dir=events
+    )
     store = OnlineFeatureStore(_redis(fake))
-    assert check_skew(store, sample_size=2, historical_dir=historical, dim_file=dim).ok
+    assert check_skew(
+        store, sample_size=2, historical_dir=historical, dim_file=dim
+    ).ok
 
     generation = fake.values[ACTIVE_GENERATION_KEY]
     for key, value in fake.values.items():
@@ -287,15 +306,19 @@ def test_skew_check_detects_a_corrupted_online_value(tmp_path: Path) -> None:
             record = json.loads(value)
             record["cum_count"] = "999"
             fake.values[key] = json.dumps(record)
-    report = check_skew(store, sample_size=2, historical_dir=historical, dim_file=dim)
+    report = check_skew(
+        store, sample_size=2, historical_dir=historical, dim_file=dim
+    )
     assert not report.ok
     assert any(m.feature == "u_reviews_to_date" for m in report.mismatches)
 
 
 def test_skew_check_rejects_a_stale_redis_snapshot(tmp_path: Path) -> None:
-    historical, dim = _artifacts(tmp_path)
+    historical, dim, events = _artifacts(tmp_path)
     fake = _MemoryRedis()
-    manifest = materialize_online(client=_redis(fake), historical_dir=historical, dim_file=dim)
+    manifest = materialize_online(
+        client=_redis(fake), historical_dir=historical, dim_file=dim, events_dir=events
+    )
     manifest_key = f"{KEY_PREFIX}:{manifest.generation}:manifest"
     raw = fake.values[manifest_key]
     assert isinstance(raw, dict)
@@ -321,9 +344,11 @@ def test_concurrent_lookups_through_one_store_do_not_contaminate_each_other(
     each thread had its own connection and this held trivially; it is now load-bearing,
     so it gets a test that would fail if those relations stopped being cursor-local.
     """
-    historical, dim = _artifacts(tmp_path)
+    historical, dim, events = _artifacts(tmp_path)
     fake = _MemoryRedis()
-    materialize_online(client=_redis(fake), historical_dir=historical, dim_file=dim)
+    materialize_online(
+        client=_redis(fake), historical_dir=historical, dim_file=dim, events_dir=events
+    )
     store = OnlineFeatureStore(_redis(fake))
 
     pairs = [("u1", "b1"), ("u1", "b2"), ("u3", "b3"), ("u2", "b1")]
@@ -355,9 +380,11 @@ def test_item_als_catalog_is_fetched_once_per_process_not_once_per_thread(
 ) -> None:
     """I31's actual defect: the catalog-wide relation was cached per thread, so every
     worker the threadpool created re-paid a ~640ms build over a 19.6MB payload."""
-    historical, dim = _artifacts(tmp_path)
+    historical, dim, events = _artifacts(tmp_path)
     fake = _MemoryRedis()
-    manifest = materialize_online(client=_redis(fake), historical_dir=historical, dim_file=dim)
+    manifest = materialize_online(
+        client=_redis(fake), historical_dir=historical, dim_file=dim, events_dir=events
+    )
     catalog_key = f"{KEY_PREFIX}:{manifest.generation}:item_als:{ITEM_ALS_ALL}"
 
     fetches: list[str] = []
@@ -371,14 +398,52 @@ def test_item_als_catalog_is_fetched_once_per_process_not_once_per_thread(
     fake.get = counting_get  # type: ignore[method-assign]
     store = OnlineFeatureStore(_redis(fake))
 
-    threads = [
-        Thread(target=lambda: store.lookup([FeatureQuery(0, "u1", "b1")])) for _ in range(8)
-    ]
+    threads = [Thread(target=lambda: store.lookup([FeatureQuery(0, "u1", "b1")])) for _ in range(8)]
     for thread in threads:
         thread.start()
     for thread in threads:
         thread.join()
     assert len(fetches) == 1, f"catalog fetched {len(fetches)} times across 8 threads"
+
+
+def test_item_als_relations_are_pinned_to_the_request_generation(tmp_path: Path) -> None:
+    """An active-generation swap must not replace state under an old request.
+
+    Redis deliberately keeps the old generation alive for in-flight readers. The
+    shared DuckDB cache must do the same: both generation relations remain addressable
+    and the read path explicitly selects the one captured by that request.
+    """
+    historical, dim, events = _artifacts(tmp_path)
+    fake = _MemoryRedis()
+    first = materialize_online(
+        client=_redis(fake), historical_dir=historical, dim_file=dim, events_dir=events
+    )
+    store = OnlineFeatureStore(_redis(fake))
+    first_row = store.lookup([FeatureQuery(0, "u1", "b1")])
+    assert first_row[0][-2] == 4.0
+
+    second = materialize_online(
+        client=_redis(fake), historical_dir=historical, dim_file=dim, events_dir=events
+    )
+    second_key = f"{KEY_PREFIX}:{second.generation}:item_als:{ITEM_ALS_ALL}"
+    record = fake.values[second_key]
+    assert isinstance(record, str)
+    vectors = json.loads(json.loads(record)["vectors"])
+    vectors["b1"] = [10.0, 0.0, 0.0]
+    fake.values[second_key] = json.dumps({"vectors": json.dumps(vectors)})
+
+    second_row = store.lookup([FeatureQuery(0, "u1", "b1")])
+    assert second_row[0][-2] == 20.0
+
+    first_relation = store._item_als_relations[first.generation]
+    second_relation = store._item_als_relations[second.generation]
+    assert first_relation != second_relation
+    assert store._database.execute(
+        f"SELECT value FROM {first_relation} WHERE business_id = 'b1'"
+    ).fetchone() == ([1.0, 2.0, 0.0],)
+    assert store._database.execute(
+        f"SELECT value FROM {second_relation} WHERE business_id = 'b1'"
+    ).fetchone() == ([10.0, 0.0, 0.0],)
 
 
 def test_null_item_als_vectors_are_refused_rather_than_served_as_null_features(
@@ -389,9 +454,11 @@ def test_null_item_als_vectors_are_refused_rather_than_served_as_null_features(
     check for it, `list_contains(value, NULL)`, can never fire (I27). So assert the
     corrupted payload is genuinely rejected, not merely that a guard exists.
     """
-    historical, dim = _artifacts(tmp_path)
+    historical, dim, events = _artifacts(tmp_path)
     fake = _MemoryRedis()
-    manifest = materialize_online(client=_redis(fake), historical_dir=historical, dim_file=dim)
+    manifest = materialize_online(
+        client=_redis(fake), historical_dir=historical, dim_file=dim, events_dir=events
+    )
     catalog_key = f"{KEY_PREFIX}:{manifest.generation}:item_als:{ITEM_ALS_ALL}"
 
     record = fake.values[catalog_key]
@@ -403,3 +470,66 @@ def test_null_item_als_vectors_are_refused_rather_than_served_as_null_features(
     store = OnlineFeatureStore(_redis(fake))
     with pytest.raises(OnlineStoreUnavailable, match="NULL"):
         store.lookup([FeatureQuery(0, "u1", "b1")])
+
+
+def test_reviewed_history_is_published_and_reaches_the_rerank_stage(tmp_path: Path) -> None:
+    """The rerank filter's input, whose payoff is measured: already-reviewed
+    businesses are 1.3% of the candidate pool but 13% of the served top-10."""
+    historical, dim, events = _artifacts(tmp_path)
+    fake = _MemoryRedis()
+    manifest = materialize_online(
+        client=_redis(fake), historical_dir=historical, dim_file=dim, events_dir=events
+    )
+    # u1 reviewed b1 and b2; u3 reviewed only b3.
+    assert manifest.user_reviewed == 3, "the count must reach the RETURNED manifest (I29)"
+
+    store = OnlineFeatureStore(_redis(fake))
+    inputs = store.rerank_inputs("u1", ["b1", "b2", "b3"])
+    assert inputs.reviewed == frozenset({"b1", "b2"})
+    assert store.rerank_inputs("u3", ["b1"]).reviewed == frozenset({"b3"})
+    # A user with no history filters nothing, rather than raising.
+    assert store.rerank_inputs("nobody", ["b1"]).reviewed == frozenset()
+
+
+def test_rerank_inputs_supply_open_state_and_categories(tmp_path: Path) -> None:
+    historical, dim, events = _artifacts(tmp_path)
+    fake = _MemoryRedis()
+    materialize_online(
+        client=_redis(fake), historical_dir=historical, dim_file=dim, events_dir=events
+    )
+    inputs = OnlineFeatureStore(_redis(fake)).rerank_inputs("u1", ["b1", "b3"])
+    assert inputs.is_open == {"b1": True, "b3": True}
+    assert inputs.categories["b1"] == ("Restaurants", "Pizza")
+    assert inputs.categories["b3"] == ("Coffee",)
+
+
+def test_a_business_absent_from_the_catalog_is_treated_as_closed(tmp_path: Path) -> None:
+    """Fail closed: the alternative surfaces a business the store knows nothing about,
+    and rerank is the last stage that can say no."""
+    historical, dim, events = _artifacts(tmp_path)
+    fake = _MemoryRedis()
+    materialize_online(
+        client=_redis(fake), historical_dir=historical, dim_file=dim, events_dir=events
+    )
+    inputs = OnlineFeatureStore(_redis(fake)).rerank_inputs("u1", ["ghost"])
+    assert inputs.is_open["ghost"] is False
+    assert inputs.categories["ghost"] == ()
+
+
+def test_a_generation_written_under_an_older_schema_is_refused(tmp_path: Path) -> None:
+    """Why the schema 5 -> 6 bump exists. A rerank-capable reader against a schema-5
+    generation would find no reviewed records, filter nothing, and serve the user
+    places they have already been — with nothing raised. The guard turns that silent
+    degradation into a refusal, so it has to actually fire."""
+    historical, dim, events = _artifacts(tmp_path)
+    fake = _MemoryRedis()
+    manifest = materialize_online(
+        client=_redis(fake), historical_dir=historical, dim_file=dim, events_dir=events
+    )
+    stored = fake.values[f"{KEY_PREFIX}:{manifest.generation}:manifest"]
+    assert isinstance(stored, dict)
+    stored["schema_version"] = "5"
+
+    store = OnlineFeatureStore(_redis(fake))
+    with pytest.raises(OnlineStoreUnavailable, match="schema"):
+        store.rerank_inputs("u1", ["b1"])

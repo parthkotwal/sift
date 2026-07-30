@@ -33,6 +33,7 @@ class StageLatency:
     retrieval_ms: float
     feature_lookup_ms: float
     ranking_ms: float
+    rerank_ms: float
     overhead_ms: float
     total_ms: float
 
@@ -116,6 +117,10 @@ class OnlineRanker:
                 retrieval_ms=retrieval_ms,
                 feature_lookup_ms=feature_ms,
                 ranking_ms=ranking_ms,
+                # This is the displaced build-step-4 baseline, kept runnable for
+                # comparison; it has no rerank stage, so the number is 0 rather than
+                # absent. A missing stage should read as measured-zero, not unmeasured.
+                rerank_ms=0.0,
                 overhead_ms=overhead_ms,
                 total_ms=total_ms,
             ),
