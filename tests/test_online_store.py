@@ -6,9 +6,11 @@ import builtins
 import json
 from collections.abc import Callable
 from pathlib import Path
+from threading import Thread
 from typing import cast
 
 import duckdb
+import pytest
 from redis import Redis
 
 from conftest import write_als_state
@@ -18,6 +20,7 @@ from sift.offline.ingest import build_events
 from sift.store.materialize import materialize_historical
 from sift.store.online import (
     ACTIVE_GENERATION_KEY,
+    ITEM_ALS_ALL,
     KEY_PREFIX,
     FeatureQuery,
     OnlineFeatureStore,
@@ -306,3 +309,97 @@ def test_skew_check_rejects_a_stale_redis_snapshot(tmp_path: Path) -> None:
     )
     assert not report.ok
     assert report.online_as_of != report.offline_as_of
+
+
+def test_concurrent_lookups_through_one_store_do_not_contaminate_each_other(
+    tmp_path: Path,
+) -> None:
+    """The property that makes a shared DuckDB database safe (I31).
+
+    Per-request relations are TEMP, which DuckDB scopes to the cursor, so threads
+    cannot see each other's `queries`/`user_current` rows. Before the shared database
+    each thread had its own connection and this held trivially; it is now load-bearing,
+    so it gets a test that would fail if those relations stopped being cursor-local.
+    """
+    historical, dim = _artifacts(tmp_path)
+    fake = _MemoryRedis()
+    materialize_online(client=_redis(fake), historical_dir=historical, dim_file=dim)
+    store = OnlineFeatureStore(_redis(fake))
+
+    pairs = [("u1", "b1"), ("u1", "b2"), ("u3", "b3"), ("u2", "b1")]
+    expected = {pair: store.lookup([FeatureQuery(0, *pair)])[0][1:] for pair in pairs}
+
+    wrong: list[str] = []
+    failed: list[str] = []
+
+    def hammer(pair: tuple[str, str]) -> None:
+        try:
+            for _ in range(30):
+                got = store.lookup([FeatureQuery(0, *pair)])[0][1:]
+                if got != expected[pair]:
+                    wrong.append(f"{pair} got {got!r}, expected {expected[pair]!r}")
+        except Exception as exc:  # noqa: BLE001
+            failed.append(f"{pair}: {type(exc).__name__}: {exc}")
+
+    threads = [Thread(target=hammer, args=(pair,)) for pair in pairs * 2]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert not failed, failed[:3]
+    assert not wrong, wrong[:3]
+
+
+def test_item_als_catalog_is_fetched_once_per_process_not_once_per_thread(
+    tmp_path: Path,
+) -> None:
+    """I31's actual defect: the catalog-wide relation was cached per thread, so every
+    worker the threadpool created re-paid a ~640ms build over a 19.6MB payload."""
+    historical, dim = _artifacts(tmp_path)
+    fake = _MemoryRedis()
+    manifest = materialize_online(client=_redis(fake), historical_dir=historical, dim_file=dim)
+    catalog_key = f"{KEY_PREFIX}:{manifest.generation}:item_als:{ITEM_ALS_ALL}"
+
+    fetches: list[str] = []
+    inner = fake.get
+
+    def counting_get(key: object) -> object | None:
+        if key == catalog_key:
+            fetches.append(str(key))
+        return inner(key)
+
+    fake.get = counting_get  # type: ignore[method-assign]
+    store = OnlineFeatureStore(_redis(fake))
+
+    threads = [
+        Thread(target=lambda: store.lookup([FeatureQuery(0, "u1", "b1")])) for _ in range(8)
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert len(fetches) == 1, f"catalog fetched {len(fetches)} times across 8 threads"
+
+
+def test_null_item_als_vectors_are_refused_rather_than_served_as_null_features(
+    tmp_path: Path,
+) -> None:
+    """The guard must actually fire. A NULL-filled vector is invisible downstream —
+    `ui_als_score` just comes back NULL and nothing raises (I26) — and the obvious
+    check for it, `list_contains(value, NULL)`, can never fire (I27). So assert the
+    corrupted payload is genuinely rejected, not merely that a guard exists.
+    """
+    historical, dim = _artifacts(tmp_path)
+    fake = _MemoryRedis()
+    manifest = materialize_online(client=_redis(fake), historical_dir=historical, dim_file=dim)
+    catalog_key = f"{KEY_PREFIX}:{manifest.generation}:item_als:{ITEM_ALS_ALL}"
+
+    record = fake.values[catalog_key]
+    assert isinstance(record, str)
+    vectors = json.loads(json.loads(record)["vectors"])
+    corrupted = {business: [None] * len(vector) for business, vector in vectors.items()}
+    fake.values[catalog_key] = json.dumps({"vectors": json.dumps(corrupted)})
+
+    store = OnlineFeatureStore(_redis(fake))
+    with pytest.raises(OnlineStoreUnavailable, match="NULL"):
+        store.lookup([FeatureQuery(0, "u1", "b1")])

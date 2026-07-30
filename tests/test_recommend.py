@@ -41,9 +41,13 @@ def test_recommend_returns_ranked_online_results(client: TestClient) -> None:
     body = resp.json()
     assert [r["business_id"] for r in body["results"]] == ["u1-b1", "u1-b2"]
     assert [r["rank"] for r in body["results"]] == [1, 2]
-    assert body["path"] == (
-        "Redis user embedding -> exact ALS retrieval (popularity cold fallback)"
-    )
+    # Assert what the description must convey, not its exact wording: the response
+    # names the stages actually in the path. A stale `path` is how a displaced model
+    # goes unnoticed (I30), so the ranker has to appear here once it serves.
+    path = body["path"]
+    for stage in ("user embedding", "ALS retrieval", "online features", "ranker"):
+        assert stage in path, f"{stage!r} missing from {path!r}"
+    assert "cold fallback" in path
 
 
 def test_recommend_exposes_real_stage_timings(client: TestClient) -> None:

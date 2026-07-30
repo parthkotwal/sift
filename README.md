@@ -51,17 +51,31 @@ uv run python -m sift.store.skew          # Redis == Parquet as-of-now
 uv run uvicorn sift.api.main:app --reload
 ```
 
-`GET /recommend?user_id=<id>&k=10` reads the versioned user embedding from Redis
-and performs exact ALS retrieval over the full metro catalog. Users absent from the
-ALS artifact fall back explicitly to pre-T popularity. The ALS-conditioned
-LightGBM ranker remains runnable but does not serve: it lowered NDCG@10 relative to
-ALS's own order, so it failed the model gate.
+`GET /recommend?user_id=<id>&k=10` reads the versioned user embedding from Redis,
+performs exact ALS retrieval over the full metro catalog to get 500 candidates, and
+orders them with the ALS-conditioned LightGBM ranker. Users absent from the ALS
+artifact fall back explicitly to pre-T popularity, unranked.
+
+The ranker earns that position only because retrieval's own score now reaches it as
+time-sliced ALS state: with that feature it beats ALS's raw ordering (NDCG@10
+0.0269 → 0.0294); without it, it lost. The naive version of the same feature leaks
+the label outright, so the slices are what make it usable — see `.agents/DECISIONS.md`
+D27.
+
+**This path is not yet within its latency contract.** Single-threaded it is
+comfortable, but the online store caches catalog-wide ALS vectors per *thread* while
+the endpoint runs on a threadpool, so p99 degrades badly under concurrency
+(`.agents/ISSUES.md` I31). The measurement is the deliverable here, including when it
+says no.
 
 For a latency distribution rather than one request:
 
 ```bash
-uv run python -m sift.retrieval.online --samples 100
+uv run python -m sift.retrieval.online --samples 500
 ```
+
+Note that this is a single-threaded loop against a warm process, so it profiles one
+thread rather than the server — I31 is the record of what that hides.
 
 Set `SIFT_REDIS_URL` to use a non-default Redis endpoint.
 

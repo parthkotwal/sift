@@ -22,7 +22,7 @@ from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from threading import local
+from threading import Lock, local
 from typing import cast
 from uuid import uuid4
 
@@ -48,6 +48,13 @@ KEY_PREFIX = "sift:online"
 ACTIVE_GENERATION_KEY = f"{KEY_PREFIX}:active"
 GENERATION_INDEX_KEY = f"{KEY_PREFIX}:generations"
 ITEM_ALS_ALL = "__catalog__"
+# Intra-request DuckDB parallelism, deliberately 1. A lookup projects a few hundred
+# rows out of relations small enough that parallelism buys nothing per request, while
+# DuckDB's default (one thread per core) multiplies against request concurrency: at 8
+# concurrent requests the default oversubscribed a 4-performance-core machine badly
+# enough to dominate the stage (I31). A serving process wants concurrency to come
+# from requests, not from inside one.
+LOOKUP_THREADS = 1
 SCHEMA_VERSION = 5
 PIPELINE_SIZE = 1_000
 OLD_GENERATION_TTL_SECONDS = 3_600
@@ -414,6 +421,16 @@ class OnlineFeatureStore:
     def __init__(self, client: Redis | None = None) -> None:
         self.client = client or redis_client()
         self._thread = local()
+        # One DuckDB database per store, with a cursor per serving thread. Catalog
+        # state (the item-ALS relation) is shared across cursors so it is built once
+        # per process; per-request relations are TEMP, which DuckDB scopes to the
+        # cursor, so concurrent requests cannot see each other's rows. A connection
+        # per thread instead would re-pay a ~640ms build and duplicate ~19.6MB for
+        # every worker the threadpool creates (I31).
+        self._database = duckdb.connect()
+        self._database.execute(f"SET threads TO {LOOKUP_THREADS}")
+        self._item_als_lock = Lock()
+        self._item_als_generation: str | None = None
 
     def manifest(self) -> OnlineManifest:
         try:
@@ -490,10 +507,15 @@ class OnlineFeatureStore:
         return vector
 
     def _connection(self) -> duckdb.DuckDBPyConnection:
-        """One reusable DuckDB connection per serving thread."""
+        """One cursor per serving thread over the store's shared database.
+
+        A cursor, not a fresh `duckdb.connect()`: cursors share the catalog and
+        buffer pool, so the catalog-wide item-ALS relation is visible to every thread
+        without being rebuilt or duplicated, while TEMP relations stay cursor-local.
+        """
         connection = getattr(self._thread, "connection", None)
         if not isinstance(connection, duckdb.DuckDBPyConnection):
-            connection = duckdb.connect()
+            connection = self._database.cursor()
             self._thread.connection = connection
         return connection
 
@@ -554,27 +576,59 @@ class OnlineFeatureStore:
         return read_current_features(con, features)
 
     def _ensure_item_als(self, con: duckdb.DuckDBPyConnection, generation: str) -> None:
-        """Build `item_als_current` once per (connection, generation).
+        """Build `item_als_current` once per (process, generation).
 
-        The catalog's ALS vectors do not vary by request, so fetching and parsing
-        them per request was pure waste and the dominant cost in feature lookup
-        (I29). Keyed by generation so a republish rebuilds the relation rather than
-        serving the previous snapshot's vectors.
+        The catalog's ALS vectors do not vary by request, so fetching and parsing them
+        per request was pure waste and the dominant cost in feature lookup (I29). They
+        also do not vary by *thread*, which the first fix missed: caching them per
+        thread re-paid a ~640ms build for every worker the threadpool created and
+        collapsed p99 under concurrency (I31).
+
+        Two properties make once-per-process safe. The relation is created on the
+        shared database rather than a cursor-local TEMP table, so every thread's
+        cursor sees it; and it is keyed by generation, so a republish rebuilds it
+        instead of serving the previous snapshot's vectors.
+
+        The Redis payload is already a JSON object of `business_id -> vector`, so
+        DuckDB parses it directly. The previous route parsed it in Python, re-encoded
+        it with `_rows_json`, and had `json_each` parse it a third time — three passes
+        over 19.6MB, of which two bought nothing (638ms -> ~215ms).
         """
-        if getattr(self._thread, "item_als_generation", None) == generation:
+        if self._item_als_generation == generation:
             return
-        raw = self.client.get(_key(generation, "item_als", ITEM_ALS_ALL))
-        catalog: dict[str, list[float]] = (
-            json.loads(_decode_record(raw).get("vectors", "{}")) if raw else {}
-        )
-        con.execute(
-            "CREATE OR REPLACE TABLE item_als_current AS SELECT "
-            "json_extract_string(value, '$.business_id') AS business_id, "
-            "json_extract(value, '$.value')::FLOAT[] AS value "
-            "FROM json_each(?::JSON)",
-            [_rows_json(("business_id", "value"), list(catalog.items()))],
-        )
-        self._thread.item_als_generation = generation
+        with self._item_als_lock:
+            # Re-check inside the lock: several threads can arrive together on a cold
+            # process, and only the first should pay for the build.
+            if self._item_als_generation == generation:
+                return
+            raw = self.client.get(_key(generation, "item_als", ITEM_ALS_ALL))
+            blob = _decode_record(raw).get("vectors", "{}") if raw else "{}"
+            self._database.execute(
+                "CREATE OR REPLACE TABLE item_als_current AS "
+                "SELECT key AS business_id, value::FLOAT[] AS value FROM json_each(?::JSON)",
+                [blob],
+            )
+            # Structural guard, per I26: a NULL vector here is invisible downstream —
+            # `ui_als_score` simply comes back NULL for the affected businesses and
+            # nothing raises. Assert the marshalling worked rather than trusting it.
+            # `list_filter(... IS NULL)`, not `list_contains(value, NULL)`, which
+            # returns NULL rather than true and so can never fire (I27).
+            #
+            # Width is checked for *self-consistency*, not against a constant: the
+            # definition works at any matching length by design, so hardcoding 64
+            # here would reject a legitimately narrower slice (see tests/conftest.py).
+            broken = self._database.execute(
+                "SELECT count(*) FILTER ("
+                "  value IS NULL OR len(list_filter(value, x -> x IS NULL)) > 0"
+                "), count(DISTINCT len(value)) FROM item_als_current"
+            ).fetchone()
+            if broken is not None and (broken[0] or broken[1] > 1):
+                raise OnlineStoreUnavailable(
+                    f"item ALS state in generation {generation} is unusable: "
+                    f"{broken[0]} vectors are NULL or contain NULLs, and "
+                    f"{broken[1]} distinct widths are present; rematerialize"
+                )
+            self._item_als_generation = generation
 
     @staticmethod
     def _load_relations(
@@ -591,7 +645,7 @@ class OnlineFeatureStore:
             (query.query_id, query.user_id, query.business_id, as_of) for query in queries
         ]
         con.execute(
-            "CREATE OR REPLACE TABLE queries AS SELECT "
+            "CREATE OR REPLACE TEMP TABLE queries AS SELECT "
             "json_extract(value, '$.query_id')::BIGINT AS query_id, "
             "json_extract_string(value, '$.user_id') AS user_id, "
             "json_extract_string(value, '$.business_id') AS business_id, "
@@ -616,7 +670,7 @@ class OnlineFeatureStore:
                     )
                 )
         con.execute(
-            "CREATE OR REPLACE TABLE user_current AS SELECT "
+            "CREATE OR REPLACE TEMP TABLE user_current AS SELECT "
             "json_extract_string(value, '$.user_id') AS user_id, "
             "json_extract(value, '$.ts')::TIMESTAMP AS ts, "
             "json_extract(value, '$.cum_count')::BIGINT AS cum_count, "
@@ -651,7 +705,7 @@ class OnlineFeatureStore:
             if state
         ]
         con.execute(
-            "CREATE OR REPLACE TABLE item_current AS SELECT "
+            "CREATE OR REPLACE TEMP TABLE item_current AS SELECT "
             "json_extract_string(value, '$.business_id') AS business_id, "
             "json_extract(value, '$.ts')::TIMESTAMP AS ts, "
             "json_extract(value, '$.cum_count')::BIGINT AS cum_count, "
@@ -666,7 +720,7 @@ class OnlineFeatureStore:
             for category, count in state.items()
         ]
         con.execute(
-            "CREATE OR REPLACE TABLE user_category_current AS SELECT "
+            "CREATE OR REPLACE TEMP TABLE user_category_current AS SELECT "
             "json_extract_string(value, '$.user_id') AS user_id, "
             "json_extract_string(value, '$.category') AS category, "
             "json_extract(value, '$.cum_count')::BIGINT AS cum_count "
@@ -683,7 +737,7 @@ class OnlineFeatureStore:
             if state
         ]
         con.execute(
-            "CREATE OR REPLACE TABLE user_als_current AS SELECT "
+            "CREATE OR REPLACE TEMP TABLE user_als_current AS SELECT "
             "json_extract_string(value, '$.user_id') AS user_id, "
             # FLOAT[], not DOUBLE[]: the offline state is FLOAT[64] and
             # list_dot_product accumulates at the element type, so widening here
@@ -709,7 +763,7 @@ class OnlineFeatureStore:
                     )
                 )
         con.execute(
-            "CREATE OR REPLACE TABLE business_current AS SELECT "
+            "CREATE OR REPLACE TEMP TABLE business_current AS SELECT "
             "json_extract_string(value, '$.business_id') AS business_id, "
             "json_extract_string(value, '$.name') AS name, "
             "json_extract(value, '$.latitude')::DOUBLE AS latitude, "

@@ -117,6 +117,118 @@ requirement next to `uv sync`.
 
 ## Open
 
+### I31 — The online feature path collapses under concurrency   [fixed, partially]
+
+Wiring the ranker into the API (I30) made the API call `store.lookup()` for the
+first time, which exposed a latent defect in the I29 fix: **it was validated on a
+workload that structurally cannot exhibit the bug.**
+
+`_ensure_item_als` caches the item-ALS relation in `threading.local()`. Both
+benchmarks that blessed it — `retrieval.online --samples` and `ranking.online
+--samples` — are single-threaded loops, so they build the relation once and measure
+a permanently warm thread. But `/recommend` is a **sync** FastAPI endpoint, so
+Starlette runs it in the AnyIO worker threadpool: the cache is per worker thread,
+and every cold thread pays the full build.
+
+Measured through uvicorn on a 10-core / 4-performance-core machine, 200 requests:
+
+| | feature_lookup p50 | p99 | total p99 | requests > 100ms |
+|---|---:|---:|---:|---:|
+| concurrency 1 | 19.21ms | 35.13ms | 39.92ms | 0/200 |
+| concurrency 4 | 36.46ms | 54.86ms | 62.77ms | 0/200 |
+| concurrency 8 | 79.47ms | 3676.52ms | 3702.96ms | **78/200** |
+
+At concurrency 8 the end-to-end p99 contract (<100ms) fails on 39% of requests.
+Sequentially it never fails, which is exactly why every benchmark to date missed it.
+
+**The cold build, decomposed** (19.6MB Redis payload, 14,568 businesses):
+
+| step | cost |
+|---|---:|
+| Redis `GET` | 128.2ms |
+| `json.loads` | 119.9ms |
+| **re-serialise via `_rows_json`** | **240.2ms** |
+| DuckDB `json_each` | 149.5ms |
+| total per cold thread | **637.8ms** |
+
+Two distinct problems, and the second is the one that bites:
+
+1. **240ms is pure waste.** The payload is parsed from JSON, dumped straight back to
+   JSON, then parsed a third time by `json_each` — three passes over 19.6MB to move
+   data that was already in memory as Python objects.
+2. **The cache is per-thread for data that is per-process.** Item ALS vectors are
+   catalog-wide and immutable within a generation — the exact justification for
+   making them one Redis record in the first place. Caching them per thread
+   re-pays 637ms per worker and duplicates ~19.6MB of parsed state per worker.
+
+Contention compounds it: each thread holds its own DuckDB connection, and DuckDB
+and LightGBM both default to using all cores, so 8 concurrent requests oversubscribe
+4 performance cores. That is why concurrency 8 degrades super-linearly (p50 19 -> 36
+-> 79ms) rather than merely queueing.
+
+**Fixed, in three parts — and not fully closed.**
+
+*One DuckDB database per store, one cursor per thread.* Cursors share the catalog and
+buffer pool, so `item_als_current` is a regular table built once per process and read
+by every thread. Verified before relying on it: a regular table is visible across
+cursors, TEMP tables are cursor-scoped, same-named TEMP tables stay independent, and
+8 threads x 300 TEMP round-trips produced zero cross-talk.
+
+*Per-request relations became TEMP.* This is a **correctness** requirement, not a
+performance one, and it is the part worth remembering: all six per-request relations
+(`queries`, `user_current`, `item_current`, `user_category_current`,
+`user_als_current`, `business_current`) were plain `CREATE OR REPLACE TABLE`. That was
+safe only because every thread had its own private database. Sharing a database
+without scoping them would have let concurrent requests overwrite each other's rows —
+one user served another user's features, silently, with no error. Consolidating state
+turned a wasteful-but-isolated design into a shared one; the isolation had to be
+re-established explicitly rather than inherited.
+
+*Bounded intra-request parallelism.* DuckDB defaulted to 10 threads and LightGBM to
+every core, so each request tried to fan out across the whole machine and multiplied
+against request concurrency instead of adding to it. Both are pinned to 1
+(`LOOKUP_THREADS`): a lookup projects a few hundred rows and scoring 500 candidates
+is ~2.6ms single-threaded, so there was nothing to win per request and a lot to lose
+under load.
+
+The cold build also dropped 637.8ms -> ~215ms by handing the Redis blob straight to
+`json_each`. It is already a JSON object of `business_id -> vector`, so the Python
+parse and the `_rows_json` re-encode were two passes over 19.6MB that bought nothing.
+
+**Measured through uvicorn, 300 requests per level** (total p99 / requests over 100ms):
+
+| concurrency | before | shared db | + bounded threads |
+|---|---:|---:|---:|
+| 1 | 39.92ms · 0 | 38.11ms · 0 | 42.77ms · 0 |
+| 4 | 62.77ms · 0 | 129.28ms · 8 | **69.21ms · 0** |
+| 8 | 3702.96ms · 78/200 | 147.02ms · 52 | **118.37ms · 57** |
+| 16 | — | 368.67ms · 259 | 316.07ms · 291 |
+
+The tail at concurrency 8 improved ~31x and concurrency 4 is now fully inside the
+100ms contract. **Still open above that:** p50 scales roughly linearly past
+concurrency 2 (18 -> 23 -> 34 -> 70 -> 162ms), which is CPU saturation on 4
+performance cores, not cold start.
+
+**The remaining lever is the same insight one layer out.** Per request the store still
+fetches ~1000 Redis records (500 `item` + 500 `business`) and pushes them through the
+identical three-pass JSON route that `item_als` just escaped: decode in Python,
+re-encode with `_rows_json`, re-parse in `json_each`. But `item` and `business` current
+state is *also* catalog-wide and immutable within a generation — only the user side
+(`user`, `user_category`, `user_als`, three records) genuinely varies per request.
+Publishing the item side as catalog-wide records built once per process would cut
+per-request marshalling from ~1000 records to 3. That is a materialization-format
+change and a schema bump, so it is a decision, not a follow-up patch.
+
+**Rule this earns:** a per-stage latency number measured single-threaded does not
+describe a threaded server. Benchmark the transport the service actually uses, at
+the concurrency it actually sees — `--samples` in a loop is a profile of one warm
+thread, not a serving measurement.
+
+**Also caught here:** a p99 over 100 samples is the 99th of 100 points — effectively
+the maximum, with no statistical content. Every `--samples 100` p99 in this log is
+under-powered, including I29's headline 26.874ms; at n=600 the same single-threaded
+path measures p99 35.39ms.
+
 ### I29 — Online feature lookup regressed on ALS state   [fixed, partially]
 
 Publishing ALS state (D27) took online feature lookup from ~2ms to **49ms p50** —
@@ -165,8 +277,30 @@ latency instrumentation. Gated behind I29: shipping a ranker whose feature looku
 2.5x over budget would trade measured quality for measured latency without deciding
 which matters more here.
 
+**Code written, not shippable.** `OnlineALSRetriever` now retrieves `SERVING_POOL`
+candidates, reads their features through the store, and orders them with
+`ALS_RANKER_MODEL` using the same stable tie-break as `reranked_candidate_lists`, so
+serving cannot order candidates differently from the offline run that decided the
+ranker lands. Tests pin the properties that matter: the ranker overrides the ALS
+order it was given, tied scores fall back to retrieval's order (I6), the *whole* pool
+is scored rather than a pre-truncated top-k, and a cold user is served popularity
+without a feature lookup at all.
 
-### I25 — The online store cannot serve `ui_als_score`   [open]
+**Now blocked by I31, which wiring this is what exposed.** Calling `store.lookup()`
+from the API for the first time surfaced a per-thread cache that collapses under
+concurrency. The original I29 gate turned out to be the less important one: the 2.5x
+figure was single-threaded, and single-threaded was never the serving condition.
+
+**On the stale docstring:** it claimed the ranker does not land, which D27 falsified
+three commits earlier. The same falsified fact was live in four places at once — this
+entry, `DECISIONS.md` D27's closing paragraph, `README.md`, and the module docstring —
+while `I25` sat marked open after being fixed. A project whose deliverable is "the
+author can explain every stage cold" cannot afford docs that describe a superseded
+system: this is the set of files someone reads to prepare, and all four disagreed
+with the code. When a decision reverses a result, grep for the old claim.
+
+
+### I25 — The online store cannot serve `ui_als_score`   [fixed]
 
 The Redis publisher materialises the user/item/user_category/business groups; the
 ALS slice groups (D27) are not among them, so `online_features()` omits
@@ -180,6 +314,15 @@ waited on the offline verdict. The verdict is in, so this is now the blocker.
 `online_features()` derives servability from `ONLINE_STATE_GROUPS`, so adding the
 groups to the publisher closes this automatically rather than needing a list edited
 in two places.
+
+**Fixed (800c69d).** `user_als` and `item_als` joined `ONLINE_STATE_GROUPS`, so
+`online_features()` now returns all nine features and the skew check passes over the
+full set (500 pairs / 36,500 values). The derived-not-listed design paid off exactly
+as intended: closing this needed no edit to `online_features()` itself.
+
+**This entry stayed marked open for three commits after it was fixed**, and
+`DECISIONS.md` D27 still read "Not yet servable" — see the note under I30 on stale
+claims outliving the code.
 
 ### I26 — A 2-D ndarray registers into DuckDB transposed   [fixed]
 

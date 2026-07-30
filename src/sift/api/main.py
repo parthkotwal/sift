@@ -103,7 +103,10 @@ def recommend(
     return RecommendResponse(
         user_id=user_id,
         metro=f"{METRO_CITY}, {METRO_STATE}",
-        path="Redis user embedding -> exact ALS retrieval (popularity cold fallback)",
+        path=(
+            "Redis user embedding -> exact ALS retrieval -> online features -> "
+            "LightGBM ranker (unranked popularity cold fallback)"
+        ),
         latency=LatencyBreakdown(
             retrieval_ms=latency.retrieval_ms,
             feature_lookup_ms=latency.feature_lookup_ms,
