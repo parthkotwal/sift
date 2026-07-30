@@ -46,7 +46,7 @@ hit contribution measured so no source rides for free.
 
 **Rerank** applies hard filters — `is_open` *now* (a serving-time filter, deliberately never a training feature — see the skew section), already-reviewed — and a simple diversity pass to reach the final 10.
 
-**Latency budget** (initial allocation, to be revised against measurement): retrieval ≤ 30ms, online feature lookup ≤ 20ms, ranker inference ≤ 30ms, rerank + overhead ≤ 20ms. Instrumented per stage from day one; an end-to-end number with no breakdown is a footgun (`AGENTS.md`).
+**Latency budget** (re-baselined against measurement, `DECISIONS.md` D28): retrieval ≤ 10ms, online feature lookup ≤ 60ms, ranker inference ≤ 10ms, rerank + overhead ≤ 20ms — and **end-to-end p99 < 100ms at up to 4 concurrent requests per process**. Instrumented per stage from day one; an end-to-end number with no breakdown is a footgun (`AGENTS.md`), and a per-stage number with no concurrency level is not a contract at all — the same code measured 18ms and 162ms p50 on offered load alone (`ISSUES.md` I31). The initial allocation was 30/20/30/20, apportioned before anything was timed; measurement found retrieval and ranking using ~15% of their share and feature lookup starved.
 
 ## Offline path
 

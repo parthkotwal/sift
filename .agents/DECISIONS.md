@@ -278,3 +278,39 @@ ablations. PyTorch remains isolated to the explicitly attempted 5b offline stage
 **Servable as of 800c69d (was "not yet servable").** `user_als` and `item_als` joined `ONLINE_STATE_GROUPS`, so `online_features()` now returns all nine features and the skew check passes over the full set. The rule this paragraph originally asserted still holds and is worth keeping stated: training may use the full registry, but shipping a model that reads a feature serving cannot supply is skew by construction — that is what gated this decision, and it gated it correctly.
 
 **Serving the ranker is a separate, still-open problem.** The wiring exists in `retrieval/online.py` and matches this decision's offline path candidate-for-candidate, but it does not meet the latency contract under concurrency: the online store's item-ALS relation is cached per *thread* while `/recommend` runs on a threadpool, so end-to-end p99 fails on 39% of requests at concurrency 8 (ISSUES.md I31). D27's *quality* verdict is unaffected — that was measured offline on the frozen holdout and stands.
+
+## D28 — The latency budget is re-baselined against measurement, and gains a concurrency level   [accepted] (2026-07-30)
+
+**Context:** `ARCHITECTURE.md` set the per-stage allocation in build step 1 — retrieval ≤ 30ms, online feature lookup ≤ 20ms, ranker inference ≤ 30ms, rerank + overhead ≤ 20ms — and labelled it "initial allocation, to be revised against measurement". It was written before ALS state was a feature, before any stage had been timed, and it sums to exactly 100ms: apportioned, not observed. With the ranker now actually serving (I30), every stage has been measured through uvicorn and the allocation is wrong in a specific way.
+
+**What measurement showed.** Two stages were over-allocated by roughly an order of magnitude, and the one doing the work was starved:
+
+| stage | allocated | measured (conc 1) | measured (conc 4) |
+|---|---:|---:|---:|
+| retrieval (Redis vector + exact search) | ≤ 30ms | ~2.6ms p50 / 5.7ms p99 | — |
+| online feature lookup | ≤ 20ms | 18.7ms p50 / 31.0ms p99 | 34.5ms p50 / 55.0ms p99 |
+| ranker inference | ≤ 30ms | ~2.6ms p50 / 3.8ms p99 | — |
+| rerank + overhead | ≤ 20ms | not built | not built |
+| **end-to-end** | **< 100ms p99** | **42.8ms p99** | **69.2ms p99** |
+
+**The structural defect, which matters more than the numbers:** the old budget named no concurrency level, and a per-stage millisecond figure without one is not a contract. The same unchanged code measures 18ms p50 and 162ms p50 depending only on offered load (I31) — so "feature lookup ≤ 20ms" was satisfiable and violable simultaneously, and for months the only figures on record came from single-threaded loops that could not observe the difference.
+
+**Options:** (a) re-baseline the allocation against measurement and state a concurrency envelope; (b) keep the original allocation and drive feature lookup under 20ms first; (c) drop per-stage lines and hold only the end-to-end p99.
+
+**Choice: (a).** Revised, and this supersedes `ARCHITECTURE.md`'s initial allocation:
+
+- retrieval, including the user-embedding lookup — **≤ 10ms**
+- online feature lookup — **≤ 60ms**
+- ranker inference — **≤ 10ms**
+- rerank + overhead — **≤ 20ms** (unchanged; unbuilt, so unmeasured)
+- **end-to-end p99 < 100ms at up to 4 concurrent requests per process**, the figure that was always the real contract, and now with the envelope it was always missing.
+
+**Why not (b):** it optimises a stage that is not the bottleneck against the contract that binds — `AGENTS.md` explicitly forbids that — and it would have kept the API serving a displaced model while the work proceeded. **Why not (c):** the per-stage lines earned their keep. The 20ms allocation is the only reason I29's regression from 2ms to 49ms was ever noticed; an end-to-end number alone looked fine throughout. Deleting the tripwire because it fired is the wrong lesson.
+
+**Costs, accepted.** Feature lookup now owns 60% of the budget, which looks lopsided for a stage that is mostly JSON marshalling rather than computation — ~1000 Redis records decoded in Python, re-encoded, and re-parsed by DuckDB per request. That is a known-addressable cost, not a fundamental one (I31 names the fix: item and business current state is catalog-wide and immutable within a generation, so only the three user-side records genuinely vary per request). The allocation reflects where the work is today, not where it should end up. Second cost: the concurrency envelope is modest, and it is hardware-specific — 4 performance cores. A single 0.5 vCPU Fargate task will be tighter, so the AWS validation run must report its own measured numbers rather than inheriting these.
+
+**Not a weakening of the contract.** End-to-end p99 < 100ms is unchanged and met with 31ms of headroom at the stated envelope. The reallocation moves budget *from* two stages measured at ~15% of their allocation *to* the one that was starved, which is what "to be revised against measurement" asked for. What changed is that the numbers are now measured through the transport the service actually uses, at a stated load, instead of apportioned in advance.
+
+**This tightens D25's ANN scale trigger, and D25 is not edited to say so** (this log is append-only). D25 says to revisit ANN "when exact retrieval materially approaches the 30ms stage budget"; retrieval's allocation is now 10ms, so the trigger moves with it. Exact search measures ~2.6ms p50 / 5.7ms p99 including the Redis vector lookup, so it still sits at roughly half the new allocation and ANN still pays no rent — the seam is unchanged, only the threshold that would open it.
+
+**Consequence for the AWS deployment.** `AWS_DEPLOYMENT_PLAN.md` Phase 0 required that the intended online path be the one the API actually serves, that required online features be servable, that correctness/skew tests pass, and that the current latency result be understood. All four now hold: the ranker serves through `sift.api.main:app`, `ui_als_score` is servable (I25), skew passes 500 pairs / 36,500 values, and the latency result is understood including its concurrency dependence. Ground rule 9 and acceptance criterion 8 are clear. The remaining I31 work is a measured, documented optimisation with the contract met inside the stated envelope — not an unresolved architecture problem, and explicitly not something to debug through ECS.
