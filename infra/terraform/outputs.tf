@@ -82,3 +82,14 @@ output "ecs_role_arns" {
     task      = aws_iam_role.ecs_task.arn
   }
 }
+
+output "alb" {
+  description = "Public ALB endpoint and resources consumed by deployment and validation."
+  value = {
+    arn               = aws_lb.api.arn
+    dns_name          = aws_lb.api.dns_name
+    hosted_zone_id    = aws_lb.api.zone_id
+    http_listener_arn = aws_lb_listener.http.arn
+    target_group_arn  = aws_lb_target_group.api.arn
+  }
+}

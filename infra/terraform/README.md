@@ -37,8 +37,9 @@ Resources will be added in reviewable slices, not as one uninspectable apply:
    and CloudWatch log groups;
 4. IAM (implemented, not applied): separate ECS execution and task roles with
    resource-scoped policies;
-5. ECS and ALB: cluster, task definitions, one-task service, target group,
-   listener, and one-off materialization command support;
+5. ALB (implemented, not applied) and ECS: public load balancer, target group,
+   listener, cluster, task definitions, one-task service, and one-off
+   materialization command support;
 6. GitHub OIDC: repository-scoped build/push/deploy role.
 
 No NAT Gateway, autoscaling, Multi-AZ Redis, public Redis, EKS, CodePipeline, or
@@ -111,3 +112,14 @@ the two planned task log groups. The application role can only call
 `s3:GetObject` below `sift/artifacts/*`. It cannot list the bucket or call
 ElastiCache APIs because startup fetches exact artifact keys and cache access is
 network-level.
+
+## Load-balancer contract
+
+The internet-facing IPv4 ALB spans only the two public subnets and attaches only
+the ALB security group. Its single HTTP port 80 listener forwards to an `ip`
+target group on port 8000, which is required for Fargate's `awsvpc` tasks.
+
+Target health uses `GET /health`, expects HTTP 200, checks every 15 seconds, and
+requires two successes or three failures. This deliberately leaves catalog
+initialization on the first `/recommend`; health checks must not disguise that
+cold cost. Deletion protection is off for verified showcase teardown.

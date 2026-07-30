@@ -391,6 +391,45 @@ Saved-plan audit:
 IAM roles and policies have no separate hourly AWS resource charge. Their
 permissions authorize later billable service activity but do not create it.
 
+### Phase 3 — Application Load Balancer
+
+Implemented on the current `aws` branch without applying it:
+
+- one internet-facing IPv4 Application Load Balancer spanning only the two
+  public subnets and attaching only the existing ALB security group;
+- invalid HTTP header fields are dropped and deletion protection is disabled
+  for the short-lived showcase;
+- one HTTP port 80 listener forwarding to one HTTP port 8000 target group;
+- target type `ip`, as required by Fargate tasks using `awsvpc`;
+- `/health` checks every 15 seconds with a five-second timeout, two-success
+  healthy threshold, three-failure unhealthy threshold, and HTTP 200 matcher;
+- 30-second target deregistration delay;
+- outputs expose the ALB ARN/DNS/hosted-zone ID, listener ARN, and target-group
+  ARN needed by ECS and validation.
+
+The health path intentionally does not initialize the catalog. A target can
+become healthy before its first `/recommend` pays the catalog cold cost; that
+first request remains a separately reported Phase 7 measurement.
+
+Saved-plan audit:
+
+- the combined plan reported `42 to add, 0 to change, 0 to destroy`, exactly
+  three additions beyond the previous plan: ALB, listener, and target group;
+- the ALB references only `aws_subnet.public` and
+  `aws_security_group.alb`;
+- the listener has one forward action referencing only the API target group;
+- the target group is HTTP port 8000 with target type `ip` and the exact
+  `/health` contract above;
+- no NAT resource appeared and the only public CIDR rules remain ALB port 80
+  ingress and ECS port 443 egress;
+- the saved plan was deleted after JSON inspection so it cannot become a stale
+  apply artifact;
+- no `terraform apply` was run and no AWS resources were created.
+
+Once applied, the ALB adds load-balancer hours or partial hours, LCUs, and
+service-managed public IPv4 address hours across its enabled zones, plus any
+applicable data transfer. Re-check current pricing immediately before apply.
+
 ## AWS resource state
 
 No AWS infrastructure has been created by this lane yet:
@@ -409,24 +448,29 @@ deployment-generated AWS service charges to preserve.
 
 ## Exact next action
 
-Add the Phase 3 ALB configuration without applying it:
+Add the Phase 3 ECS cluster, task definitions, and one-task service without
+applying them:
 
-1. create one internet-facing Application Load Balancer in the two public
-   subnets using only the existing ALB security group;
-2. create an `ip` target group for Fargate on HTTP port 8000;
-3. configure `/health` as the target-group health check with thresholds and
-   timing appropriate to ordinary process startup;
-4. keep the health check independent of catalog initialization: the first
-   `/recommend` cold cost must not be hidden by changing `/health`;
-5. create one public HTTP port 80 listener forwarding to that target group;
-6. keep deletion protection off for the one-day showcase and expose the ALB DNS
-   name/zone plus target-group ARN for the later ECS service;
-7. format, validate, and inspect a saved plan for subnet tier, target type,
-   public listener count, health path, security group, deletion behavior,
-   unexpected resources, and current hourly/LCU/public-IPv4 cost categories.
+1. define required immutable image-tag and artifact-generation deployment
+   inputs rather than inventing values in tracked configuration;
+2. create one ECS cluster without paid optional observability features;
+3. define an ARM64 or x86_64 Fargate task architecture that must match the CI
+   image, with one Uvicorn worker and configurable CPU/memory;
+4. pass the selected artifact bucket/generation and private `rediss://`
+   connection through the existing application environment contract;
+5. configure `awslogs` separately for the API and materialization command;
+6. create one API service task using public subnets, explicit public-IP
+   assignment, the ECS security group, and the ALB `ip` target group;
+7. retain one task with no autoscaling and set health grace for process startup,
+   not catalog initialization;
+8. expose the cluster, task-definition, and service identifiers needed for
+   one-off `RunTask`, deployment, and validation;
+9. validate the container JSON and inspect a saved plan for task count,
+   worker count, architecture, sizing, public IP, network exposure, roles,
+   logging, environment values, and costs.
 
-Do not add an ECS service or apply the ALB yet. This keeps the next review slice
-independent of the image tag and current `main` integration.
+Before publishing an image or applying ECS, integrate current `origin/main` and
+rerun the package/container/schema-skew smoke recorded under Coordination.
 
 ## Remaining phases
 
