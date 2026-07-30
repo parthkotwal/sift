@@ -30,6 +30,12 @@ bundles, private endpoints, or credentials in this file.
   interface and intended caller here, then ask the core coding agent to provide
   it. Do not patch around the boundary in `src/sift/**`.
 - There is currently **no outstanding request for the core coding agent**.
+- Coordination note: `origin/main` was observed at `fd3cede` after this branch
+  diverged. It includes D31 (`5b6dcb2`): Redis schema 7, catalog-wide item and
+  business records, and a measured desktop supported concurrency of 8. The
+  network slice is independent of that change. Before publishing an artifact
+  generation or deploying ECS, integrate current `main` and rerun the complete
+  package/container/skew smoke against schema 7.
 
 ## Fixed deployment decisions
 
@@ -51,19 +57,24 @@ bundles, private endpoints, or credentials in this file.
 
 ## Application performance contract carried into AWS
 
-- D28's end-to-end p99 target is `< 100 ms` at up to four concurrent requests
-  **per process**, measured on four performance cores.
+- D28 introduced an end-to-end p99 target of `< 100 ms` at up to four
+  concurrent requests **per process**, measured on four performance cores.
+  D31 subsequently moved the desktop `SUPPORTED_CONCURRENCY` to 8 after
+  catalog-wide state removed 1,000 invariant per-request Redis records.
 - A Fargate task cannot inherit that result. Phase 7 must report the task size,
   offered concurrency, p50/p95/p99 through the ALB, and Sift's per-stage timing
   where available.
-- I31 creates a real per-process cold cost: the first `/recommend` builds a
-  roughly 19.6 MB catalog relation and was previously measured around 215 ms at
-  the application layer.
+- The serving process retains a real cold cost: the first `/recommend` builds
+  immutable catalog relations for the generation. Before D31, the 19.6 MB ALS
+  relation alone was measured around 215 ms at the application layer. Schema 7
+  adds catalog-wide item and business relations, so the old number is historical
+  evidence rather than a prediction for the merged deployment.
 - Because `/health` does not touch the store, a fresh target can become healthy
   before its first recommendation pays that cost. Report the first request
   separately; do not classify it as a steady-state regression.
-- I31 remains an application optimization, not an ECS debugging task. Do not
-  change its materialization format or schema from this lane.
+- D31 resolved I31 in the application lane. Do not debug or redesign its
+  materialization format through ECS; integrate it, validate schema compatibility,
+  and measure the merged image.
 
 ## Completed work and evidence
 
@@ -192,6 +203,46 @@ Verification:
   `.terraform.lock.hcl` is tracked;
 - no `terraform apply` was run and no AWS resources were created.
 
+### Phase 3 — network configuration
+
+Implemented on the current `aws` branch without applying it:
+
+- one `10.42.0.0/20` VPC with DNS support and hostnames enabled;
+- two public `/24` subnets and two private `/24` subnets across `us-west-2a`
+  and `us-west-2b`;
+- one internet gateway and a public default route;
+- one explicit private route table with no internet or NAT route;
+- public subnets do not assign public IPs automatically; the later Fargate
+  service must explicitly enable public IP assignment;
+- separate ALB, ECS-task, and Redis security groups;
+- ALB ingress is public HTTP port 80 only;
+- ECS port 8000 accepts only the ALB security group;
+- Redis port 6379 accepts only the ECS task security group;
+- ECS egress is limited to public HTTPS port 443 and Redis port 6379;
+- outputs expose the VPC, subnet, AZ, and security-group IDs needed later.
+
+Saved-plan audit:
+
+- `22 to add, 0 to change, 0 to destroy`;
+- one VPC, one internet gateway, four subnets, two route tables, one public
+  route, four route-table associations, three security groups, and six
+  security-group rules;
+- no NAT Gateway or other NAT resource;
+- exactly two `0.0.0.0/0` rules: ALB ingress on 80 and ECS egress on 443;
+- the saved plan was deleted after JSON inspection so it cannot become a stale
+  apply artifact;
+- no `terraform apply` was run and no AWS resources were created.
+
+Cost boundary as of 2026-07-30:
+
+- this network-only plan allocates no public IPv4 address and contains no NAT
+  Gateway, running compute, load balancer, or managed cache;
+- later billable categories are ALB hours/LCUs and public IPv4 addresses,
+  Fargate vCPU/memory and its task public IPv4 address, the ElastiCache node,
+  CloudWatch ingestion/storage, and S3/ECR storage and requests;
+- data transfer can also accrue once traffic exists. Re-check the inspected
+  full plan before apply rather than treating this categorical note as a quote.
+
 ## AWS resource state
 
 No AWS infrastructure has been created by this lane yet:
@@ -210,17 +261,18 @@ deployment-generated AWS service charges to preserve.
 
 ## Exact next action
 
-Add the Phase 3 network configuration without applying it:
+Add the Phase 3 private storage and registry configuration without applying it:
 
-1. define one small VPC in `us-west-2` across two available AZs;
-2. add two public subnets for the ALB and public-IP Fargate tasks;
-3. add two private subnets for ElastiCache;
-4. add one internet gateway and public route table, with no NAT Gateway;
-5. add separate ALB, ECS-task, and Redis security groups with only the planned
-   traffic relationships;
-6. expose IDs needed by later storage, Redis, ECS, and ALB slices;
-7. run format and validation, then inspect a saved `terraform plan` for public
-   exposure and unexpected resources.
+1. create one account-unique, private S3 artifact bucket;
+2. enable Block Public Access, bucket-owner-enforced ownership, versioning, and
+   server-side encryption;
+3. create one private ECR repository with immutable tags, scan-on-push, and
+   encryption;
+4. add bounded lifecycle policies appropriate to a one-day showcase without
+   deleting the selected generation during validation;
+5. expose only the bucket name/ARN and ECR repository URL/ARN needed later;
+6. format, validate, and inspect a saved plan for public access, retention,
+   destructive teardown behavior, and unexpected resources.
 
 Do not run `terraform apply` yet. First report the planned resource count,
 internet-facing rules, absence of NAT, and expected one-day cost categories.

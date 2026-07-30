@@ -41,3 +41,28 @@ variable "additional_tags" {
     error_message = "additional_tags cannot contain blank keys or values."
   }
 }
+
+variable "vpc_cidr" {
+  description = "Private IPv4 CIDR for the short-lived showcase VPC."
+  type        = string
+  default     = "10.42.0.0/20"
+
+  validation {
+    condition     = can(cidrnetmask(var.vpc_cidr)) && can(cidrsubnet(var.vpc_cidr, 4, 3))
+    error_message = "vpc_cidr must be an IPv4 CIDR with room for four equal subnets."
+  }
+}
+
+variable "alb_ingress_cidrs" {
+  description = "IPv4 CIDRs allowed to call the public HTTP demo listener."
+  type        = set(string)
+  default     = ["0.0.0.0/0"]
+
+  validation {
+    condition = (
+      length(var.alb_ingress_cidrs) > 0
+      && alltrue([for cidr in var.alb_ingress_cidrs : can(cidrnetmask(cidr))])
+    )
+    error_message = "alb_ingress_cidrs must contain at least one valid IPv4 CIDR."
+  }
+}

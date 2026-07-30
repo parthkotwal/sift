@@ -29,8 +29,8 @@ local copy is ignored.
 
 Resources will be added in reviewable slices, not as one uninspectable apply:
 
-1. network: VPC, internet gateway, two public and two private subnets, route
-   tables, and narrowly scoped security groups;
+1. network (implemented, not applied): VPC, internet gateway, two public and two
+   private subnets, route tables, and narrowly scoped security groups;
 2. storage and registry: private versioned S3 artifact bucket and private ECR;
 3. Redis and observability: single-node ElastiCache and CloudWatch log groups;
 4. IAM: separate ECS execution and task roles with resource-scoped policies;
@@ -40,3 +40,20 @@ Resources will be added in reviewable slices, not as one uninspectable apply:
 
 No NAT Gateway, autoscaling, Multi-AZ Redis, public Redis, EKS, CodePipeline, or
 other service outside the deployment plan should appear in these slices.
+
+## Network contract
+
+The VPC defaults to `10.42.0.0/20`, divided into two public and two private
+`/24` subnets across the first two available AZs. The private route table has no
+internet route. Public subnets do not assign public IPs by default; the later
+ECS service must opt its Fargate ENIs into public IP assignment explicitly.
+
+Security-group relationships are deliberately directional:
+
+- the public CIDR input reaches only ALB port 80;
+- the ALB reaches only ECS task port 8000;
+- ECS tasks reach public HTTPS endpoints and Redis port 6379;
+- Redis accepts port 6379 only from the ECS task security group.
+
+The public HTTPS egress is required because this no-NAT design uses public-IP
+Fargate tasks to pull from ECR, download artifacts from S3, and publish logs.

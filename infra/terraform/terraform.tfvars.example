@@ -4,6 +4,7 @@
 aws_region   = "us-west-2"
 project_name = "sift"
 environment  = "showcase"
+vpc_cidr     = "10.42.0.0/20"
 
 additional_tags = {
   Purpose = "portfolio-showcase"
