@@ -83,6 +83,17 @@ time-sliced ALS state: with that feature it beats ALS's raw ordering (NDCG@10
 the label outright, so the slices are what make it usable — see `.agents/DECISIONS.md`
 D27.
 
+That feature also closed the project's longest-running deferral. Every stage orders with
+a stable sort, so candidates it scores identically keep the order the previous stage gave
+them — a stage with no opinion between two candidates must not overwrite one that had
+one. That was deliberately *not* done while the ranker produced 18 distinct scores over
+500 candidates, because falling back to the incumbent would have reported the baseline's
+ordering as the ranker's. Adding retrieval's score dissolved the ties: the same model now
+produces a median of 500 distinct scores over 500, three users in 26,489 have a tie at
+the top-10 boundary at all, and unifying the tie-break moved no metric. The lesson is in
+D32 — a deferral justified by a number needs the number attached to something that
+re-runs, or it goes stale without anything failing.
+
 Everything catalog-wide — item state, the business dimension, and the ALS vectors — is
 one Redis record per generation, parsed once per process into an immutable relation,
 while request-local DuckDB relations stay isolated per worker. A 500-candidate request

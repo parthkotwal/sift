@@ -135,10 +135,10 @@ class OnlineALSRetriever:
                 self.model.predict(x, num_threads=RANKER_THREADS), dtype=np.float64
             )
             # Stable, so ties fall back to the order retrieval supplied — which for
-            # this personalized pool is ALS's own ranking. That is the funnel
-            # behaviour I6 describes, and it matches `reranked_candidate_lists`, the
-            # offline path that produced D27's numbers. Serving must not order
-            # candidates differently from the run that decided the ranker lands.
+            # this personalized pool is ALS's own ranking. It matches
+            # `reranked_candidate_lists`, the offline path that produced D27's
+            # numbers: serving must not order candidates differently from the run
+            # that decided the ranker lands.
             # RERANK_POOL, not k: rerank drops candidates, so truncating to k here
             # would leave it nothing to backfill from and the response would come back
             # short exactly when the filters bite hardest.

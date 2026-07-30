@@ -117,54 +117,62 @@ requirement next to `uv sync`.
 
 ## Open
 
-One entry, and it is a deliberate deferral rather than a backlog. Resolved entries used
-to accumulate here marked `[fixed]`, which made the section unreadable as a to-do list —
-they now move to *Fixed — kept because the failure mode recurs* as soon as they close,
-so anything appearing under this heading is genuinely outstanding.
+Nothing outstanding. Resolved entries used to accumulate here marked `[fixed]`, which
+made the section unreadable as a to-do list — they now move to *Fixed — kept because the
+failure mode recurs* as soon as they close, so anything appearing under this heading is
+genuinely open work rather than a record of finished work.
 
-### I6 — Tie-breaking in the ranker is arbitrary   [deferred, deliberately]
-
-With a shallow model the ranker produces far fewer distinct scores than candidates
-(measured: 18 distinct scores over 500). `np.argsort` breaks the ties by whatever
-order it lands on, so the top-k can be an arbitrary slice of a large tie group
-rather than the incumbent's ordering. A stable fallback to retrieval's own order is
-the correct funnel behaviour.
-
-**Deferred on purpose:** adding it now would drag the ranker's numbers toward
-popularity's and disguise the finding that the ranker has no personalization
-signal. Revisit once the ranker has real score resolution.
-
-**The two rank paths deliberately differ (2026-07-27, from review of 26cfe46).**
-`reranked_lists` (popularity pool) keeps the unstable `np.argsort` this entry
-defers; `reranked_candidate_lists` (personalized pool) uses `kind="stable"`, so
-ties fall back to the candidate order the provider supplied — for ALS that *is*
-retrieval's own ranking, which is the correct funnel behaviour described above.
-The divergence was undocumented when it landed; it is intentional, and the reason
-is that the deferral's rationale does not transfer. Popularity's pool is a fixed
-global list, so stable tie-breaking there means "fall back to global popularity" —
-exactly the incumbent the ranker must beat, which is what would hide the ranker's
-lack of resolution. ALS's pool is per-user, so stable tie-breaking is a personalized
-fallback and hides nothing. Both call sites now carry that reasoning inline.
-Unifying them requires remeasuring both baselines, not editing one line.
-
-**The deferral's stated condition has now been met, and the entry stays open anyway
-(2026-07-30).** "Revisit once the ranker has real score resolution" was written when the
-ranker had 18 distinct scores over 500 candidates and no personalization signal. D27 gave
-it `ui_als_score` and it now beats ALS's own ordering outright, so the condition is
-satisfied — the reason to leave this open is no longer the original one.
-
-What remains is narrower. The path that serves is already stable (`retrieval/online.py`
-and `reranked_candidate_lists`), so **serving is not affected**; the open question is
-whether `reranked_lists`, the popularity-pool path, should be unified with it. That path
-exists only as the build-step-4 baseline, and D20 makes candidate source part of the
-ranker's training contract, so changing its tie-break means remeasuring a baseline whose
-whole job is to be a fixed comparison point. Low value, real cost, and the ledger (D30)
-would now catch it moving — which is a better reason to leave it alone than the one this
-entry was opened with.
+An empty section is the honest state, not a claim of perfection: the traps below still
+recur, and the things this project has deliberately not built (multi-metro, ANN, a
+two-tower that wins) are scope in `ARCHITECTURE.md`, not defects.
 
 ---
 
 ## Fixed — kept because the failure mode recurs
+
+### I6 — Tie-breaking in the ranker is arbitrary   [fixed → D32]
+
+With a shallow model the ranker produced far fewer distinct scores than candidates
+(measured 2026-07-26: 18 distinct scores over 500). `np.argsort` defaults to an unstable
+sort, so the top-k could be an arbitrary slice of a large tie group rather than the
+incumbent's ordering. A stable fallback to retrieval's own order is the correct funnel
+behaviour: a stage that scores two candidates identically has expressed no opinion
+between them.
+
+**Deferred on purpose, then:** making it stable would have made the popularity-pool
+ranker fall back to popularity — the exact incumbent it had to beat — and reported that
+as the ranker's number, hiding the finding that it had no personalization signal.
+`reranked_candidate_lists` (personalized pool) used `kind="stable"` because that
+rationale does not transfer to a per-user pool; `reranked_lists` and `ranking/online.py`
+stayed unstable. The divergence was deliberate and documented at both call sites.
+
+**Fixed (2026-07-30) by measuring the premise instead of re-arguing it.** Over the frozen
+holdout, the *same* popularity-pool model now produces a median of 500 distinct scores
+over 500 candidates (min 453); 3 users in 26,489 have a tie at the top-10 boundary at
+all; exactly 1 user's top-10 changes between the two tie-breaks; and every metric is
+identical at four decimals. All five orderings in the package are stable now, and
+`tests/test_tie_break.py` asserts that across the package by AST rather than at each call
+site — the realistic regression is a *new* ordering added beside the existing ones, which
+a test of today's five would not catch.
+
+**Why it is kept: a deferral justified by a number needs the number attached to something
+that re-runs.** The premise expired on 2026-07-27, when `ui_als_score` (D27) landed and
+both rankers were retrained — the continuous feature is what dissolved the tie groups.
+Nothing failed at that moment, because I6 recorded a measurement in prose and a condition
+in English ("revisit once the ranker has real score resolution") with nothing watching
+for it. It sat stale for three days, and the 2026-07-30 addendum written the day before
+this fix *still* repeated the 18-score figure as current while arguing about cost. A
+deferral is a claim about the world; if it is worth deferring on, it is worth being able
+to re-check cheaply.
+
+**Found while closing it:** `sift.ranking.rank` was an eval entrypoint with no ledger
+call, so the one baseline this entry said was expensive to remeasure was also the one
+D30 was not protecting — which is most of why remeasuring *felt* expensive. It also
+recorded the popularity baseline under the name `"popularity"` while every other
+entrypoint used `"popularity (pre-T review count)"`; since the ledger keys on the run
+name, that would have created a second, separately-ratcheted baseline for the same
+recommender. Two entries that can disagree is worse than none, because both look
+authoritative.
 
 ### I33 — One request read the active generation three times   [fixed]
 
