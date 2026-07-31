@@ -584,6 +584,24 @@ quality gates but AWS denied the initial name-only OIDC subject. CloudTrail
 showed that GitHub now supplies immutable owner and repository IDs in `sub`;
 the trust policy was corrected to the exact observed claim before retrying.
 
+End-to-end proof:
+
+- workflow run `30664468214` completed successfully in 5m38s from `aws` commit
+  `3bc40c42e3776181737b42d08df3015c0c7f0b6d`;
+- all 215 tests, Ruff, and strict mypy passed on the hosted runner;
+- the corrected exact-subject OIDC exchange succeeded, followed by ECR login;
+- GitHub built and pushed one Linux AMD64 image under the full Git SHA;
+- the workflow registered API revision 6, updated ECS, waited for stability,
+  and required every ALB target to be healthy;
+- the new ECR digest is
+  `sha256:f117e20a405ea3decd5920f6d6c355349fb818c36808575485b1bd02b3edb9d7`;
+- ECR's basic scan completed with the same recorded 3 critical, 5 high, and 3
+  medium Debian-package findings as the first image;
+- the ignored local deployment selection was advanced to the workflow SHA and
+  an audited Terraform apply registered API revision 7 plus materialization
+  revision 5. A final refresh plan reports no changes, so local state once
+  again owns the image the workflow deployed.
+
 ### Phase 7 — cloud validation and measured envelope
 
 An early 1-vCPU / 2-GiB exploratory run established that the task was too small.
@@ -620,6 +638,23 @@ of the formerly failing request then returned their full declared bodies, and
 the 1,000-request benchmark had zero transport errors. This is deployment
 configuration only; `src/sift/**` remains unchanged.
 
+Final privacy and operability checks:
+
+- direct access to the running task's public IPv4 on port 8000 timed out;
+- the ECS security group admits port 8000 only from the ALB security group;
+- the Valkey endpoint does not resolve on the public client, direct port 6379
+  is blocked, and the Redis security group admits 6379 only from the ECS task
+  security group;
+- the S3 manifest returned HTTP 403 anonymously;
+- the latest API log stream contains 22 events and the materialization stream
+  contains 13 events, both in three-day-retention log groups;
+- no file below `data/`, Terraform state, saved plan, or deployment auto-tfvars
+  is tracked by Git;
+- `/health` returns 200 through the ALB, a closed-connection recommendation
+  returns all ten results, and its immediate warm application total was
+  74.10 ms;
+- the final Terraform refresh plan reports `No changes`.
+
 ### Current one-day price envelope
 
 Public on-demand prices were queried through the AWS Price List API on
@@ -653,16 +688,13 @@ user explicitly asks to take the showcase down.
 
 ## Exact next action
 
-Commit and push the OIDC workflow, deployment-safe Uvicorn backend, and this
-evidence update. Manually dispatch the workflow from the `aws` branch, watch it
-through tests/build/push/ECS stability/target health, reconcile its immutable
-image tag into local Terraform state, then finish the public-port/privacy checks
-and a fresh no-drift plan.
+Keep the showcase live for the user. Preserve `infra/terraform/terraform.tfstate`
+and its backup. Do not run destroy until the user explicitly asks to take the
+showcase down. When asked, save any final non-sensitive evidence, enable the
+deliberate asset-deletion switch, inspect the destroy plan, destroy, and verify
+that every paid resource is gone.
 
 ## Remaining phases
 
-- Phase 6: complete the first manual OIDC workflow run and reconcile Terraform.
-- Phase 7: finish direct-port, Redis-private, no-data-committed, log, and
-  no-drift checks.
-- Phase 8: only after the user asks, preserve final evidence, destroy paid
+- Phase 8 only: after the user asks, preserve final evidence, destroy paid
   resources, and verify teardown and billing views.
