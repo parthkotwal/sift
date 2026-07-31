@@ -86,9 +86,11 @@ their deletion should still be an intentional teardown decision.
 
 ElastiCache uses one Valkey 8 node in the private subnet group. Valkey preserves
 the Redis protocol used by Sift while avoiding a legacy Redis OSS choice. The
-default `cache.t4g.micro` is a low-cost starting point, not a performance claim;
-change `elasticache_node_type` if materialization or ALB measurements require
-more memory or sustained CPU.
+default `cache.t4g.medium` follows a real schema-7 container smoke: publication
+used 1.04 GiB and peaked at 1.06 GiB, so the earlier 0.5-GiB micro could not hold
+the serving state. A 1.37-GiB small would leave too little space after AWS/Redis
+overhead; the 3.09-GiB medium leaves useful capacity and burstable-CPU headroom.
+Change `elasticache_node_type` again only when cloud measurement supports it.
 
 The replication group has exactly one node, no replica, no Multi-AZ failover,
 and no snapshots. At-rest encryption and required in-transit encryption are

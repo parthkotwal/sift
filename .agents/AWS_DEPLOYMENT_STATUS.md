@@ -49,7 +49,7 @@ bundles, private endpoints, or credentials in this file.
 | Compute | ECS on Fargate, one API task initially, one Uvicorn worker per task. Size from measurement rather than inheriting the plan's 0.5 vCPU / 1 GB example. |
 | Network | ALB in public subnets; ECS API tasks use public IPs for AWS egress; ElastiCache is private; no NAT Gateway. |
 | Durable artifacts | Private S3 immutable generation prefixes. Redis remains rebuildable and non-durable. |
-| Managed cache | One private Valkey 8 node, initially `cache.t4g.micro`, using the Redis protocol over TLS. No replica, Multi-AZ failover, or snapshots. Resize if measurement requires it. |
+| Managed cache | One private Valkey 8 `cache.t4g.medium` node, using the Redis protocol over TLS. Schema-7 publication used 1.04 GiB locally, which ruled out the earlier micro and left too little headroom on small. No replica, Multi-AZ failover, or snapshots. |
 | Registry | Private ECR repository with Git-SHA image tags. |
 | AWS credentials in tasks | ECS task-role credentials through boto3's default credential chain. No static AWS keys in images or task configuration. |
 | CI/CD | GitHub Actions with AWS OIDC; no CodePipeline or CodeBuild. |
@@ -94,6 +94,30 @@ After integration:
 - the API, online materializer, and skew checker ran without `torch` or
   `implicit` installed in the serving image.
 
+Schema-7 deployment revalidation on 2026-07-31:
+
+- merged `origin/main` through `fd3cede` in merge commit `0d1a923` without
+  changing core semantics;
+- `uv sync --frozen` succeeded;
+- all 215 tests passed, Ruff passed, and strict mypy passed across 70 source
+  files;
+- packaged immutable generation `20260731T192746Z-0d1a923`, tied to the full
+  merge SHA, with Redis schema 7, 29 files, and 379,777,487 bytes;
+- every packaged size and SHA-256 digest verified;
+- built and loaded the exact Linux AMD64 image selected by Terraform. It is
+  295,691,986 bytes locally, runs as non-root user `sift`, retains the artifact
+  entrypoint, and pins one Uvicorn worker;
+- inside that image, a clean Redis publication activated schema 7 with the
+  expected entity counts, and the skew check passed over 100 pairs / 7,300
+  feature values;
+- `/health` returned 200 and cold plus immediate-warm `/recommend` requests
+  each returned ten results. Under AMD64 emulation on the ARM developer machine,
+  application time was 799.273 ms cold and 86.497 ms warm. These numbers prove
+  the path, not the Fargate latency contract;
+- the temporary smoke containers/network and response files were deleted. The
+  verified private generation and image remain local for publication only after
+  foundation approval.
+
 ### Phase 1 — containerization
 
 Commit `60d6496` (`deploy: package API and bootstrap in one runtime image`):
@@ -108,10 +132,9 @@ Commit `60d6496` (`deploy: package API and bootstrap in one runtime image`):
 - materialized Redis, passed the skew check, and returned a representative
   recommendation.
 
-The current image, after adding the artifact entrypoint, is Linux ARM64,
-286,228,616 bytes, runs as `sift`, and retains the one-worker API command.
-ECR/ECS architecture must match the image produced by CI; do not assume this
-developer-machine ARM64 build determines the final task architecture.
+The earlier developer image was Linux ARM64. The current deployment image is
+the revalidated Linux AMD64 build recorded above, matching the Terraform
+runtime-platform choice and the standard GitHub-hosted build architecture.
 
 ### Phase 2 — immutable artifact packaging
 
@@ -298,7 +321,7 @@ Implemented on the current `aws` branch without applying it:
 - one ElastiCache subnet group referencing only the two private subnets;
 - one node-based Valkey 8.0 replication group using the Redis protocol expected
   by Sift;
-- a configurable `cache.t4g.micro` initial node, with exactly one cache node,
+- a configurable `cache.t4g.medium` node, with exactly one cache node,
   no replicas, automatic failover disabled, and Multi-AZ disabled;
 - snapshot retention set to zero with no final snapshot identifier, because S3
   is authoritative and the serving state is rebuilt by the materialization
@@ -311,16 +334,21 @@ Implemented on the current `aws` branch without applying it:
 - separate standard CloudWatch log groups for the API and materialization task,
   with configurable three-day retention and deletion during teardown.
 
-Choice and compatibility evidence on 2026-07-30:
+Choice and compatibility evidence, updated 2026-07-31:
 
 - the live ElastiCache API in `us-west-2` reported Valkey versions 7.2, 8.0,
   8.1, 8.2, 9.0, and 9.1;
-- AWS documents `cache.t4g.micro` as a current-generation Valkey/Redis OSS node
-  with 0.5 GiB memory and burstable CPU. This is a low-cost starting envelope,
-  not a claim that it will pass materialization or ALB performance validation;
-- the AWS Price List API returned one `us-west-2` Valkey
-  `cache.t4g.micro` product at `$0.0128` per node-hour or partial hour, about
-  `$0.31` for 24 hours before other services and transfer. Re-check immediately
+- the exact schema-7 AMD64 container publication used 1,115,428,248 bytes
+  (1.04 GiB), peaked at 1.06 GiB, and created 1,234,043 Redis keys. The planned
+  0.5-GiB `cache.t4g.micro` cannot hold it and was rejected before apply;
+- the 2026-07-31 AWS Price List record gives `cache.t4g.small` 1.37 GiB and
+  `cache.t4g.medium` 3.09 GiB. The measured state would consume 75.8% of the
+  small's physical memory before managed-service/Redis overhead, versus 33.6%
+  of the medium, so medium is the smallest defensible initial node;
+- current `us-west-2` Valkey on-demand prices are `$0.0256` per small node-hour
+  and `$0.0520` per medium node-hour, effective 2026-07-01. Deterministic
+  calculation gives `$0.6144` versus `$1.2480` for 24 hours, a `$0.6336`
+  one-day difference before other services and transfer. Re-check immediately
   before apply because pricing can change;
 - Sift constructs its client with `Redis.from_url`, so the deployment boundary
   already accepts the required `rediss://` URL. No core application change is
@@ -334,7 +362,7 @@ Saved-plan audit:
   two log groups;
 - the cache references only `aws_subnet.private` and
   `aws_security_group.redis`;
-- the planned cache has Valkey 8.0, `cache.t4g.micro`, one node, zero snapshot
+- the planned cache has Valkey 8.0, `cache.t4g.medium`, one node, zero snapshot
   retention, both encryption modes enabled, and no auth token;
 - each log group has three-day retention and `skip_destroy = false`;
 - no NAT resource appeared and the only public CIDR rules remain ALB port 80
@@ -489,6 +517,28 @@ The ECS skill's service-specific guidance was applied to Fargate sizing,
 version, logging, and immutable ECR use. It did not alter the agreed deployment
 architecture.
 
+### Current one-day price envelope
+
+Public on-demand prices were queried through the AWS Price List API on
+2026-07-31 for `us-west-2`, then calculated deterministically:
+
+- the foundation's fixed 24-hour subtotal is `$2.02800`: Valkey medium
+  `$1.24800`, ALB base `$0.54000`, and two ALB public IPv4 addresses `$0.24000`;
+- with one API task running for the full 24 hours, the fixed subtotal becomes
+  `$3.33288`: Fargate 1-vCPU compute adds `$0.97152`, 2-GiB memory adds
+  `$0.21336`, and its public IPv4 address adds `$0.12000`;
+- one continuously consumed ALB LCU would add `$0.19200` per 24 hours. Actual
+  LCU, log ingestion, requests, and transfer depend on traffic;
+- the local artifact and image sizes imply only about `$0.001173` of combined
+  S3/ECR storage for 24 hours at current first-tier rates, before requests;
+- the one-off materialization task adds only its runtime Fargate/IP usage;
+- a practical light-testing expectation is therefore the fixed `$3.33288`
+  live subtotal plus usage-based LCU, logs, requests, and transfer. Re-query and
+  recalculate if the apply date changes.
+
+The billing/cost skill supplied the current-date, Price List, and deterministic
+calculation rules used here. No budget, billing, or AWS resource was changed.
+
 ## AWS resource state
 
 No AWS infrastructure has been created by this lane yet:
@@ -507,16 +557,11 @@ deployment-generated AWS service charges to preserve.
 
 ## Exact next action
 
-Commit and push the validated ECS slice, then integrate current `origin/main`
-without changing its core semantics. Recreate the locked environment and rerun
-the full repository test/lint/type-check baseline. Package a new immutable
-schema-7 generation and build the exact Linux x86-64 image locally; repeat the
-container materialization, skew, health, and representative recommendation
-smoke before publishing either asset.
-
-After local proof, query current one-day pricing and create a fresh
-foundation-only apply plan. Audit it, explain the expected charges, and obtain
-explicit user approval before the first `terraform apply`.
+Commit and push the schema-7 integration, local proof, and measured cache
+capacity correction. Then obtain explicit user approval for the first billable
+foundation apply. After approval, create and audit a fresh saved foundation
+plan, apply that exact plan, retain its local Terraform state, and verify every
+created resource before publishing the already-verified image or generation.
 
 ## Remaining phases
 

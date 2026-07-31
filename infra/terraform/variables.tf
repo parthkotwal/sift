@@ -87,7 +87,7 @@ variable "elasticache_engine_version" {
 variable "elasticache_node_type" {
   description = "Single ElastiCache node type; resize when deployment measurements require it."
   type        = string
-  default     = "cache.t4g.micro"
+  default     = "cache.t4g.medium"
 
   validation {
     condition     = can(regex("^cache\\.[a-z0-9]+\\.[a-z0-9]+$", var.elasticache_node_type))

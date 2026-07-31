@@ -10,7 +10,7 @@ vpc_cidr     = "10.42.0.0/20"
 allow_asset_deletion = false
 
 elasticache_engine_version     = "8.0"
-elasticache_node_type          = "cache.t4g.micro"
+elasticache_node_type          = "cache.t4g.medium"
 cloudwatch_log_retention_days  = 3
 
 additional_tags = {
