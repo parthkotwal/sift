@@ -93,3 +93,32 @@ output "alb" {
     target_group_arn  = aws_lb_target_group.api.arn
   }
 }
+
+output "ecs_cluster" {
+  description = "ECS cluster used by the API service and one-off materialization tasks."
+  value = {
+    arn  = aws_ecs_cluster.this.arn
+    name = aws_ecs_cluster.this.name
+  }
+}
+
+output "ecs_deployment" {
+  description = "ECS identifiers; task definitions and service are null until immutable inputs activate them."
+  value = {
+    active                          = local.deployment_activated
+    api_task_definition_arn         = try(aws_ecs_task_definition.api["active"].arn, null)
+    materialize_task_definition_arn = try(aws_ecs_task_definition.materialize["active"].arn, null)
+    service_name                    = try(aws_ecs_service.api["active"].name, null)
+  }
+}
+
+output "ecs_run_task_network" {
+  description = "Network inputs for an ECS RunTask materialization invocation."
+  value = {
+    assign_public_ip = true
+    security_group_ids = [
+      aws_security_group.ecs_tasks.id,
+    ]
+    subnet_ids = values(aws_subnet.public)[*].id
+  }
+}

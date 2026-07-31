@@ -16,3 +16,16 @@ cloudwatch_log_retention_days  = 3
 additional_tags = {
   Purpose = "portfolio-showcase"
 }
+
+# Leave both unset for the foundation-only plan. Activate task definitions and
+# the zero-task API service only after this exact image and generation exist.
+# deployment_image_tag = "0123456789abcdef0123456789abcdef01234567"
+# artifact_generation  = "20260731T120000Z-0123456"
+
+# Keep zero until the one-off materialization task and skew verification pass.
+# api_desired_count = 0
+
+# Initial measurement envelope; valid pairs and either architecture are configurable.
+# fargate_cpu              = 1024
+# fargate_memory           = 2048
+# fargate_cpu_architecture = "X86_64"

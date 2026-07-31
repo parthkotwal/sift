@@ -123,3 +123,38 @@ Target health uses `GET /health`, expects HTTP 200, checks every 15 seconds, and
 requires two successes or three failures. This deliberately leaves catalog
 initialization on the first `/recommend`; health checks must not disguise that
 cold cost. Deletion protection is off for verified showcase teardown.
+
+## ECS activation contract
+
+The ECS cluster is part of the foundation plan. Task definitions and the API
+service are deliberately absent until both `deployment_image_tag` and
+`artifact_generation` select immutable assets. Those inputs must be supplied
+together; the image tag must be a lowercase Git SHA and can never be `latest`.
+
+Both task definitions use Linux Fargate with `awsvpc` networking, separate
+execution and application roles, one essential container, and the existing S3
+and TLS Redis environment contract. The API task pins one Uvicorn worker and
+writes to the API log group. The one-off materialization task runs publication
+and the 100-pair skew check in sequence and writes to its own log group.
+
+The initial measurement envelope is x86-64, 1 vCPU, and 2 GiB. Architecture,
+CPU, and memory remain validated inputs so the deployed task can match the CI
+image and be resized from cloud measurements. The API service uses public
+subnets and an explicit public IP only for outbound AWS access; port 8000 still
+accepts traffic solely from the ALB security group.
+
+Activation has three deliberate states:
+
+1. leave both immutable inputs null for a foundation-only plan;
+2. set both inputs with `api_desired_count = 0` to register the task definitions
+   and service without starting the API;
+3. after the one-off task materializes Redis and its skew check passes, set
+   `api_desired_count = 1` to start exactly one API task.
+
+The service has no autoscaling. Deployment percentages are 0/100 so replacing
+the one-task demo may cause brief downtime but does not run two paid API tasks.
+The 180-second ALB health grace covers artifact download and process startup;
+it does not hide the catalog initialization paid by the first recommendation.
+
+`ecs_cluster`, `ecs_deployment`, and `ecs_run_task_network` outputs expose the
+identifiers needed for deployment and the one-off `aws ecs run-task` call.

@@ -6,7 +6,7 @@
 > truth. This file records execution status, evidence, decisions made while
 > implementing that plan, and the exact next action.
 >
-> **Last updated:** 2026-07-30 on branch `aws`.
+> **Last updated:** 2026-07-31 on branch `aws`.
 
 ## Update rule
 
@@ -430,6 +430,65 @@ Once applied, the ALB adds load-balancer hours or partial hours, LCUs, and
 service-managed public IPv4 address hours across its enabled zones, plus any
 applicable data transfer. Re-check current pricing immediately before apply.
 
+### Phase 3 — ECS cluster, tasks, and service
+
+Implemented on the current `aws` branch without applying it:
+
+- one ECS cluster with paid Container Insights explicitly disabled;
+- nullable immutable image-tag and artifact-generation inputs that must be set
+  together and cannot use `latest` or unsafe generation paths;
+- task CPU/memory validation covering valid Fargate combinations, with an
+  initial x86-64, 1-vCPU, 2-GiB measurement envelope chosen to match standard
+  GitHub-hosted builders and leave more startup headroom than the old example;
+- separate Linux/Fargate `awsvpc` API and materialization task definitions,
+  both using the existing execution/application role separation;
+- one essential API container with the exact one-worker Uvicorn command, port
+  8000, immutable S3 generation, and private TLS Redis URL;
+- one essential materialization container that publishes the selected
+  generation and then requires the 100-pair Redis/Parquet skew check to pass;
+- separate `awslogs` destinations for API and materialization output;
+- one API service using only the public subnets, explicit public-IP assignment,
+  only the ECS task security group, and only the ALB `ip` target group;
+- desired count constrained to zero or one, no autoscaling, a three-minute
+  artifact/process startup health grace, and 0/100 deployment percentages that
+  trade brief replacement downtime for never running two paid API tasks;
+- activation gating that creates only the cluster when immutable assets are
+  unset, creates both task definitions plus a zero-task service once they are
+  selected, and starts exactly one task only after `api_desired_count` moves to
+  one;
+- outputs for cluster identity, both task-definition ARNs, service name, and
+  the public-subnet/security-group inputs required by `aws ecs run-task`.
+
+Verification on 2026-07-31:
+
+- the AWS identity remains IAM user `parth` in account `442042531996`;
+- Terraform formatting and validation passed;
+- negative plans proved that an unpaired image/generation, an invalid Fargate
+  CPU/memory combination, or a positive desired count without immutable inputs
+  fails validation rather than merely warning;
+- the foundation plan has 43 creates, zero changes, and zero destroys, with
+  only the ECS cluster from this slice;
+- the staged and live plans each have 46 creates, zero changes, and zero
+  destroys: cluster, two task definitions, and one service are the four ECS
+  resources;
+- staged desired count is zero and live desired count is exactly one;
+- both task definitions plan `FARGATE`, `awsvpc`, Linux x86-64, 1024 CPU units,
+  and 2048 MiB; the service plans Fargate platform `1.4.0`, explicit public IP,
+  port 8000, 180-second grace, and 0/100 replacement limits;
+- no NAT or application-autoscaling resource appears. The only public CIDR
+  rules remain ALB ingress port 80 and ECS egress port 443;
+- task container JSON remains unknown before the foundation exists because its
+  environment contains the not-yet-created bucket ID and cache endpoint. Its
+  static configuration was inspected now and must be re-audited in the
+  activation plan after the foundation apply resolves those values;
+- all saved plan files were deleted after inspection;
+- no `terraform apply` was run and no AWS resources were created.
+
+The ECS skill's service-specific guidance was applied to Fargate sizing,
+`awsvpc`, `ip` targets, task/execution-role separation, explicit platform
+version, logging, and immutable ECR use. It did not alter the agreed deployment
+architecture.
+
 ## AWS resource state
 
 No AWS infrastructure has been created by this lane yet:
@@ -448,29 +507,16 @@ deployment-generated AWS service charges to preserve.
 
 ## Exact next action
 
-Add the Phase 3 ECS cluster, task definitions, and one-task service without
-applying them:
+Commit and push the validated ECS slice, then integrate current `origin/main`
+without changing its core semantics. Recreate the locked environment and rerun
+the full repository test/lint/type-check baseline. Package a new immutable
+schema-7 generation and build the exact Linux x86-64 image locally; repeat the
+container materialization, skew, health, and representative recommendation
+smoke before publishing either asset.
 
-1. define required immutable image-tag and artifact-generation deployment
-   inputs rather than inventing values in tracked configuration;
-2. create one ECS cluster without paid optional observability features;
-3. define an ARM64 or x86_64 Fargate task architecture that must match the CI
-   image, with one Uvicorn worker and configurable CPU/memory;
-4. pass the selected artifact bucket/generation and private `rediss://`
-   connection through the existing application environment contract;
-5. configure `awslogs` separately for the API and materialization command;
-6. create one API service task using public subnets, explicit public-IP
-   assignment, the ECS security group, and the ALB `ip` target group;
-7. retain one task with no autoscaling and set health grace for process startup,
-   not catalog initialization;
-8. expose the cluster, task-definition, and service identifiers needed for
-   one-off `RunTask`, deployment, and validation;
-9. validate the container JSON and inspect a saved plan for task count,
-   worker count, architecture, sizing, public IP, network exposure, roles,
-   logging, environment values, and costs.
-
-Before publishing an image or applying ECS, integrate current `origin/main` and
-rerun the package/container/schema-skew smoke recorded under Coordination.
+After local proof, query current one-day pricing and create a fresh
+foundation-only apply plan. Audit it, explain the expected charges, and obtain
+explicit user approval before the first `terraform apply`.
 
 ## Remaining phases
 
