@@ -117,6 +117,63 @@ requirement next to `uv sync`.
 
 ## Open
 
+Nothing outstanding. Resolved entries used to accumulate here marked `[fixed]`, which
+made the section unreadable as a to-do list — they now move to *Fixed — kept because the
+failure mode recurs* as soon as they close, so anything appearing under this heading is
+genuinely open work rather than a record of finished work.
+
+An empty section is the honest state, not a claim of perfection: the traps below still
+recur, and the things this project has deliberately not built (multi-metro, ANN, a
+two-tower that wins) are scope in `ARCHITECTURE.md`, not defects.
+
+---
+
+## Fixed — kept because the failure mode recurs
+
+### I6 — Tie-breaking in the ranker is arbitrary   [fixed → D32]
+
+With a shallow model the ranker produced far fewer distinct scores than candidates
+(measured 2026-07-26: 18 distinct scores over 500). `np.argsort` defaults to an unstable
+sort, so the top-k could be an arbitrary slice of a large tie group rather than the
+incumbent's ordering. A stable fallback to retrieval's own order is the correct funnel
+behaviour: a stage that scores two candidates identically has expressed no opinion
+between them.
+
+**Deferred on purpose, then:** making it stable would have made the popularity-pool
+ranker fall back to popularity — the exact incumbent it had to beat — and reported that
+as the ranker's number, hiding the finding that it had no personalization signal.
+`reranked_candidate_lists` (personalized pool) used `kind="stable"` because that
+rationale does not transfer to a per-user pool; `reranked_lists` and `ranking/online.py`
+stayed unstable. The divergence was deliberate and documented at both call sites.
+
+**Fixed (2026-07-30) by measuring the premise instead of re-arguing it.** Over the frozen
+holdout, the *same* popularity-pool model now produces a median of 500 distinct scores
+over 500 candidates (min 453); 3 users in 26,489 have a tie at the top-10 boundary at
+all; exactly 1 user's top-10 changes between the two tie-breaks; and every metric is
+identical at four decimals. All five orderings in the package are stable now, and
+`tests/test_tie_break.py` asserts that across the package by AST rather than at each call
+site — the realistic regression is a *new* ordering added beside the existing ones, which
+a test of today's five would not catch.
+
+**Why it is kept: a deferral justified by a number needs the number attached to something
+that re-runs.** The premise expired on 2026-07-27, when `ui_als_score` (D27) landed and
+both rankers were retrained — the continuous feature is what dissolved the tie groups.
+Nothing failed at that moment, because I6 recorded a measurement in prose and a condition
+in English ("revisit once the ranker has real score resolution") with nothing watching
+for it. It sat stale for three days, and the 2026-07-30 addendum written the day before
+this fix *still* repeated the 18-score figure as current while arguing about cost. A
+deferral is a claim about the world; if it is worth deferring on, it is worth being able
+to re-check cheaply.
+
+**Found while closing it:** `sift.ranking.rank` was an eval entrypoint with no ledger
+call, so the one baseline this entry said was expensive to remeasure was also the one
+D30 was not protecting — which is most of why remeasuring *felt* expensive. It also
+recorded the popularity baseline under the name `"popularity"` while every other
+entrypoint used `"popularity (pre-T review count)"`; since the ledger keys on the run
+name, that would have created a second, separately-ratcheted baseline for the same
+recommender. Two entries that can disagree is worse than none, because both look
+authoritative.
+
 ### I33 — One request read the active generation three times   [fixed]
 
 **I logged this as "twice" and as "narrow". Cross-review found it is three times, and
@@ -160,7 +217,7 @@ with whether the store should expose an explicit `snapshot()` handle that a requ
 holds for its whole life — which would make the property structural instead of
 remembered, the same way the per-generation relation names did.
 
-### I31 — The online feature path collapses under concurrency   [fixed, partially]
+### I31 — The online feature path collapses under concurrency   [fixed]
 
 Wiring the ranker into the API (I30) made the API call `store.lookup()` for the
 first time, which exposed a latent defect in the I29 fix: **it was validated on a
@@ -256,15 +313,22 @@ The tail at concurrency 8 improved ~31x and concurrency 4 is now fully inside th
 concurrency 2 (18 -> 23 -> 34 -> 70 -> 162ms), which is CPU saturation on 4
 performance cores, not cold start.
 
-**The remaining lever is the same insight one layer out.** Per request the store still
-fetches ~1000 Redis records (500 `item` + 500 `business`) and pushes them through the
-identical three-pass JSON route that `item_als` just escaped: decode in Python,
-re-encode with `_rows_json`, re-parse in `json_each`. But `item` and `business` current
-state is *also* catalog-wide and immutable within a generation — only the user side
-(`user`, `user_category`, `user_als`, three records) genuinely varies per request.
-Publishing the item side as catalog-wide records built once per process would cut
-per-request marshalling from ~1000 records to 3. That is a materialization-format
-change and a schema bump, so it is a decision, not a follow-up patch.
+**The remaining lever, now taken (D31).** Per request the store fetched ~1000 Redis
+records (500 `item` + 500 `business`) — measured at **16.1ms of the ~19ms stage** — and
+pushed them through the identical three-pass JSON route `item_als` had escaped. But
+`item` and `business` current state is *also* catalog-wide and immutable within a
+generation; only the three user-side records genuinely vary. Both are now one record
+per generation, parsed once per process, and the per-request fetch is 3 records.
+
+Feature lookup **19.3 -> 9.3ms p50**; end-to-end **33.0 -> 22.4ms p50**. The payoff that
+matters is the envelope: concurrency 8 went from 118ms p99 with 57/300 requests over the
+contract to **67.9ms p99 with 0/1000 over**, so the supported concurrency doubled.
+
+Two surprises worth keeping, both in D31: rerank got *slower* first, because reading 50
+candidates out of a 14,568-row DuckDB relation scans the whole thing — moving data
+closer is not automatically faster, the access pattern decides. And 1.1ms silently
+appeared in `overhead`, which turned out to be the generation-pinning Redis round trip
+sitting before the first timer.
 
 **Rule this earns:** a per-stage latency number measured single-threaded does not
 describe a threaded server. Benchmark the transport the service actually uses, at
@@ -276,7 +340,7 @@ the maximum, with no statistical content. Every `--samples 100` p99 in this log 
 under-powered, including I29's headline 26.874ms; at n=600 the same single-threaded
 path measures p99 35.39ms.
 
-### I29 — Online feature lookup regressed on ALS state   [fixed, partially]
+### I29 — Online feature lookup regressed on ALS state   [fixed → D31]
 
 Publishing ALS state (D27) took online feature lookup from ~2ms to **49ms p50** —
 over its 20ms allocation, though end-to-end p99 still fit under 100ms. The
@@ -423,7 +487,7 @@ only ever meets rows where both vectors exist, and LEFT JOINing the result back 
 `query_id` — the same shape `ui_category_affinity` already uses for `uc`. The
 definition's expression is therefore `als.score`, not a dot product written inline.
 
-### I24 — No regression test pins the headline retrieval metrics   [deferred]
+### I24 — No regression test pins the headline retrieval metrics   [fixed → D30]
 
 ALS's 0.2519 recall@500 and the two-tower's 0.2399 (D25/D26) exist only as prose in
 `DECISIONS.md`. Nothing fails if a refactor moves them: the suite covers component
@@ -444,6 +508,31 @@ write `data/RESULTS.md` numbers to a versioned JSON alongside the model manifest
 and have the eval entrypoint diff against the previous run and refuse to overwrite
 a regression without an explicit flag. That belongs to the build step that touches
 eval next, not to a review fix.
+
+**Fixed, built to that shape (D30).** `sift/eval/ledger.py` keeps
+`data/derived/eval_ledger.json` — gitignored with the rest of the dataset-derived
+numbers — and every eval entrypoint diffs against it, prints the verdict, and exits
+non-zero on a regression. `--accept` records the new value deliberately.
+
+The deferral's constraint is respected rather than worked around: the mechanism is
+unit-tested with synthetic reports and runs anywhere, while the numbers live in a
+local artifact. No test asserts 0.2519, so nothing reintroduces I1's hidden dependency
+on machine state, and no synthetic fixture is asked to reproduce a property of the
+real distribution (I8).
+
+Three behaviours the tests pin, because each is a way this could pass while doing
+nothing:
+
+- **A first run establishes rather than passes.** A fresh clone has no ledger, and
+  "no baseline" must not look like "no regression" — otherwise the first run of a
+  broken model reads clean.
+- **A regression is not written.** The way a ratchet fails is by ratcheting the wrong
+  way once: record a bad run and the *next* run is judged against it, so the loss
+  disappears silently.
+- **A changed eval set is fatal, not a regression, and `--accept` cannot silence it.**
+  D18 froze the holdout; if `n_users` moves, the runs did not measure the same thing
+  and an *improvement* is exactly as untrustworthy as a decline. That is a different
+  failure from "the model got worse" and must not share an escape hatch with it.
 
 ### I5 — Repeats vs. the already-reviewed rerank filter   [resolved at step 6 → D29]
 
@@ -491,35 +580,6 @@ already knows. Serving filters them; the unfiltered number stays published besid
 filtered one so the gap is legible rather than hidden. D18 and the frozen holdout are
 untouched — this is a serving decision reported alongside them, not a redefinition of
 ground truth.
-
-### I6 — Tie-breaking in the ranker is arbitrary   [deferred, deliberately]
-
-With a shallow model the ranker produces far fewer distinct scores than candidates
-(measured: 18 distinct scores over 500). `np.argsort` breaks the ties by whatever
-order it lands on, so the top-k can be an arbitrary slice of a large tie group
-rather than the incumbent's ordering. A stable fallback to retrieval's own order is
-the correct funnel behaviour.
-
-**Deferred on purpose:** adding it now would drag the ranker's numbers toward
-popularity's and disguise the finding that the ranker has no personalization
-signal. Revisit once the ranker has real score resolution.
-
-**The two rank paths deliberately differ (2026-07-27, from review of 26cfe46).**
-`reranked_lists` (popularity pool) keeps the unstable `np.argsort` this entry
-defers; `reranked_candidate_lists` (personalized pool) uses `kind="stable"`, so
-ties fall back to the candidate order the provider supplied — for ALS that *is*
-retrieval's own ranking, which is the correct funnel behaviour described above.
-The divergence was undocumented when it landed; it is intentional, and the reason
-is that the deferral's rationale does not transfer. Popularity's pool is a fixed
-global list, so stable tie-breaking there means "fall back to global popularity" —
-exactly the incumbent the ranker must beat, which is what would hide the ranker's
-lack of resolution. ALS's pool is per-user, so stable tie-breaking is a personalized
-fallback and hides nothing. Both call sites now carry that reasoning inline.
-Unifying them requires remeasuring both baselines, not editing one line.
-
----
-
-## Fixed — kept because the failure mode recurs
 
 ### I34 — "Already reviewed" meant any event type   [fixed]
 

@@ -261,11 +261,25 @@ def read_current_features(
     features: Sequence[str] | None = None,
     queries: str = "queries",
     *,
+    item_state: str = "item_current",
+    dim: str = "business_current",
     item_als_state: str = "item_als_current",
 ) -> list[tuple[object, ...]]:
-    """Project current state; rows are ``(query_id, *features)``."""
+    """Project current state; rows are ``(query_id, *features)``.
+
+    The catalog-wide relations are named by the caller because the online store builds
+    one immutable set per Redis generation, so an in-flight request keeps reading the
+    snapshot it started on while a newer one uses its own (I31). The defaults name the
+    per-request relations, which is what a test or an ad-hoc projection would build.
+    """
     return con.execute(
-        current_feature_query(features, queries, item_als_state=item_als_state)
+        current_feature_query(
+            features,
+            queries,
+            item_state=item_state,
+            dim=dim,
+            item_als_state=item_als_state,
+        )
     ).fetchall()
 
 

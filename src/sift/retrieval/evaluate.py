@@ -9,6 +9,7 @@ Run: ``python -m sift.retrieval.evaluate``.
 
 from __future__ import annotations
 
+import argparse
 import json
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -18,6 +19,7 @@ import numpy as np
 from numpy.typing import NDArray
 
 from sift.eval.holdout import load_ground_truth
+from sift.eval.ledger import report_and_exit_code
 from sift.eval.run import EvalReport, evaluate, popularity_recommender
 from sift.retrieval.als import ITEM_FACTORS, ITEM_IDS, USER_FACTORS, USER_IDS
 from sift.retrieval.index import exact_top_k
@@ -150,10 +152,18 @@ def compare() -> tuple[EvalReport, EvalReport, MarginalHits]:
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--accept",
+        action="store_true",
+        help="record a regression as the new baseline; say why in DECISIONS.md",
+    )
+    args = parser.parse_args()
     popularity, als, marginal = compare()
     print(popularity.render())
     print(als.render())
     print(marginal.render(500))
+    raise SystemExit(report_and_exit_code([popularity, als], accept=args.accept))
 
 
 if __name__ == "__main__":

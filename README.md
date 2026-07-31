@@ -32,6 +32,8 @@ Backwards, one stage at a time: dumb popularity baseline end-to-end first, then 
 
 **The exception is rerank (D29)**, which lowers recall@10 by 41% and lands anyway. The rule exists to stop a change being kept because it feels better; it is not a rule that the final number must always rise. Rerank's drop is almost entirely the already-reviewed filter removing credit the ranker was earning for predicting return visits, and knowing that is worth more than the number it cost. An exception that has to be argued in the decision log is the rule working, not the rule being broken.
 
+The rule is enforced, not just stated: every eval entrypoint diffs its numbers against a local ledger and exits non-zero on a regression rather than recording it, so an exception has to be taken deliberately with `--accept` (D30). The numbers stay out of git — they're dataset-derived and Yelp's terms restrict publishing them — so a fresh clone's first run establishes its own baseline and says so.
+
 The fixed two-tower has now been run through that gate and did not replace ALS.
 Its code and versioned artifacts remain reproducible for inspection; the selected
 online path is unchanged.
@@ -81,16 +83,30 @@ time-sliced ALS state: with that feature it beats ALS's raw ordering (NDCG@10
 the label outright, so the slices are what make it usable — see `.agents/DECISIONS.md`
 D27.
 
-The catalog-wide ALS state is shared once per process, while request-local DuckDB
-relations remain isolated per worker. The load benchmark checks the stated
-four-request concurrency envelope and refuses a verdict on a contended host; the
-binding result comes from deployment hardware rather than inheriting a noisy desktop
+That feature also closed the project's longest-running deferral. Every stage orders with
+a stable sort, so candidates it scores identically keep the order the previous stage gave
+them — a stage with no opinion between two candidates must not overwrite one that had
+one. That was deliberately *not* done while the ranker produced 18 distinct scores over
+500 candidates, because falling back to the incumbent would have reported the baseline's
+ordering as the ranker's. Adding retrieval's score dissolved the ties: the same model now
+produces a median of 500 distinct scores over 500, three users in 26,489 have a tie at
+the top-10 boundary at all, and unifying the tie-break moved no metric. The lesson is in
+D32 — a deferral justified by a number needs the number attached to something that
+re-runs, or it goes stale without anything failing.
+
+Everything catalog-wide — item state, the business dimension, and the ALS vectors — is
+one Redis record per generation, parsed once per process into an immutable relation,
+while request-local DuckDB relations stay isolated per worker. A 500-candidate request
+therefore reads **3 Redis records rather than 1,003**, which was 16ms of a 19ms stage;
+it is also what doubled the supported concurrency from four to eight (D31). The load
+benchmark checks that envelope and refuses a verdict on a contended host; the binding
+result comes from deployment hardware rather than inheriting a noisy desktop
 measurement (`.agents/ISSUES.md` I31).
 
 To check the latency contract, drive the running endpoint at a stated concurrency:
 
 ```bash
-uv run python -m sift.api.bench --concurrency 4 --check
+uv run python -m sift.api.bench --concurrency 8 --check
 ```
 
 It reports per-stage p50/p95/p99 from the response's own breakdown plus client-side

@@ -14,6 +14,7 @@ import pytest
 from sift.api.bench import (
     END_TO_END_P99_MS,
     STAGE_TRIPWIRE_MS,
+    SUPPORTED_CONCURRENCY,
     BenchReport,
     deterministic_users,
     quiet_host_threshold,
@@ -122,8 +123,8 @@ def test_warmup_request_is_excluded_from_the_percentiles() -> None:
 
 def test_concurrency_beyond_the_stated_envelope_is_flagged_not_silently_reported() -> None:
     fetch, _ = _fetch([_sample(30.0)])
-    rendered = run_benchmark(fetch, ["u1"], concurrency=16).render()
-    assert "exceeds the 4" in rendered
+    rendered = run_benchmark(fetch, ["u1"], concurrency=SUPPORTED_CONCURRENCY * 2).render()
+    assert f"exceeds the {SUPPORTED_CONCURRENCY}" in rendered
     assert "envelope, not a defect" in rendered
 
 

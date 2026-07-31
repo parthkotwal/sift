@@ -128,8 +128,9 @@ def test_ranker_order_overrides_the_als_order_it_was_given(tmp_path: Path) -> No
 
 
 def test_tied_ranker_scores_fall_back_to_retrieval_order(tmp_path: Path) -> None:
-    """The funnel property I6 describes: a ranker with no resolution must not
-    scramble the incumbent ordering it was asked to refine."""
+    """A stage that scores two candidates identically has expressed no opinion between
+    them, so retrieval's order stands (D32). `tests/test_tie_break.py` asserts the same
+    property structurally, across every ordering in the package."""
     store = _Store({"warm": _warm_vector()}, {"b1": 1.0, "b2": 1.0, "b3": 1.0})
     result = _retriever(tmp_path, store).recommend("warm", 3)
     assert [entry.business_id for entry in result.results] == ["b2", "b3", "b1"]

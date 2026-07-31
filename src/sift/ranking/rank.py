@@ -26,11 +26,12 @@ input, never the definition. Offline eval has no latency budget; the online path
 will read materialized values from the store (build step 4) rather than either of
 these routes; this module already reads it, just from Parquet rather than Redis.
 
-Run: python -m sift.ranking.rank
+Run: python -m sift.ranking.rank  (diffs both numbers against the ledger, D30)
 """
 
 from __future__ import annotations
 
+import argparse
 from collections.abc import Iterator, Mapping, Sequence
 
 import duckdb
@@ -39,6 +40,7 @@ import numpy as np
 
 from sift.config import SPLIT_T
 from sift.eval.holdout import load_ground_truth
+from sift.eval.ledger import report_and_exit_code
 from sift.eval.run import evaluate, popularity_recommender
 from sift.features.definitions import feature_names
 from sift.offline.dim_business import DIM_BUSINESS
@@ -100,12 +102,14 @@ def reranked_lists(
             x = np.column_stack([to_float(data[name]) for name in feature_names()])
             assert x.shape[0] == len(batch) * n_cand, "feature rows lost in the join"
             scores = np.asarray(model.predict(x), dtype=np.float64).reshape(len(batch), n_cand)
-            # Unstable on purpose, and it is not the same choice as the personalized
-            # path below: I6 defers a stable tie-break here so the popularity-pool
-            # ranker's numbers keep showing that it has almost no score resolution
-            # (18 distinct scores over 500). Making it stable would quietly drag them
-            # toward popularity's and hide that finding.
-            order = np.argsort(-scores, axis=1)  # best score first, per user
+            # Stable: ties fall back to the order the pool arrived in, which here is
+            # popularity's own ranking. This was deliberately unstable while the ranker
+            # had 18 distinct scores over 500 candidates and a stable fallback would
+            # have quietly reported popularity's numbers as the ranker's (I6). D27's
+            # `ui_als_score` ended that: the same model now produces a median of 500
+            # distinct scores over 500, 3 users in 26,489 have a tie at the top-10
+            # boundary at all, and switching moved no metric at four decimals.
+            order = np.argsort(-scores, axis=1, kind="stable")  # best score first, per user
             for i, user_id in enumerate(batch):
                 lists[user_id] = [pool[j] for j in order[i]]
             if progress:
@@ -161,11 +165,10 @@ def reranked_candidate_lists(
             x = np.column_stack([to_float(data[name]) for name in feature_names()])
             assert x.shape[0] == len(batch) * n_cand, "feature rows lost in the join"
             scores = np.asarray(model.predict(x), dtype=np.float64).reshape(len(batch), n_cand)
-            # Stable, unlike `reranked_lists`: ties fall back to the candidate order
-            # the provider gave, which for a personalized pool is retrieval's own
-            # ranking — the correct funnel behaviour I6 describes. The divergence is
-            # deliberate and recorded in I6; do not "unify" them without remeasuring
-            # both baselines.
+            # Stable, like every other ordering in the funnel: ties fall back to the
+            # candidate order the provider gave, which for a personalized pool is
+            # retrieval's own ranking. `tests/test_tie_break.py` asserts that property
+            # across the package rather than leaving it to five separate call sites.
             order = np.argsort(-scores, axis=1, kind="stable")
             for index, user_id in enumerate(batch):
                 pool = candidates_by_user[user_id]
@@ -189,9 +192,22 @@ def _resolution(lists: dict[str, list[str]]) -> None:
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--accept",
+        action="store_true",
+        help="record a regression as the new baseline; say why in DECISIONS.md",
+    )
+    args = parser.parse_args()
     ground_truth = load_ground_truth()
     users = list(ground_truth)
-    baseline = evaluate(popularity_recommender(), ground_truth, name="popularity")
+    # The ledger keys on the run name, so the incumbent has to be spelled the way the
+    # other entrypoints spell it. Recorded here as "popularity" it would have become a
+    # second, separately-ratcheted baseline for the same recommender — two entries that
+    # can disagree is worse than none, because both look authoritative.
+    baseline = evaluate(
+        popularity_recommender(), ground_truth, name="popularity (pre-T review count)"
+    )
     model = lgb.Booster(model_file=str(RANKER_MODEL))
     pool = [entry.business_id for entry in load_ranking()[:SERVING_POOL]]
     lists = reranked_lists(model, users, pool, str(SPLIT_T), progress=True)
@@ -210,6 +226,7 @@ def main() -> None:
     print()
     print(ranked.render())
     _resolution(lists)
+    raise SystemExit(report_and_exit_code([baseline, ranked], accept=args.accept))
 
 
 if __name__ == "__main__":

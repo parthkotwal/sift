@@ -66,16 +66,24 @@ DEFAULT_URL = "http://localhost:8000"
 # stage are mostly different requests. The original 30/20/30/20 allocation summing to
 # exactly 100ms encoded that confusion; a budget built by adding stage p99s
 # over-provisions every stage and still does not bound the total.
+#
+# Re-tightened after I31 moved feature lookup from 32ms p99 to 15ms: a 40ms line on a
+# 15ms stage would let it regress back to 39ms unnoticed, which is precisely how I29
+# (2ms -> 49ms) was caught in the first place. A tripwire has to follow its stage down
+# or it stops being one. Each is set at roughly 2x the measured p99 — loose enough not
+# to flap on scheduling noise, tight enough that a real regression trips it.
 STAGE_TRIPWIRE_MS: dict[str, float] = {
-    "retrieval_ms": 10.0,
-    "feature_lookup_ms": 40.0,
-    "ranking_ms": 15.0,
-    "rerank_ms": 10.0,
-    "overhead_ms": 5.0,
+    "retrieval_ms": 10.0,  # p99 4.5
+    "feature_lookup_ms": 30.0,  # p99 15.3
+    "ranking_ms": 15.0,  # p99 11.0
+    "rerank_ms": 8.0,  # p99 3.3
+    "overhead_ms": 5.0,  # p99 0.03
 }
 TRIPWIRE_CONCURRENCY = 1
 END_TO_END_P99_MS = 100.0
-SUPPORTED_CONCURRENCY = 4
+# Raised from 4 after I31 (D31). Concurrency 8 measures 67.9ms p99 with 0/1000 over the
+# contract, where it was 118ms with 57/300 over before the catalog records landed.
+SUPPORTED_CONCURRENCY = 8
 
 # The percentile the contract is written in. p50/p95 are reported for shape, but only
 # p99 is asserted -- a budget stated at the median hides exactly the tail that hurts.

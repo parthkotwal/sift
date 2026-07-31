@@ -91,9 +91,10 @@ class OnlineRanker:
         columns = tuple(zip(*(row[1:] for row in feature_rows), strict=True))
         x = np.column_stack([to_float(np.asarray(column, dtype=object)) for column in columns])
         scores = np.asarray(self.model.predict(x), dtype=np.float64)
-        # Keep the existing tie behavior until the deliberately deferred I6 choice
-        # is revisited; changing it here would silently resolve that open decision.
-        order = np.argsort(-scores)
+        # Stable, so ties fall back to the order retrieval handed over — here the
+        # popularity ranking. Deferred while the ranker had no score resolution to
+        # scramble (I6); resolved once measurement showed it has (D32).
+        order = np.argsort(-scores, kind="stable")
         ranked = tuple(
             RankedBusiness(
                 business_id=candidates[index].business_id,
