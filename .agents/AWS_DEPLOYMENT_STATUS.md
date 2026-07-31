@@ -569,7 +569,8 @@ Terraform now defines:
 
 - the account's GitHub OIDC provider;
 - one deploy role whose trust policy requires audience `sts.amazonaws.com` and
-  exact subject `repo:parthkotwal/sift:ref:refs/heads/aws`;
+  GitHub's exact immutable-ID subject
+  `repo:parthkotwal@98301375/sift@1308243087:ref:refs/heads/aws`;
 - an inline policy limited to pushing the Sift ECR repository, registering an
   ECS task definition, updating only the Sift ECS service, passing only the two
   Sift task roles to `ecs-tasks.amazonaws.com`, and reading target health;
@@ -578,8 +579,10 @@ Terraform now defines:
   for service stability, and requires every registered ALB target to be healthy.
 
 The inspected OIDC plan contained exactly three resource creates, zero changes,
-and zero destroys. It applied successfully. The workflow still needs its first
-manual end-to-end run after this commit is pushed.
+and zero destroys. It applied successfully. The first workflow run passed all
+quality gates but AWS denied the initial name-only OIDC subject. CloudTrail
+showed that GitHub now supplies immutable owner and repository IDs in `sub`;
+the trust policy was corrected to the exact observed claim before retrying.
 
 ### Phase 7 — cloud validation and measured envelope
 

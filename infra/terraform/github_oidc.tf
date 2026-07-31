@@ -1,5 +1,8 @@
 locals {
-  github_repository = "parthkotwal/sift"
+  # GitHub's OIDC subject uses immutable owner/repository IDs in addition to names.
+  # CloudTrail records this exact value, so a renamed or recreated repository cannot
+  # inherit this deployment role merely by reusing `parthkotwal/sift`.
+  github_repository_subject = "parthkotwal@98301375/sift@1308243087"
 }
 
 resource "aws_iam_openid_connect_provider" "github" {
@@ -27,7 +30,7 @@ data "aws_iam_policy_document" "github_deploy_assume_role" {
     condition {
       test     = "StringEquals"
       variable = "token.actions.githubusercontent.com:sub"
-      values   = ["repo:${local.github_repository}:ref:refs/heads/aws"]
+      values   = ["repo:${local.github_repository_subject}:ref:refs/heads/aws"]
     }
   }
 }
