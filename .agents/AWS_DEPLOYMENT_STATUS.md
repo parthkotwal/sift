@@ -6,6 +6,9 @@
 > truth. This file records execution status, evidence, decisions made while
 > implementing that plan, and the exact next action.
 >
+> **Issue ledger:** `.agents/AWS_ISSUES.md` records deployment failures, residual
+> risks, and operating traps that should survive the handoff.
+>
 > **Last updated:** 2026-07-31 on branch `aws`.
 
 ## Update rule
@@ -29,7 +32,9 @@ bundles, private endpoints, or credentials in this file.
 - If deployment needs a missing application interface, record the exact
   interface and intended caller here, then ask the core coding agent to provide
   it. Do not patch around the boundary in `src/sift/**`.
-- There is currently **no outstanding request for the core coding agent**.
+- There is no missing application interface blocking the AWS lane. The cloud
+  latency miss and cold-start behavior are recorded as coding-agent follow-ups
+  in `AWS_ISSUES.md` (AWS-I1 and AWS-I2).
 - Coordination note: `origin/main` was observed at `fd3cede` after this branch
   diverged. It includes D31 (`5b6dcb2`): Redis schema 7, catalog-wide item and
   business records, and a measured desktop supported concurrency of 8. The
