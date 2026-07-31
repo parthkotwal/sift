@@ -1,0 +1,119 @@
+name: Deploy AWS showcase
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: sift-aws-showcase
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: us-west-2
+  ECR_REPOSITORY: sift-showcase-api
+  ECS_CLUSTER: sift-showcase
+  ECS_SERVICE: sift-showcase-api
+  TASK_FAMILY: sift-showcase-api
+
+jobs:
+  deploy:
+    if: github.ref == 'refs/heads/aws'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.9.13"
+          enable-cache: true
+
+      - name: Install locked dependencies
+        run: uv sync --frozen
+
+      - name: Run quality gates
+        run: |
+          uv run pytest
+          uv run ruff check .
+          uv run mypy
+
+      - name: Authenticate to AWS with OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::442042531996:role/sift-showcase-github-deploy
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Log in to Amazon ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set immutable image URI
+        run: echo "IMAGE_URI=${{ steps.ecr.outputs.registry }}/${ECR_REPOSITORY}:${GITHUB_SHA}" >> "$GITHUB_ENV"
+
+      - name: Build and push Linux AMD64 image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          tags: ${{ env.IMAGE_URI }}
+
+      - name: Register task definition with the new image
+        id: task
+        run: |
+          aws ecs describe-task-definition \
+            --task-definition "$TASK_FAMILY" \
+            --query taskDefinition > task-definition-source.json
+          jq --arg image "$IMAGE_URI" '
+            .containerDefinitions |= map(
+              if .name == "api" then .image = $image else . end
+            )
+            | del(
+                .compatibilities,
+                .registeredAt,
+                .registeredBy,
+                .requiresAttributes,
+                .revision,
+                .status,
+                .taskDefinitionArn
+              )
+          ' task-definition-source.json > task-definition-deploy.json
+          task_definition_arn=$(aws ecs register-task-definition \
+            --cli-input-json file://task-definition-deploy.json \
+            --query taskDefinition.taskDefinitionArn \
+            --output text)
+          echo "arn=$task_definition_arn" >> "$GITHUB_OUTPUT"
+
+      - name: Deploy and wait for ECS stability
+        run: |
+          aws ecs update-service \
+            --cluster "$ECS_CLUSTER" \
+            --service "$ECS_SERVICE" \
+            --task-definition "${{ steps.task.outputs.arn }}" \
+            --no-cli-pager > /dev/null
+          aws ecs wait services-stable \
+            --cluster "$ECS_CLUSTER" \
+            --services "$ECS_SERVICE"
+
+      - name: Verify ALB target health
+        run: |
+          target_group_arn=$(aws ecs describe-services \
+            --cluster "$ECS_CLUSTER" \
+            --services "$ECS_SERVICE" \
+            --query 'services[0].loadBalancers[0].targetGroupArn' \
+            --output text)
+          aws elbv2 describe-target-health \
+            --target-group-arn "$target_group_arn" \
+            --query 'TargetHealthDescriptions[].TargetHealth.State' \
+            --output json | jq -e 'length > 0 and all(. == "healthy")'

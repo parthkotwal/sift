@@ -60,6 +60,10 @@ resource "aws_ecs_task_definition" "api" {
         "8000",
         "--workers",
         "1",
+        "--http",
+        "h11",
+        "--timeout-keep-alive",
+        "65",
       ]
       environment = local.task_environment
       portMappings = [

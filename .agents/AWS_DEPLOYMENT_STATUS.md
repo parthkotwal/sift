@@ -517,6 +517,106 @@ The ECS skill's service-specific guidance was applied to Fargate sizing,
 version, logging, and immutable ECR use. It did not alter the agreed deployment
 architecture.
 
+### Phases 3–5 — live deployment
+
+The user explicitly approved the billable deployment on 2026-07-31. A fresh
+foundation plan was inspected before apply and contained exactly 43 creates,
+zero changes, and zero destroys. The apply completed successfully. Subsequent
+activation plans were kept deliberately small and inspected before each apply.
+
+Live foundation verification:
+
+- the VPC, two public subnets, two private subnets, route tables, internet
+  gateway, and three security groups exist in `us-west-2`;
+- there is no NAT Gateway and the private subnet route table has no public
+  route;
+- the S3 artifact bucket has all four Block Public Access controls, versioning,
+  `BucketOwnerEnforced`, AES-256 encryption, and the TLS-only deny policy;
+- an anonymous object request returned HTTP 403;
+- ECR is private, immutable-tagged, AES-256 encrypted, scan-on-push enabled,
+  and governed by the intended lifecycle policy;
+- the single-node Valkey 8 replication group is available on
+  `cache.t4g.medium`, TLS-required, encrypted at rest, private-subnet-only, and
+  has no replica, failover, Multi-AZ, or snapshots;
+- the ALB is active and the Fargate target is healthy;
+- a post-foundation refresh plan reported no changes.
+
+Immutable publication evidence:
+
+- S3 generation `20260731T192746Z-0d1a923` contains exactly 30 objects: the 29
+  manifest-declared files plus `manifest.json`;
+- the 29-file payload is 379,777,487 bytes and every local manifest size and
+  SHA-256 digest was verified before upload;
+- ECR tag `0d1a923424d074dfbfba26ea4c88ab355b1714d6` is immutable and resolves to
+  image-index digest
+  `sha256:e190a0eef85ed883b4c1a59132cb7bae14bd4dd937c4e63c2374156f30473c63`;
+- the Linux AMD64 child digest is
+  `sha256:eaf401482ae0a5d8843bce1f406252fcedb0c97ef36724194e5a3a81d7fde8d3`;
+- ECR's basic scan completed. It reported 3 critical, 5 high, and 3 medium
+  package findings, predominantly against Debian's essential `perl-base`.
+  Sift does not invoke Perl, the container is non-root, and this remains a
+  recorded short-lived-showcase residual risk rather than a hidden clean scan.
+
+The one-off materialization task downloaded and verified the real S3
+generation, activated Redis schema 7 with the expected counts, passed the skew
+check over 100 pairs / 7,300 values, and exited 0. The continuously running API
+uses the same image and generation. `/health` and representative recommendations
+both succeed through the public ALB.
+
+### Phase 6 — GitHub Actions OIDC
+
+Terraform now defines:
+
+- the account's GitHub OIDC provider;
+- one deploy role whose trust policy requires audience `sts.amazonaws.com` and
+  exact subject `repo:parthkotwal/sift:ref:refs/heads/aws`;
+- an inline policy limited to pushing the Sift ECR repository, registering an
+  ECS task definition, updating only the Sift ECS service, passing only the two
+  Sift task roles to `ecs-tasks.amazonaws.com`, and reading target health;
+- a manual workflow that runs the locked test/lint/type-check gates, builds and
+  pushes Linux AMD64 under `github.sha`, registers a new task revision, waits
+  for service stability, and requires every registered ALB target to be healthy.
+
+The inspected OIDC plan contained exactly three resource creates, zero changes,
+and zero destroys. It applied successfully. The workflow still needs its first
+manual end-to-end run after this commit is pushed.
+
+### Phase 7 — cloud validation and measured envelope
+
+An early 1-vCPU / 2-GiB exploratory run established that the task was too small.
+The deployed value size is one 2-vCPU / 4-GiB Linux AMD64 task and one Uvicorn
+worker. A deterministic 1,000-request run through the public ALB at concurrency
+4, on a quiet client host, completed with zero request failures:
+
+| Stage | p50 | p95 | p99 |
+| --- | ---: | ---: | ---: |
+| Retrieval | 2.83 ms | 40.92 ms | 72.03 ms |
+| Feature lookup | 69.98 ms | 104.52 ms | 121.11 ms |
+| Ranking | 35.04 ms | 69.21 ms | 81.47 ms |
+| Rerank | 1.38 ms | 19.22 ms | 32.63 ms |
+| Application total | 125.29 ms | 163.71 ms | 189.56 ms |
+| Client wall through ALB | 224.11 ms | 325.29 ms | 353.07 ms |
+
+The cloud run is an honest `MISS` against the desktop `<100 ms` application p99
+contract: 777/1,000 requests exceeded 100 ms. A controlled 4-vCPU / 8-GiB test
+also missed (217.21 ms application p99), while cache engine CPU stayed below
+1%, data-memory usage stayed near 45%, and service memory was low. The service
+was therefore returned to 2 vCPU / 4 GiB instead of paying for an ineffective
+vertical resize.
+
+The first request after the connection-safe 2-vCPU task rollout measured
+556.54 ms inside the funnel and 1.26 s at the client; the immediate warm request
+measured 46.52 ms inside the funnel. Cold initialization is intentionally
+reported separately.
+
+The original Uvicorn `httptools` backend reproducibly truncated mid-sized ALB
+responses when the client sent `Connection: close`, which Python `urllib` does.
+The container command now selects Uvicorn `h11` and uses a 65-second backend
+keep-alive, longer than the ALB's 60-second idle window. Six consecutive copies
+of the formerly failing request then returned their full declared bodies, and
+the 1,000-request benchmark had zero transport errors. This is deployment
+configuration only; `src/sift/**` remains unchanged.
+
 ### Current one-day price envelope
 
 Public on-demand prices were queried through the AWS Price List API on
@@ -524,55 +624,42 @@ Public on-demand prices were queried through the AWS Price List API on
 
 - the foundation's fixed 24-hour subtotal is `$2.02800`: Valkey medium
   `$1.24800`, ALB base `$0.54000`, and two ALB public IPv4 addresses `$0.24000`;
-- with one API task running for the full 24 hours, the fixed subtotal becomes
-  `$3.33288`: Fargate 1-vCPU compute adds `$0.97152`, 2-GiB memory adds
-  `$0.21336`, and its public IPv4 address adds `$0.12000`;
+- with the deployed 2-vCPU / 4-GiB API task and its public IPv4 address, the
+  fixed subtotal is `$4.51776` per 24 hours;
 - one continuously consumed ALB LCU would add `$0.19200` per 24 hours. Actual
-  LCU, log ingestion, requests, and transfer depend on traffic;
-- the local artifact and image sizes imply only about `$0.001173` of combined
-  S3/ECR storage for 24 hours at current first-tier rates, before requests;
-- the one-off materialization task adds only its runtime Fargate/IP usage;
-- a practical light-testing expectation is therefore the fixed `$3.33288`
-  live subtotal plus usage-based LCU, logs, requests, and transfer. Re-query and
-  recalculate if the apply date changes.
+  LCU, log ingestion, requests, image/artifact storage, and transfer depend on
+  usage;
+- one-off materialization and controlled sizing tests add only their measured
+  Fargate/public-IP runtime.
 
 The billing/cost skill supplied the current-date, Price List, and deterministic
-calculation rules used here. No budget, billing, or AWS resource was changed.
+calculation rules used here. No budget or billing configuration was changed.
 
 ## AWS resource state
 
-No AWS infrastructure has been created by this lane yet:
+The showcase is live and billable. Terraform local state and its backup exist
+under `infra/terraform/` and are gitignored. Preserve them until verified
+teardown succeeds.
 
-- no VPC, subnets, route tables, or security groups;
-- no S3 artifact bucket;
-- no ECR repository or pushed image;
-- no ECS cluster, task definition, service, or running task;
-- no ALB;
-- no ElastiCache node;
-- no CloudWatch log group;
-- no GitHub OIDC role.
-
-Therefore there are currently no deployment resources to tear down and no
-deployment-generated AWS service charges to preserve.
+Live resources include the Terraform-managed VPC/network rules, private S3
+bucket, private ECR repository, private Valkey node, two short-retention log
+groups, ECS cluster/task definitions/service, internet-facing ALB, ECS task and
+execution roles, GitHub OIDC provider, and GitHub deploy role. One 2-vCPU /
+4-GiB API task is continuously running. Do not destroy any of them until the
+user explicitly asks to take the showcase down.
 
 ## Exact next action
 
-Commit and push the schema-7 integration, local proof, and measured cache
-capacity correction. Then obtain explicit user approval for the first billable
-foundation apply. After approval, create and audit a fresh saved foundation
-plan, apply that exact plan, retain its local Terraform state, and verify every
-created resource before publishing the already-verified image or generation.
+Commit and push the OIDC workflow, deployment-safe Uvicorn backend, and this
+evidence update. Manually dispatch the workflow from the `aws` branch, watch it
+through tests/build/push/ECS stability/target health, reconcile its immutable
+image tag into local Terraform state, then finish the public-port/privacy checks
+and a fresh no-drift plan.
 
 ## Remaining phases
 
-- Phase 3: Terraform networking, IAM, private S3/ECR, ElastiCache, ECS, ALB, and
-  CloudWatch logs.
-- Phase 4: package and upload one immutable generation; run and verify the
-  one-off Redis materialization task.
-- Phase 5: push the image, deploy one API task, and verify ALB health and
-  recommendation traffic.
-- Phase 6: GitHub Actions OIDC build/push/deploy workflow.
-- Phase 7: ALB benchmark with independently stated task size and offered
-  concurrency, plus privacy/network checks.
-- Phase 8: preserve non-sensitive evidence, destroy paid resources, and confirm
-  teardown and billing views.
+- Phase 6: complete the first manual OIDC workflow run and reconcile Terraform.
+- Phase 7: finish direct-port, Redis-private, no-data-committed, log, and
+  no-drift checks.
+- Phase 8: only after the user asks, preserve final evidence, destroy paid
+  resources, and verify teardown and billing views.
