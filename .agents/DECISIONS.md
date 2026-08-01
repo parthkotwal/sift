@@ -494,3 +494,11 @@ configured environment value rather than verify what OpenBLAS actually loaded.
 measure. The $10 lifetime ceiling uses an $8 operational stop point, preserving $2 for
 billing lag. No higher daily-rate topology becomes the showcase default without the
 author's explicit approval.
+
+**Outcome:** the probe observed two logical CPUs and an automatic two-thread OpenBLAS
+pool. Pinning one worker to one BLAS thread reduced closing-connection `server_ms` p99
+from 81.05/175.32/317.24ms at concurrency 1/2/4 to
+34.80/71.94/173.88ms. Two warmed workers with the same pin were slower at
+57.39/110.05/239.74ms and doubled service memory. Therefore the selected topology is
+one Uvicorn worker with `OPENBLAS_NUM_THREADS=1`. The optional two-task cell was skipped
+because process-per-core was not promising, exactly as the conditional matrix specified.

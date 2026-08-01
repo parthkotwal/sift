@@ -33,14 +33,12 @@ bundles, private endpoints, or credentials in this file.
   interface and intended caller here, then ask the core coding agent to provide
   it. Do not patch around the boundary in `src/sift/**`.
 - There is no missing application interface blocking the AWS lane. The cloud
-  latency miss and cold-start behavior are recorded as coding-agent follow-ups
-  in `AWS_ISSUES.md` (AWS-I1 and AWS-I2).
-- Coordination note: `origin/main` was observed at `fd3cede` after this branch
-  diverged. It includes D31 (`5b6dcb2`): Redis schema 7, catalog-wide item and
-  business records, and a measured desktop supported concurrency of 8. The
-  network slice is independent of that change. Before publishing an artifact
-  generation or deploying ECS, integrate current `main` and rerun the complete
-  package/container/skew smoke against schema 7.
+  concurrency-4 miss and cold-start behavior remain coding-agent follow-ups in
+  `AWS_ISSUES.md` (AWS-I1 and AWS-I2).
+- Current `main` through `3e1ba04` is merged. The deployed image includes the
+  exact-k response contract, corrected middleware `server_ms`, fixed-rate load
+  generation, and opt-in sub-stage timings. The merged branch passed 246 tests,
+  Ruff, strict mypy, Terraform validation, and a Linux AMD64 container build.
 
 ## Fixed deployment decisions
 
@@ -49,10 +47,10 @@ bundles, private endpoints, or credentials in this file.
 | AWS identity | Keep the existing identity: account `442042531996`, IAM user ARN `arn:aws:iam::442042531996:user/parth`. |
 | Region | `us-west-2`. |
 | Infrastructure as code | Terraform. Installed CLI: `v1.15.8` on `darwin_arm64`. The CLI has no usage charge; provisioned AWS resources do. |
-| Environment lifetime | Short-lived showcase, approximately one day, followed by verified teardown. |
+| Environment lifetime | Short-lived showcase. Visible expiry: 2026-08-01 18:00 PDT, followed by user-authorized verified teardown. Hard lifetime ceiling `$10`; operational stop `$8` to reserve `$2` for billing lag. |
 | Runtime | One Linux container image for both the API and one-off Redis materialization commands. |
-| Compute | ECS on Fargate, one API task initially, one Uvicorn worker per task. Size from measurement rather than inheriting the plan's 0.5 vCPU / 1 GB example. |
-| Network | ALB in public subnets; ECS API tasks use public IPs for AWS egress; ElastiCache is private; no NAT Gateway. |
+| Compute | ECS on Fargate, one 2-vCPU / 4-GiB API task, one Uvicorn worker, and `OPENBLAS_NUM_THREADS=1`, selected by the controlled matrix rather than assumed. |
+| Network | ALB in public subnets with explicit `/32` caller ingress; dedicated restricted benchmark-client security group; ECS API tasks use public IPs for AWS egress; ElastiCache is private; no NAT Gateway. |
 | Durable artifacts | Private S3 immutable generation prefixes. Redis remains rebuildable and non-durable. |
 | Managed cache | One private Valkey 8 `cache.t4g.medium` node, using the Redis protocol over TLS. Schema-7 publication used 1.04 GiB locally, which ruled out the earlier micro and left too little headroom on small. No replica, Multi-AZ failover, or snapshots. |
 | Registry | Private ECR repository with Git-SHA image tags. |
@@ -607,58 +605,65 @@ End-to-end proof:
   revision 5. A final refresh plan reports no changes, so local state once
   again owns the image the workflow deployed.
 
+The corrected serving revision was subsequently deployed by workflow run
+`30677517131` from immutable Git SHA
+`aae459ece593868dd2cc323d5ebdaf4b01d7eccc`. All quality gates, OIDC exchange,
+Linux AMD64 build/push, ECS stability wait, and target-health verification
+passed. ECR resolves that tag to digest
+`sha256:4e2d264552e3ca6648089f074ca2b3d58c46e2fb04709ea64fe32e5c26f567ba`.
+Terraform was reconciled to the same SHA before any runtime experiment.
+
 ### Phase 7 — cloud validation and measured envelope
 
-An early 1-vCPU / 2-GiB exploratory run established that the task was too small.
-The deployed value size is one 2-vCPU / 4-GiB Linux AMD64 task and one Uvicorn
-worker. A deterministic 1,000-request run through the public ALB at concurrency
-4, on a quiet client host, completed with zero request failures:
+A runtime probe established the actual Fargate boundary before measurement. The
+2-vCPU task sees two logical CPUs; its unpinned NumPy/OpenBLAS pool selected two
+threads, while `OPENBLAS_NUM_THREADS=1` produced an observed one-thread pool.
+Access logs include process IDs. Before the two-worker cell, 101 discarded
+warmup requests reached both workers (41 and 60 respectively).
 
-| Stage | p50 | p95 | p99 |
-| --- | ---: | ---: | ---: |
-| Retrieval | 2.83 ms | 40.92 ms | 72.03 ms |
-| Feature lookup | 69.98 ms | 104.52 ms | 121.11 ms |
-| Ranking | 35.04 ms | 69.21 ms | 81.47 ms |
-| Rerank | 1.38 ms | 19.22 ms | 32.63 ms |
-| Application total | 125.29 ms | 163.71 ms | 189.56 ms |
-| Client wall through ALB | 224.11 ms | 325.29 ms | 353.07 ms |
+Every binding cell used the same immutable image and artifact generation,
+1,000 deterministic requests, the corrected whole-request `server_ms` clock,
+and both closing and persistent connections. Values are server p99 / achieved
+closed-loop throughput:
 
-The cloud run is an honest `MISS` against the desktop `<100 ms` application p99
-contract: 777/1,000 requests exceeded 100 ms. A controlled 4-vCPU / 8-GiB test
-also missed (217.21 ms application p99), while cache engine CPU stayed below
-1%, data-memory usage stayed near 45%, and service memory was low. The service
-was therefore returned to 2 vCPU / 4 GiB instead of paying for an ineffective
-vertical resize.
+| Runtime cell | c1 close | c2 close | c4 close | c1 keep-alive | c2 keep-alive | c4 keep-alive |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 worker, BLAS auto (2) | 81.05 ms / 16.6/s | 175.32 ms / 18.2/s | 317.24 ms / 21.0/s | 79.78 ms / 16.9/s | 174.37 ms / 18.4/s | 329.42 ms / 21.1/s |
+| 1 worker, BLAS 1 | 34.80 ms / 37.7/s | 71.94 ms / 47.9/s | 173.88 ms / 45.0/s | 34.44 ms / 38.5/s | 73.93 ms / 47.3/s | 171.75 ms / 44.8/s |
+| 2 warmed workers, BLAS 1 | 57.39 ms / 22.3/s | 110.05 ms / 29.2/s | 239.74 ms / 29.5/s | 55.62 ms / 23.7/s | 97.55 ms / 28.5/s | 244.23 ms / 29.9/s |
 
-The first request after the connection-safe 2-vCPU task rollout measured
-556.54 ms inside the funnel and 1.26 s at the client; the immediate warm request
-measured 46.52 ms inside the funnel. Cold initialization is intentionally
-reported separately.
+The selected topology is one worker with one BLAS thread. It preserves the
+concurrency-1 stage tripwires, passes the whole-request contract through
+concurrency 2, and is materially faster than two workers. The optional two
+1-vCPU-task cell was not run because the agreed matrix made it conditional on a
+promising two-worker result. This avoided increasing the daily run rate without
+evidence.
 
-The original Uvicorn `httptools` backend reproducibly truncated mid-sized ALB
-responses when the client sent `Connection: close`, which Python `urllib` does.
-The container command now selects Uvicorn `h11` and uses a 65-second backend
-keep-alive, longer than the ALB's 60-second idle window. Six consecutive copies
-of the formerly failing request then returned their full declared bodies, and
-the 1,000-request benchmark had zero transport errors. This is deployment
-configuration only; `src/sift/**` remains unchanged.
+The exact UTC matrix windows were 01:34:53–01:40:19 for the unpinned baseline,
+01:44:41–01:47:03 for the selected cell, and 01:52:40–01:56:27 for two workers.
+Ordinary `AWS/ECS` service metrics showed peak CPU of 98.68%, 99.99%, and 98.13%
+respectively; peak memory was 5.79%, 6.29%, and 10.94%. These are useful
+one-minute service/task aggregates with one desired task, but they cannot show
+individual cores or processes.
 
-Final privacy and operability checks:
+Corrected fixed-rate scheduling on the selected topology sustained 20.0
+requests/s with 77.06 ms server p99 and a client that kept its schedule. At a
+requested 30/s, queueing grew into seconds and the bounded client eventually
+fell 500 ms behind, so it proves overload rather than a valid 30/s capacity.
+A 100-request diagnostic sample placed the largest median sub-stages in the
+DuckDB feature query (15.69 ms), relation loading (8.09 ms), and LightGBM
+prediction (18.06 ms). The corresponding p99s were 28.38, 14.89, and 32.39 ms.
 
-- direct access to the running task's public IPv4 on port 8000 timed out;
-- the ECS security group admits port 8000 only from the ALB security group;
-- the Valkey endpoint does not resolve on the public client, direct port 6379
-  is blocked, and the Redis security group admits 6379 only from the ECS task
-  security group;
-- the S3 manifest returned HTTP 403 anonymously;
-- the latest API log stream contains 22 events and the materialization stream
-  contains 13 events, both in three-day-retention log groups;
-- no file below `data/`, Terraform state, saved plan, or deployment auto-tfvars
-  is tracked by Git;
-- `/health` returns 200 through the ALB, a closed-connection recommendation
-  returns all ten results, and its immediate warm application total was
-  74.10 ms;
-- the final Terraform refresh plan reports `No changes`.
+The h11 backend, 65-second backend keep-alive, and full-body closing-client
+regression path remained intact. All measured requests were decoded completely;
+there were no transport errors. The ALB's former `0.0.0.0/0` rule was replaced
+with one authorized `/32`, and Terraform now has no public default. A dedicated
+benchmark security group reaches only ALB port 80 and AWS HTTPS endpoints.
+Plain HTTP remains an explicitly accepted short-lived residual risk.
+
+Terraform owns the selected image and topology at API task revision 12. The
+target is healthy, the runtime probe reports one worker and one BLAS thread, and
+a final refresh plan reports `No changes`.
 
 ### Current one-day price envelope
 
@@ -676,7 +681,16 @@ Public on-demand prices were queried through the AWS Price List API on
   Fargate/public-IP runtime.
 
 The billing/cost skill supplied the current-date, Price List, and deterministic
-calculation rules used here. No budget or billing configuration was changed.
+calculation rules used here. Cost Explorer reported only `$0.00044065` of older
+S3 usage because current-day deployment charges had not landed. A conservative
+deterministic upper bound at 2026-07-31 19:07 PDT, including deliberately
+pessimistic duplicate-task allowance, benchmark clients, and three paid Cost
+Explorer API calls, is `$2.25`. That leaves `$5.75` before the operational `$8`
+stop and `$7.75` before the hard lifetime `$10` ceiling. Keeping the selected
+topology until the 2026-08-01 18:00 PDT expiry adds about `$4.31` of fixed-rate
+cost before variable LCU/log/storage/transfer charges. There is no AWS Budget;
+creating a notification requires an approved destination, and daily billing
+lag means it would be warning-only rather than enforcement.
 
 ## AWS resource state
 
@@ -684,20 +698,29 @@ The showcase is live and billable. Terraform local state and its backup exist
 under `infra/terraform/` and are gitignored. Preserve them until verified
 teardown succeeds.
 
-Live resources include the Terraform-managed VPC/network rules, private S3
+A final post-matrix state copy is stored outside the repository at
+`~/.codex/aws-state-backups/sift-showcase-20260731T1909PDT.tfstate`; its directory
+is mode 0700, the file is mode 0600, and its SHA-256 matches live state at
+`afed44d5c33e710caa95bd78bbf1e7243ca38d20bfa702863faeaad8e043beb6`.
+
+Live resources include the Terraform-managed VPC/network rules, dedicated
+benchmark client security group, private S3
 bucket, private ECR repository, private Valkey node, two short-retention log
 groups, ECS cluster/task definitions/service, internet-facing ALB, ECS task and
 execution roles, GitHub OIDC provider, and GitHub deploy role. One 2-vCPU /
-4-GiB API task is continuously running. Do not destroy any of them until the
-user explicitly asks to take the showcase down.
+4-GiB API task with one Uvicorn worker and one OpenBLAS thread is continuously
+running. All one-off benchmark tasks have exited. The live ALB caller ingress is
+one explicit `/32`, not `0.0.0.0/0`. Do not destroy any resource until the user
+explicitly asks to take the showcase down.
 
 ## Exact next action
 
-Keep the showcase live for the user. Preserve `infra/terraform/terraform.tfstate`
-and its backup. Do not run destroy until the user explicitly asks to take the
-showcase down. When asked, save any final non-sensitive evidence, enable the
-deliberate asset-deletion switch, inspect the destroy plan, destroy, and verify
-that every paid resource is gone.
+Keep the showcase live for the user, but treat 2026-08-01 18:00 PDT as the
+teardown decision deadline. Preserve `infra/terraform/terraform.tfstate` and
+the checksum-verified mode-0600 backup outside the repository. Do not run
+destroy until the user explicitly asks to take the showcase down. When asked,
+follow the exact inspected destroy-plan and independent post-destroy checklist
+in `infra/terraform/README.md`.
 
 ## Remaining phases
 

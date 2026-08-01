@@ -31,8 +31,8 @@ additional_tags = {
 # api_desired_count = 0
 # api_worker_count   = 1
 
-# Null is the observed-library baseline. Set exactly 1 for the controlled BLAS cells.
-# openblas_num_threads = 1
+# The measured default is one BLAS thread. Set null only to repeat the automatic-pool cell.
+# openblas_num_threads = null
 
 # Initial measurement envelope; valid pairs and either architecture are configurable.
 # fargate_cpu              = 1024

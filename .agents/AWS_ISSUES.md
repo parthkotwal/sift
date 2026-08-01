@@ -17,27 +17,39 @@ record contents, or artifact bundles in this file.
 
 ## Open
 
-### AWS-I1 — Fargate misses the established steady-state latency contract   [open]
+### AWS-I1 — The selected Fargate topology meets concurrency 2, not 4   [open]
 
-The final one-worker, 2-vCPU / 4-GiB task completed a deterministic 1,000-request
-run through the ALB at concurrency 4 with zero transport errors, but application
-p99 was 189.56 ms and 777/1,000 requests exceeded the `<100 ms` contract. Client
-wall p99 was 353.07 ms. Feature lookup was the largest median stage at 69.98 ms.
+A controlled matrix used the same immutable image and artifact generation, the
+corrected whole-request `server_ms` clock, and 1,000 requests per binding p99.
+The selected one-worker, 2-vCPU / 4-GiB task with
+`OPENBLAS_NUM_THREADS=1` measured 34.80 ms server p99 at concurrency 1 and
+71.94 ms at concurrency 2 with closing connections. At concurrency 4 it missed
+at 173.88 ms. Persistent connections produced the same conclusion: 34.44,
+73.93, and 171.75 ms respectively. All six runs completed without transport
+errors.
 
-A controlled 4-vCPU / 8-GiB run was worse at 217.21 ms application p99 while
-Valkey engine CPU remained below 1%, data-memory usage stayed near 45%, and task
-memory was low. The service was returned to 2 vCPU / 4 GiB because doubling the
-task cost did not solve the bottleneck.
+The unpinned one-worker baseline exposed a two-thread OpenBLAS pool and missed
+from concurrency 2 onward. Two warmed Uvicorn workers with one BLAS thread each
+were slower at every concurrency, doubled memory use, and regressed the
+single-concurrency ranking tripwire. The optional two-task cell was therefore
+not run: the review required it only if the worker experiment was promising.
 
-**Impact:** the showcase is healthy and functionally correct, but its cloud
-performance result is an explicit `MISS`, not a validated extension of the
-desktop envelope.
+A corrected open-loop run held 20.0 requests/s and passed at 77.06 ms server
+p99. At 30 requests/s the service accumulated seconds of queueing and the
+bounded client eventually fell behind its own schedule, so that run establishes
+overload rather than a valid 30 requests/s capacity result. Standard ECS metrics
+showed service CPU peaking near 100% while memory stayed below 7% for the selected
+cell; those metrics are one-minute task/service aggregates, not per-core or
+per-process evidence.
 
-**Next investigation:** the application lane should profile the feature-store /
-DuckDB path, Python scheduling, and per-request work under Linux/Fargate before
-another infrastructure resize. Cross-AZ placement can add noise because the
-single Valkey node occupies one AZ while ECS can place the task in either public
-subnet, but the measurements do not support treating placement as the root cause.
+**Impact:** the deployed topology is a measured improvement and a valid
+concurrency-2 service, but the desktop concurrency-4 promise is not established
+on this Fargate size.
+
+**Next investigation:** the diagnostic 100-request `detail=true` sample places
+most median time in `feature.duckdb_query`, `feature.load_relations`, and
+`ranking.predict`. The application lane should use those sub-stages before any
+further resize or topology change.
 
 ### AWS-I2 — The first recommendation after rollout pays a large cold cost   [open]
 
@@ -58,10 +70,15 @@ interact with the one-task rollout gap in AWS-I4.
 
 ### AWS-I3 — The deployed base image has unresolved ECR scan findings   [open]
 
-ECR basic scanning completed for both published images and reported 3 critical,
-5 high, and 3 medium package findings, predominantly against Debian's essential
-`perl-base`. Sift does not invoke Perl and runs as a non-root user, which reduces
-exposure but does not make the findings disappear.
+ECR basic scanning completed for the selected immutable image and reported 3
+critical, 5 high, and 3 medium findings. Ten findings are against Debian `perl`
+`5.36.0-7+deb12u3`: CVE-2026-48961, CVE-2026-7017, CVE-2026-57432,
+CVE-2026-13221, CVE-2026-48959, CVE-2026-57433, CVE-2026-7010,
+CVE-2025-15649, CVE-2026-48962, and CVE-2026-12087. The remaining medium
+finding is CVE-2026-13595 in `util-linux` `2.38.1-5+deb12u3`. ECR did not report
+a fixed package version for these findings. Sift does not invoke Perl and runs
+as a non-root user, which reduces exposure but does not make the findings
+disappear.
 
 **Impact:** this is accepted residual risk for the short-lived showcase, not a
 clean security scan or a production-ready image assessment.
@@ -91,10 +108,11 @@ gitignored. They currently own the live showcase. Losing them would not delete
 AWS resources, but it would make the planned, verified teardown substantially
 harder and increase the risk of leaving billable resources behind.
 
-**Guardrail:** preserve `infra/terraform/terraform.tfstate` and its backup; never
-commit them; do not run `terraform destroy` until the user explicitly asks to take
-the showcase down. Before teardown, inspect the destroy plan, enable the deliberate
-asset-deletion switch, apply, and independently verify that paid resources are gone.
+**Guardrail:** preserve `infra/terraform/terraform.tfstate` and the mode-0600
+checksum-verified backup outside the repository; never commit them. The visible
+expiry is 2026-08-01 18:00 PDT. Do not run `terraform destroy` until the user
+explicitly asks to take the showcase down. Before teardown, follow the exact
+destroy-plan and independent post-destroy checklist in `infra/terraform/README.md`.
 
 ### AWS-I6 — GitHub Actions currently emits a Node runtime deprecation warning   [open]
 
@@ -105,6 +123,19 @@ Node.js 20 and forced them onto Node.js 24. This did not affect the deployment.
 warning, keeping the workflow definition on `main` and `aws` synchronized. Rerun
 the complete manual workflow after the update; do not change a working deployment
 solely to suppress an annotation without that validation.
+
+### AWS-I15 — The restricted endpoint still uses plain HTTP   [accepted]
+
+The unrestricted `0.0.0.0/0` listener rule was removed. Terraform now requires
+explicit ingress CIDRs, and the live caller rule is a single authorized `/32`.
+Short-lived load clients use a separate security group that can reach only ALB
+port 80 and public HTTPS endpoints required for ECR and CloudWatch. Direct ECS
+port 8000 and Valkey remain private to their security-group relationships.
+
+The ALB listener is still HTTP because this one-day deployment has no approved
+domain or ACM certificate. Restricting ingress and lifetime materially reduces
+exposure, but it does not provide transport confidentiality and must not be
+described as production-ready HTTPS.
 
 ---
 
@@ -203,10 +234,11 @@ Retain the cheaper measured baseline while the actual stage bottleneck is profil
 ### AWS-I14 — A Fargate probe through the public ALB was a misleading diagnostic   [fixed]
 
 A one-off task in the service VPC timed out when it tried to reach the
-internet-facing ALB by its public DNS path. That hairpin-style route was not useful
-for isolating the client-close reset and did not prove the API target was unhealthy.
-The task exited without changing infrastructure; external ALB probes and direct
-local-container reproduction were used instead.
+internet-facing ALB by its public DNS path. Security-group references match
+private addresses, not a Fargate task's translated public source address. The
+controlled matrix instead used a dedicated benchmark security group and one
+private ALB node address, retaining the ALB listener/h11 path without reopening
+world ingress.
 
 **Lesson:** choose a probe path that matches the hypothesis. A task-to-public-ALB
 timeout is not interchangeable with external client behavior or direct target
@@ -218,6 +250,9 @@ behavior.
 
 - The showcase is live and billable; keep it running until the user explicitly
   requests teardown.
+- Treat `$8` as the operational stop point for the lifetime `$10` ceiling, leaving
+  at least `$2` for billing lag; do not use Cost Explorer's current-day silence as
+  proof that today's resources are free.
 - Deploy only immutable Git-SHA image tags and immutable S3 generations.
 - Preserve local Terraform state, delete saved plan files after review/use, and
   require a clean refresh plan after any out-of-band workflow deployment.

@@ -196,9 +196,9 @@ variable "api_worker_count" {
 }
 
 variable "openblas_num_threads" {
-  description = "Optional OpenBLAS thread cap; null preserves library auto-detection for the baseline."
+  description = "OpenBLAS thread cap selected by the runtime matrix; null is retained only for an explicit auto-detection experiment."
   type        = number
-  default     = null
+  default     = 1
   nullable    = true
 
   validation {

@@ -143,19 +143,20 @@ and TLS Redis environment contract. The API task pins one Uvicorn worker and
 writes to the API log group. The one-off materialization task runs publication
 and the 100-pair skew check in sequence and writes to its own log group.
 
-The runtime matrix may set `api_worker_count` to two and may pin
-`openblas_num_threads = 1`; neither is a default or an assumed improvement. A
+The controlled runtime matrix selected one Uvicorn worker and
+`openblas_num_threads = 1`, which are now the defaults. Two workers and a null
+automatic-pool value remain available only to reproduce the experiment. A
 startup probe records the task-visible logical CPU count, the BLAS environment,
 and NumPy's runtime report. Access logs include the serving process ID so a
 multi-worker run can prove that every worker received discarded warmup traffic
 before its measured 1,000 requests. Keep the `h11` backend, 65-second keep-alive,
 and full-body closing-connection regression check in every cell.
 
-The initial measurement envelope is x86-64, 1 vCPU, and 2 GiB. Architecture,
-CPU, and memory remain validated inputs so the deployed task can match the CI
-image and be resized from cloud measurements. The API service uses public
-subnets and an explicit public IP only for outbound AWS access; port 8000 still
-accepts traffic solely from the ALB security group.
+The selected measured envelope is x86-64, 2 vCPU, 4 GiB, one Uvicorn worker,
+and one OpenBLAS thread. Architecture, CPU, memory, worker count, and native
+thread count remain validated inputs so a future experiment is explicit. The
+API service uses public subnets and an explicit public IP only for outbound AWS
+access; port 8000 still accepts traffic solely from the ALB security group.
 
 Activation has three deliberate states:
 
@@ -174,3 +175,51 @@ it does not hide the catalog initialization paid by the first recommendation.
 `ecs_cluster`, `ecs_deployment`, `ecs_run_task_network`, and
 `benchmark_run_task_network` expose the identifiers needed for deployment,
 materialization, and reproducible short-lived benchmark clients.
+
+## Inspected teardown procedure
+
+Teardown is user-authorized work. The expiry tag is a reminder, not permission
+for an automatic deletion script. Run these steps only after the user asks to
+take the showcase down.
+
+1. Confirm the AWS caller is account `442042531996`, preserve final
+   non-sensitive evidence, and make a new mode-0600 copy of
+   `terraform.tfstate` outside the repository. Record and verify its SHA-256.
+2. Keep the ignored deployment selection intact. Generate the destroy plan with
+   deliberate deletion of the reproducible S3/ECR assets enabled:
+
+   ```bash
+   terraform -chdir=infra/terraform plan \
+     -destroy \
+     -var='allow_asset_deletion=true' \
+     -out=destroy.tfplan
+   ```
+
+3. Inspect both the human plan and `terraform show -json destroy.tfplan`.
+   Every managed action must be deletion-only. Confirm it includes the ECS
+   service/tasks, ALB/listener/target group, Valkey replication group, S3
+   bucket, ECR repository, log groups, public networking, IAM roles/policies,
+   and GitHub OIDC provider. Stop on any create/update action or missing paid
+   resource.
+4. Apply that exact saved plan, then delete `destroy.tfplan`. Do not substitute
+   ad-hoc AWS deletion commands; they would create Terraform drift and make a
+   partial teardown harder to diagnose.
+5. Verify independently after provider completion and eventual-consistency
+   settling:
+
+   - `terraform state list` is empty;
+   - ECS lists no running or pending Sift tasks and no active Sift service;
+   - the Sift ALB/target group and their network interfaces are absent;
+   - the Valkey replication group is absent;
+   - the S3 bucket and ECR repository are absent;
+   - the two Sift CloudWatch log groups are absent;
+   - no NAT Gateway exists and the showcase VPC/subnets/security groups are
+     absent;
+   - the Sift ECS/GitHub IAM roles and GitHub OIDC provider are absent;
+   - Resource Groups Tagging API returns no remaining resources tagged
+     `Project=sift` and `Environment=showcase` after a second check.
+
+Cost Explorer and AWS Budgets lag behind deletion, so a nonzero or missing
+same-day billing value is not a teardown verdict. Preserve the empty state and
+protected pre-destroy backup until the independent checks are recorded; decide
+separately when to remove the historical backup.
