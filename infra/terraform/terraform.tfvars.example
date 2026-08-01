@@ -1,0 +1,40 @@
+# Defaults already target the agreed one-day showcase environment.
+# Copy to terraform.tfvars only to override them; that local file is ignored.
+
+aws_region   = "us-west-2"
+project_name = "sift"
+environment  = "showcase"
+vpc_cidr     = "10.42.0.0/20"
+
+# Required: replace this documentation-only address with the caller's public /32.
+# Unrestricted 0.0.0.0/0 exposure is not a safe showcase default.
+alb_ingress_cidrs = ["203.0.113.10/32"]
+
+# Keep false until Phase 8 explicitly decides to delete deployment assets.
+allow_asset_deletion = false
+
+elasticache_engine_version     = "8.0"
+elasticache_node_type          = "cache.t4g.medium"
+cloudwatch_log_retention_days  = 3
+
+additional_tags = {
+  Purpose   = "portfolio-showcase"
+  ExpiresAt = "2026-08-01T18:00:00-07:00"
+}
+
+# Leave both unset for the foundation-only plan. Activate task definitions and
+# the zero-task API service only after this exact image and generation exist.
+# deployment_image_tag = "0123456789abcdef0123456789abcdef01234567"
+# artifact_generation  = "20260731T120000Z-0123456"
+
+# Keep zero until the one-off materialization task and skew verification pass.
+# api_desired_count = 0
+# api_worker_count   = 1
+
+# The measured default is one BLAS thread. Set null only to repeat the automatic-pool cell.
+# openblas_num_threads = null
+
+# Initial measurement envelope; valid pairs and either architecture are configurable.
+# fargate_cpu              = 1024
+# fargate_memory           = 2048
+# fargate_cpu_architecture = "X86_64"

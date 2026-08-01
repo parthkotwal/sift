@@ -145,6 +145,23 @@ finish safely.
 
 **Own it:** *Why budget and measure per stage instead of one end-to-end number?*
 
+## Process concurrency vs. native thread pools
+
+**What:** A Python service can multiply concurrency at several layers: server worker
+processes, framework request threads, and native thread pools inside NumPy/OpenBLAS,
+DuckDB, or LightGBM. Those layers multiply rather than replace one another. Two server
+workers each allowing a ten-thread BLAS call can offer twenty native threads to a
+two-vCPU task, creating contention even though the Python code looks single-threaded.
+
+**Here:** DuckDB and LightGBM are already pinned to one thread per request. NumPy's
+OpenBLAS pool was not controlled, so the AWS runtime matrix records the task-visible CPU
+count and the loaded library's actual thread count with `threadpoolctl`, then compares
+automatic OpenBLAS against `OPENBLAS_NUM_THREADS=1` before considering more Uvicorn
+workers or tasks. One variable changes per cell.
+
+**Own it:** *Why can adding a worker make p99 worse on a two-vCPU task, and what must be
+measured before claiming process-per-core helps?*
+
 ## Idempotency
 
 **What:** Running the same job on the same input twice yields the same result — no duplicates, no drift. Achieved by deterministic transforms + overwrite-by-partition (never blind append).

@@ -11,6 +11,20 @@ venv/
 .ipynb_checkpoints/
 scratch/
 
+# Terraform — local state is retained until teardown succeeds, never committed.
+**/.terraform/*
+*.tfstate
+*.tfstate.*
+*.tfplan
+crash.log
+crash.*.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+terraform.tfvars
+*.auto.tfvars
+
 # OS / editor
 .DS_Store
 

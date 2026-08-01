@@ -10,11 +10,13 @@ requires-python = ">=3.12"
 # the `training` group below — asserting that the API does not *import* them is not the
 # same as not *installing* them, and only the second one shrinks the image.
 dependencies = [
+    "boto3>=1.40,<2",
     "duckdb>=1.5.5",
     "fastapi>=0.115",
     "lightgbm>=4.7.0",
     "numpy>=2.5.1",
     "redis>=5.2",
+    "threadpoolctl>=3.6,<4",
     "uvicorn[standard]>=0.34",
 ]
 
@@ -22,6 +24,7 @@ dependencies = [
 # Dev tooling. Runtime ML deps (implicit, LightGBM, ...)
 # are added at the build step that first needs them — every dep pays rent.
 dev = [
+    "boto3-stubs[s3]>=1.40,<2",
     "ruff>=0.9",
     "mypy>=1.14",
     "pytest>=8.3",
@@ -68,3 +71,4 @@ files = ["src", "tests"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["."]

@@ -466,3 +466,39 @@ ablations. PyTorch remains isolated to the explicitly attempted 5b offline stage
 **What this does not do.** It does not explain the Fargate result — it makes the result explainable. The competing hypotheses (GIL serialization, BLAS oversubscription, DuckDB coordination, plain CPU saturation) are now separable by measurement rather than by argument, which is the whole point of doing this before the worker/task matrix rather than after.
 
 **Costs, accepted.** Per-stage tripwires still sit on the five coarse stages, so the sub-stage numbers are diagnostic and unguarded; a regression inside `feature.duckdb_query` only trips a wire once it moves the stage. That is the right trade for numbers this new — a tripwire calibrated on one afternoon's measurement would flap — but it means they are evidence, not protection.
+
+## D35 — Worker topology is a measured matrix, with native threads made visible   [accepted] (2026-07-31)
+
+**Context:** the first Fargate run missed the `<100 ms` server-side p99 contract at
+concurrency 4. A second Uvicorn worker looked plausible on a 2-vCPU task, but NumPy uses
+OpenBLAS and had no thread limit. DuckDB and LightGBM being pinned did not constrain that
+third native pool. Choosing two workers first would change process count while leaving
+an unmeasured multiplier underneath it.
+
+**Choice:** keep one worker as the baseline and run a controlled matrix: one worker at
+concurrency 1/2/4 with automatic OpenBLAS; one worker with
+`OPENBLAS_NUM_THREADS=1`; then two workers with the same pin. Only if process-per-core is
+promising, compare two 1-vCPU / 2-GiB tasks with one worker each. Every binding p99 uses
+at least 1,000 requests, the corrected `server_ms` clock, throughput, funnel/sub-stage
+timings, ECS CPU/memory over a named window, and proof that every process/task received
+discarded warmup traffic. The image and artifact generation stay fixed across cells.
+
+**Make the hidden layer observable.** The image adds `threadpoolctl` as a direct runtime
+dependency. A startup probe records the task-visible logical CPU count, relevant thread
+environment, and the loaded native libraries' actual `num_threads`; access logs include
+the worker PID. This is the dependency's rent: without it, NumPy's runtime report warned
+that detailed pool information was unavailable, so the experiment could only repeat the
+configured environment value rather than verify what OpenBLAS actually loaded.
+
+**Cost boundary:** matrix cells replace one another and live only long enough to warm and
+measure. The $10 lifetime ceiling uses an $8 operational stop point, preserving $2 for
+billing lag. No higher daily-rate topology becomes the showcase default without the
+author's explicit approval.
+
+**Outcome:** the probe observed two logical CPUs and an automatic two-thread OpenBLAS
+pool. Pinning one worker to one BLAS thread reduced closing-connection `server_ms` p99
+from 81.05/175.32/317.24ms at concurrency 1/2/4 to
+34.80/71.94/173.88ms. Two warmed workers with the same pin were slower at
+57.39/110.05/239.74ms and doubled service memory. Therefore the selected topology is
+one Uvicorn worker with `OPENBLAS_NUM_THREADS=1`. The optional two-task cell was skipped
+because process-per-core was not promising, exactly as the conditional matrix specified.
