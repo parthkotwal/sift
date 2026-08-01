@@ -133,6 +133,22 @@ resource "aws_vpc_security_group_ingress_rule" "alb_from_benchmark" {
   to_port                      = 80
 }
 
+data "aws_ec2_managed_prefix_list" "cloudfront_origin_facing" {
+  filter {
+    name   = "prefix-list-name"
+    values = ["com.amazonaws.global.cloudfront.origin-facing"]
+  }
+}
+
+resource "aws_vpc_security_group_ingress_rule" "alb_from_cloudfront" {
+  security_group_id = aws_security_group.alb.id
+  prefix_list_id    = data.aws_ec2_managed_prefix_list.cloudfront_origin_facing.id
+  description       = "Authenticated CloudFront origin requests"
+  from_port         = 80
+  ip_protocol       = "tcp"
+  to_port           = 80
+}
+
 resource "aws_vpc_security_group_egress_rule" "benchmark_to_alb" {
   security_group_id            = aws_security_group.benchmark.id
   referenced_security_group_id = aws_security_group.alb.id

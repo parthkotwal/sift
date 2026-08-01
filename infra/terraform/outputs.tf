@@ -95,6 +95,11 @@ output "alb" {
   }
 }
 
+output "https_endpoint" {
+  description = "Restricted CloudFront HTTPS endpoint for the showcase API."
+  value       = "https://${aws_cloudfront_distribution.api.domain_name}"
+}
+
 output "ecs_cluster" {
   description = "ECS cluster used by the API service and one-off materialization tasks."
   value = {

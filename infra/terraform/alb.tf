@@ -43,7 +43,61 @@ resource "aws_lb_listener" "http" {
   protocol          = "HTTP"
 
   default_action {
+    type = "fixed-response"
+
+    fixed_response {
+      content_type = "application/json"
+      message_body = jsonencode({ detail = "Forbidden" })
+      status_code  = "403"
+    }
+  }
+}
+
+resource "aws_lb_listener_rule" "cloudfront_origin" {
+  listener_arn = aws_lb_listener.http.arn
+  priority     = 10
+
+  action {
     type             = "forward"
     target_group_arn = aws_lb_target_group.api.arn
+  }
+
+  condition {
+    http_header {
+      http_header_name = "X-Sift-Origin-Verify"
+      values           = [random_password.cloudfront_origin_header.result]
+    }
+  }
+}
+
+resource "aws_lb_listener_rule" "authorized_direct_callers" {
+  listener_arn = aws_lb_listener.http.arn
+  priority     = 20
+
+  action {
+    type             = "forward"
+    target_group_arn = aws_lb_target_group.api.arn
+  }
+
+  condition {
+    source_ip {
+      values = var.alb_ingress_cidrs
+    }
+  }
+}
+
+resource "aws_lb_listener_rule" "benchmark_clients" {
+  listener_arn = aws_lb_listener.http.arn
+  priority     = 30
+
+  action {
+    type             = "forward"
+    target_group_arn = aws_lb_target_group.api.arn
+  }
+
+  condition {
+    source_ip {
+      values = [var.vpc_cidr]
+    }
   }
 }
