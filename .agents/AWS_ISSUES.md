@@ -19,6 +19,17 @@ record contents, or artifact bundles in this file.
 
 ## Open
 
+**`[open]` here means "true of the showcase as it ran and never resolved" — not
+"outstanding work".** The deployment was destroyed on 2026-08-01, so none of these
+describes a live system, and none blocks the project's completion. They are the honest
+residual of a deliberately short-lived, single-task showcase: it was sized to answer a
+latency question cheaply, not to be highly available, hardened, or CVE-clean. Each entry
+records what was accepted and why, because a limitation someone can name and justify is
+worth more here than one quietly engineered away.
+
+If the showcase is ever redeployed, these become its opening backlog — starting with
+AWS-I2 (readiness/warmup), which is also the application lane's `ISSUES.md` I39.
+
 ### AWS-I1 — The selected Fargate topology meets concurrency 2, not 4   [open]
 
 A controlled matrix used the same immutable image and artifact generation, the

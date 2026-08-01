@@ -122,7 +122,15 @@ unreadable as a to-do list — they now move to *Fixed — kept because the fail
 recurs* as soon as they close, so anything appearing under this heading is genuinely open
 work rather than a record of finished work.
 
-### I38 — The concurrency ceiling is DuckDB, and it is not a lock   [open]
+**Open here means "known and not done", not "blocking".** Sift is a finished portfolio
+build, not a service under active operation: the AWS showcase was destroyed on
+2026-08-01, so nothing below is degrading a running system. Each entry states what would
+settle it, because a known limitation someone can articulate is a better artifact than a
+silent one — and because the reason each was left undone is itself the interesting part.
+The deployment-side counterparts (base-image CVEs, origin TLS, single-task availability)
+live in `AWS_ISSUES.md` as accepted showcase limitations.
+
+### I38 — The concurrency ceiling is DuckDB, and it is not a lock   [open, future work]
 
 Handed over from the AWS lane as "the concurrency-4 DuckDB/LightGBM bottleneck". Measured
 with D34's sub-stage timings, it is **DuckDB alone**. Local, one worker,
@@ -162,7 +170,41 @@ That is the cheapest place to look next: fewer statements per request, not more
 processes. It touches `store/read.py`, which owns the as-of join chokepoint, so it needs
 its own decision rather than an opportunistic edit.
 
-### I39 — `/health` reports ready before the process can serve   [open]
+**The cloud confirmed the diagnosis and added the layer this entry missed.** On Fargate,
+the largest median sub-stages were the DuckDB feature query (15.69ms) and relation loading
+(8.09ms) alongside LightGBM prediction (18.06ms) — DuckDB statement work dominating, as
+measured locally. But the AWS matrix found a native thread pool this entry had not
+counted: NumPy's OpenBLAS was selecting **2 threads** underneath the already-pinned DuckDB
+and LightGBM. Pinning it (`OPENBLAS_NUM_THREADS=1`) cut concurrency-4 server p99 from
+**317ms to 174ms**, while the second Uvicorn worker this entry predicted could not help
+was indeed *worse* (D35).
+
+That is the correction worth keeping: **this entry reasoned about the thread pools it knew
+about and concluded the ceiling was DuckDB alone.** It was right about DuckDB and wrong
+about completeness — there was a third multiplier one layer down, invisible until
+something measured what the library actually loaded rather than what the code configured.
+Pinning two of three native pools reads exactly like pinning all of them.
+
+Left as future work: the funnel still issues five DuckDB statements per request, three of
+which build temp tables holding one user's row. Fewer statements is the remaining lever,
+and it touches the as-of join chokepoint. No longer urgent — the deployment it would have
+served is gone.
+
+### I39 — `/health` reports ready before the process can serve   [open, deferred as future work]
+
+**Confirmed in the cloud, then deliberately not fixed.** Fargate measured the same shape
+larger: **673ms first request vs ~40ms warm**, of which 479ms was catalog construction and
+64ms rerank-input construction. So the local finding transferred, and the deployment's
+0/100 rollout percentages meant every release had a window where the only task had never
+served a request.
+
+It stays unfixed because the endpoint no longer exists — readiness would improve a service
+that was torn down on 2026-08-01, so building it now would be work with no observer. It is
+recorded as **the first bounded improvement before any redeployment**, not as a defect
+blocking completion. The measured cold cost and the reason `/health` means liveness rather
+than readiness are the durable output here; the fix is a semantic choice (warmup, a
+readiness condition distinct from liveness, loud failure on an unusable generation) that
+belongs to whoever owns the next deployment's health-check contract.
 
 The ALB health check passes as soon as the app is listening, but the first `/recommend`
 in a process pays the per-generation build. Measured locally on a fresh process:

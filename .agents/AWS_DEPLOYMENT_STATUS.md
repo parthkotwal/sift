@@ -1,5 +1,11 @@
 # AWS Deployment Status and Decisions
 
+> **STATUS: TORN DOWN (2026-08-01). Nothing in this document is running.** Every
+> endpoint, hostname, distribution, and ARN below is dead. The deployment was
+> destroyed to control cost after it had answered the question it was built for.
+> This file is a historical record and a reproduction recipe — read every present
+> tense in it as past tense. Re-deploying requires a new, explicit user request.
+>
 > **Purpose:** Shared handoff for every agent working on Sift's AWS lane.
 >
 > **Authority:** `.agents/AWS_DEPLOYMENT_PLAN.md` remains the deployment ground
@@ -9,7 +15,17 @@
 > **Issue ledger:** `.agents/AWS_ISSUES.md` records deployment failures, residual
 > risks, and operating traps that should survive the handoff.
 >
-> **Last updated:** 2026-08-01 on branch `aws`.
+> **Last updated:** 2026-08-01. Merged to `main`; the `aws` branch is no longer
+> the authority for this record.
+
+**Teardown independently re-verified on 2026-08-01 before this record was merged
+to `main`**, from the application lane rather than the lane that performed it:
+`ecs list-clusters`, `elbv2 describe-load-balancers`,
+`elasticache describe-replication-groups`, `ecr describe-repositories`,
+`cloudfront list-distributions`, and non-default `ec2 describe-vpcs` all returned
+empty in `us-west-2`, and no `sift` bucket appears in `s3api list-buckets`. The
+lane that tears something down is the worst-placed one to confirm it is gone, so
+the confirmation is recorded here by a second party.
 
 ## Update rule
 

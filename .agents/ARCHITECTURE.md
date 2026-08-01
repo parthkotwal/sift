@@ -131,9 +131,11 @@ Python · PyTorch (two-tower, step 5b only) · LightGBM · `implicit` ALS · Num
 
 ## Scope
 
-**In:** staged retrieval/ranking, hand-built feature store with point-in-time correctness and a leakage test, staged offline eval, per-stage latency instrumentation, reproducible local deploy (`docker compose up`).
+**In:** staged retrieval/ranking, hand-built feature store with point-in-time correctness and a leakage test, staged offline eval, per-stage latency instrumentation, reproducible local deploy (`docker compose up`), and a reproducible AWS deployment (`infra/terraform/`) that was run, measured, and destroyed.
 
 **Out:** UI beyond trivial, model experimentation/ablations, A/B infrastructure, streaming features, orchestrators, the social/people-matching layer.
+
+**Deployed once, deliberately not maintained.** The AWS showcase existed to answer one question the desktop could not — whether the latency contract survives hardware it did not inherit — and was torn down the same day. It is a single task with no high availability, an ephemeral IP-restricted posture rather than production hardening, and accepted base-image CVEs; those are limitations of a one-day showcase, not a backlog. The measured numbers, the topology matrix, and the falsified two-worker hypothesis are recorded in `DECISIONS.md` D35 and `AWS_DEPLOYMENT_STATUS.md`. What the deployment taught the *application* is the part that outlived it: the ceiling is DuckDB statement work, and native thread pools multiply against request concurrency (`ISSUES.md` I38).
 
 ## Extensibility: the embedding seam
 

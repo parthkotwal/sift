@@ -103,16 +103,35 @@ benchmark checks that envelope and refuses a verdict on a contended host; the bi
 result comes from deployment hardware rather than inheriting a noisy desktop
 measurement (`.agents/ISSUES.md` I31).
 
+**Concurrency 8 is a desktop number, and the cloud disagreed** — the 2-vCPU Fargate task
+met the contract through concurrency 2, not 8. That is not a regression; it is four
+performance cores versus two vCPUs, which is exactly why the contract names a concurrency
+instead of a bare p99. The desktop figure is kept as the regression profile, deliberately
+not weakened until the cloud passed, because a tripwire retuned to whatever hardware last
+ran it stops catching regressions.
+
 To check the latency contract, drive the running endpoint at a stated concurrency:
 
 ```bash
 uv run python -m sift.api.bench --concurrency 8 --check
 ```
 
-It reports per-stage p50/p95/p99 from the response's own breakdown plus client-side
-wall time, and gates on the budget. It also refuses to produce a verdict it cannot
-support — under 1,000 samples, or on a host busy enough that the numbers describe the
-machine rather than the code. Point `--url` at any deployment to measure it the same way.
+It reports per-stage p50/p95/p99 and gates on the budget, and it separates three clocks
+that answer different questions: the funnel's own `total_ms`, the whole server request
+(`server_ms`, from the middleware — this is what the contract is asserted on), and client
+wall time, which is reported but never asserted because through a load balancer it is
+mostly geography. Asserting the funnel clock would have let a change "meet" the contract
+by moving delay outside the timer (D34).
+
+`--rate` offers a fixed arrival schedule instead of the default closed loop, where
+throughput is `concurrency / latency` by construction and says nothing about capacity.
+`?detail=true` returns opt-in sub-stage timings for locating a cost the five stages are
+too coarse to explain.
+
+It also refuses to produce a verdict it cannot support — under 1,000 samples, on a host
+busy enough that the numbers describe the machine rather than the code, or against an
+endpoint too old to report `server_ms`. Point `--url` at any deployment to measure it the
+same way.
 
 For the in-process per-stage profile of a single warm thread:
 
@@ -124,6 +143,47 @@ That loop is single-threaded, so it profiles one thread rather than the server �
 is the record of what that hides, and why the benchmark above exists.
 
 Set `SIFT_REDIS_URL` to use a non-default Redis endpoint.
+
+## Deployed to AWS, then torn down
+
+**Nothing is running.** The showcase was deployed to AWS, measured, and destroyed on
+2026-08-01 to control cost. `infra/terraform/` and the `Dockerfile` are kept so the
+deployment is reproducible, not because it is live — every URL in the deployment history
+is dead. Total spend was under $6.
+
+What ran: one 2-vCPU/4-GiB Fargate task behind an ALB, a private Valkey node, S3 for
+immutable artifact generations, ECR, and CloudFront as an IP-restricted HTTPS front door,
+with GitHub Actions deploying through OIDC rather than stored AWS keys.
+
+**What the cloud measured, stated at the concurrency and connection model it was measured
+at**, because those change the answer more than the code does:
+
+| | server p99 | notes |
+|---|---:|---|
+| 20 req/s offered, connection reuse, via CloudFront | **95.41 ms** | 8/1000 over budget — passes |
+| 20 req/s offered, fresh TLS per request, via CloudFront | 120.55 ms | 32/1000 over — the edge, not the app |
+| 20 req/s offered, direct in-VPC control | **42.14 ms** | 0/1000 over, same image and users |
+| closed loop, concurrency 4 | ~172 ms | over budget; 45 req/s achieved |
+| first request in a fresh process | ~673 ms | vs ~40 ms warm |
+
+The gap between 95 ms and 42 ms at the *same* offered rate is the public edge path, not
+the service — the direct control used the identical image, users, and rate. And 20 req/s
+is not a measured ceiling: it is the highest fixed rate that passed end-to-end. At 30
+req/s queueing grew into seconds, so the real ceiling is somewhere between and was never
+pinned down.
+
+The most useful result was a falsified hypothesis. A second Uvicorn worker looked obvious
+on a 2-vCPU task and made things **worse** (110 ms vs 72 ms p99 at concurrency 2). What
+actually mattered was a native thread pool nobody had counted: NumPy's OpenBLAS was
+choosing 2 threads underneath an already-pinned DuckDB and LightGBM. Setting
+`OPENBLAS_NUM_THREADS=1` on a single worker cut concurrency-4 p99 from 317 ms to 174 ms —
+a bigger win than adding a process, and in the opposite direction (D35).
+
+**What this deployment is not:** one task with no high availability, an ephemeral
+IP-restricted security posture rather than production hardening, HTTP on the internal
+CloudFront-to-ALB hop, and accepted base-image CVEs in Debian's `perl-base`. Those were
+deliberate choices for a one-day showcase and are recorded as accepted limitations in
+`.agents/AWS_ISSUES.md`, not as unfinished work.
 
 ## Agent workflow
 
