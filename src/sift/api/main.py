@@ -15,6 +15,7 @@ from redis.exceptions import RedisError
 from sift.config import METRO_CITY, METRO_STATE
 from sift.retrieval.online import OnlineALSRetriever
 from sift.store.online import OnlineStoreUnavailable
+from sift.timing import collecting
 
 app = FastAPI(title="Sift", version="0.0.0")
 
@@ -56,7 +57,20 @@ class RecommendResponse(BaseModel):
     user_id: str
     metro: str
     path: str
+    # Both, not just `len(results)`. A response that returns 40 for a legal k=50 has to
+    # say so in the body: a client comparing against the k *it* sent is the only reader
+    # guaranteed to notice, and this API spent its whole life until now returning short
+    # lists silently. `shortfall` carries the reason, and is null on a full response.
+    requested_k: int
+    returned_k: int
+    shortfall: str | None
     latency: LatencyBreakdown
+    # Sub-stage timings, only when `?detail=true`. Absent by default so the five-stage
+    # shape stays the contract's: these are diagnostic, uncalibrated, and free to change,
+    # and putting them in every response invites them into a budget nobody measured them
+    # for. They exist because "feature lookup: 70ms" does not say whether Redis, JSON
+    # decoding, or DuckDB grew.
+    detail: dict[str, float] | None = None
     results: list[Recommendation]
 
 
@@ -91,9 +105,19 @@ def recommend(
     response: Response,
     retriever: Annotated[OnlineALSRetriever, Depends(get_online_retriever)],
     k: Annotated[int, Query(ge=1, le=50)] = 10,
+    detail: Annotated[bool, Query()] = False,
 ) -> RecommendResponse:
     try:
-        result = retriever.recommend(user_id, k)
+        # Collection is per request, so an unprofiled request pays one thread-local read
+        # per span. Enabling it globally would put diagnostic timers on every serving
+        # request to answer a question asked once.
+        if detail:
+            with collecting() as timings:
+                result = retriever.recommend(user_id, k)
+            spans = timings.as_dict()
+        else:
+            result = retriever.recommend(user_id, k)
+            spans = None
     except (RedisError, OnlineStoreUnavailable) as exc:
         raise HTTPException(status_code=503, detail="online feature store unavailable") from exc
     latency = result.latency
@@ -112,6 +136,19 @@ def recommend(
             "LightGBM ranker -> rerank filters + diversity "
             "(popularity cold fallback, reranked the same way)"
         ),
+        requested_k=result.requested_k,
+        returned_k=len(result.results),
+        shortfall=(
+            None
+            if not result.shortfall
+            else (
+                f"returned {len(result.results)} of {result.requested_k} requested: the "
+                "retrieved pool did not hold that many candidates that are open and not "
+                "already reviewed. Closed and already-reviewed businesses are never "
+                "restored to fill space."
+            )
+        ),
+        detail=spans,
         latency=LatencyBreakdown(
             retrieval_ms=latency.retrieval_ms,
             feature_lookup_ms=latency.feature_lookup_ms,

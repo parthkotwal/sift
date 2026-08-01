@@ -270,3 +270,88 @@ def test_the_cold_path_also_pins_its_generation(tmp_path: Path) -> None:
     _retriever(tmp_path, store).recommend("cold", 2)
     assert store.snapshots_taken == 1
     assert set(store.snapshots_seen) == {"generation-1"}
+
+
+# --- the k contract at the funnel level -----------------------------------------
+#
+# IDs are zero-padded so lexicographic order is numeric order: `ExactItemIndex` requires
+# sorted IDs to keep score ties deterministic, and "b10" sorts before "b2".
+
+
+def _wide(n: int) -> tuple[list[PopularityEntry], dict[str, float]]:
+    """An n-item catalog in descending order, with the feature column doubling as score."""
+    return (
+        [PopularityEntry(f"b{i:03d}", f"name{i}", n - i) for i in range(n)],
+        {f"b{i:03d}": float(n - i) for i in range(n)},
+    )
+
+
+def _wide_index(tmp_path: Path, n: int) -> ExactItemIndex:
+    factors = np.zeros((n, FACTORS), dtype=np.float32)
+    factors[:, 0] = [float(n - i) for i in range(n)]
+    factor_file = tmp_path / "items_wide.npy"
+    ids_file = tmp_path / "ids_wide.json"
+    np.save(factor_file, factors, allow_pickle=False)
+    ids_file.write_text(json.dumps([f"b{i:03d}" for i in range(n)]))
+    return ExactItemIndex(factors_file=factor_file, ids_file=ids_file)
+
+
+def _wide_retriever(tmp_path: Path, store: _Store, n: int) -> OnlineALSRetriever:
+    catalog, _ = _wide(n)
+    return OnlineALSRetriever(
+        _wide_index(tmp_path, n),
+        cast(OnlineFeatureStore, store),
+        catalog,
+        cast(lgb.Booster, _Model()),
+    )
+
+
+def test_a_warm_request_returns_exactly_k_despite_heavy_filtering(tmp_path: Path) -> None:
+    """The regression this contract exists for. With the ranked pool sliced to a fixed
+    50 before filtering, a legal k=50 returned 33-40 against real data and reported
+    nothing — measured over 2,000 holdout users, short for 100% of them."""
+    _, values = _wide(120)
+    closed = {f"b{i:03d}" for i in range(0, 120, 3)}
+    store = _Store(
+        {"warm": _warm_vector()},
+        values,
+        closed=closed,
+        reviewed={"warm": {f"b{i:03d}" for i in range(1, 60, 3)}},
+    )
+
+    result = _wide_retriever(tmp_path, store, 120).recommend("warm", 50)
+
+    assert len(result.results) == 50
+    assert result.requested_k == 50
+    assert result.shortfall == 0
+    assert not {entry.business_id for entry in result.results} & closed
+
+
+def test_a_cold_request_returns_exactly_k_too(tmp_path: Path) -> None:
+    """A user we know nothing about should not be the one who gets a short list: the
+    cold path is filtered by the same rules, so it needs the same pool depth."""
+    _, values = _wide(120)
+    closed = {f"b{i:03d}" for i in range(0, 120, 3)}
+    store = _Store({}, values, closed=closed)  # no vector -> cold fallback
+
+    result = _wide_retriever(tmp_path, store, 120).recommend("cold", 50)
+
+    assert len(result.results) == 50
+    assert result.requested_k == 50
+    assert result.shortfall == 0
+    assert not {entry.business_id for entry in result.results} & closed
+
+
+def test_an_exhausted_pool_reports_the_shortfall_instead_of_padding(tmp_path: Path) -> None:
+    """When the pool genuinely runs out the funnel says so. It must not reach for a
+    closed business to round the list up to k."""
+    _, values = _wide(20)
+    closed = {f"b{i:03d}" for i in range(12)}
+    store = _Store({"warm": _warm_vector()}, values, closed=closed)
+
+    result = _wide_retriever(tmp_path, store, 20).recommend("warm", 50)
+
+    assert len(result.results) == 8, "20 candidates less 12 closed"
+    assert result.requested_k == 50
+    assert result.shortfall == 42
+    assert not {entry.business_id for entry in result.results} & closed

@@ -48,8 +48,21 @@ class RankedBusiness:
 
 @dataclass(frozen=True)
 class OnlineRecommendation:
+    """One request's results, plus what was asked for.
+
+    `requested_k` is carried rather than inferred so a caller can tell a full response
+    from a short one without knowing what it asked. The funnel returns exactly k
+    whenever k eligible candidates exist in the retrieved pool; when it cannot, that is
+    a fact about the pool the response has to state, not round down and hide.
+    """
+
     results: tuple[RankedBusiness, ...]
     latency: StageLatency
+    requested_k: int
+
+    @property
+    def shortfall(self) -> int:
+        return self.requested_k - len(self.results)
 
 
 class OnlineRanker:
@@ -125,6 +138,7 @@ class OnlineRanker:
                 overhead_ms=overhead_ms,
                 total_ms=total_ms,
             ),
+            requested_k=k,
         )
 
 

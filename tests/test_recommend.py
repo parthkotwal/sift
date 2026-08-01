@@ -28,6 +28,7 @@ class _FakeRanker:
         return OnlineRecommendation(
             results=entries[:k],
             latency=StageLatency(0.1, 2.0, 1.0, 0.5, 0.2, 3.3),
+            requested_k=k,
         )
 
 
@@ -89,3 +90,36 @@ def test_missing_ranker_artifact_is_an_actionable_availability_error(
         api_main.get_online_retriever()
     assert caught.value.status_code == 503
     assert "ranker artifacts" in str(caught.value.detail)
+
+
+def test_a_full_response_reports_both_counts_and_no_shortfall(client: TestClient) -> None:
+    body = client.get("/recommend", params={"user_id": "u1", "k": 2}).json()
+    assert (body["requested_k"], body["returned_k"]) == (2, 2)
+    assert body["shortfall"] is None
+
+
+def test_a_short_response_says_so_in_the_body(client: TestClient) -> None:
+    """The defect this contract closes was silence, not shortness. The fake ranker holds
+    3 candidates, so k=10 cannot be filled — and the client comparing against the k *it*
+    sent is the only reader guaranteed to notice."""
+    body = client.get("/recommend", params={"user_id": "u1", "k": 10}).json()
+    assert (body["requested_k"], body["returned_k"]) == (10, 3)
+    assert len(body["results"]) == 3
+    assert body["shortfall"] is not None
+    assert "3 of 10" in body["shortfall"]
+    # It must name the reason, not just the arithmetic the client could do itself.
+    assert "already reviewed" in body["shortfall"]
+
+
+def test_sub_stage_detail_is_absent_unless_asked_for(client: TestClient) -> None:
+    """The five-stage shape is the contract's; these numbers are diagnostic and free to
+    change, so they must not appear in every response and drift into a budget."""
+    assert client.get("/recommend", params={"user_id": "u1"}).json()["detail"] is None
+
+
+def test_sub_stage_detail_is_returned_when_requested(client: TestClient) -> None:
+    body = client.get("/recommend", params={"user_id": "u1", "detail": "true"}).json()
+    assert isinstance(body["detail"], dict)
+    # The fake retriever records no spans of its own; what matters here is that asking
+    # turns collection on and returns a mapping rather than null.
+    assert body["results"], "detail must not change what the endpoint returns"

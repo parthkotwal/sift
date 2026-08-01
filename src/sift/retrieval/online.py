@@ -34,9 +34,10 @@ from sift.ranking.online import (
 )
 from sift.ranking.rank import SERVING_POOL
 from sift.ranking.train import ALS_RANKER_MODEL, to_float
-from sift.rerank.rerank import RERANK_POOL, Candidate, rerank
+from sift.rerank.rerank import Candidate, rerank
 from sift.retrieval.index import ExactItemIndex
 from sift.store.online import LOOKUP_THREADS, FeatureQuery, OnlineFeatureStore
+from sift.timing import span
 
 RANKER_THREADS = LOOKUP_THREADS
 
@@ -92,20 +93,24 @@ class OnlineALSRetriever:
         # each resolve the active generation independently otherwise, so a publication
         # landing mid-request would retrieve with one snapshot, rank with the next, and
         # filter with a third — three atomic snapshots in one response, silently.
-        snapshot = self.store.snapshot()
-        vector = self.store.lookup_user_embedding(user_id, snapshot=snapshot)
+        with span("retrieval.snapshot"):
+            snapshot = self.store.snapshot()
+        with span("retrieval.user_embedding"):
+            vector = self.store.lookup_user_embedding(user_id, snapshot=snapshot)
         cold = vector is None
         if cold:
-            # RERANK_POOL, not k: the cold path is filtered too, so it needs slack to
-            # backfill from. A closed restaurant is no better a recommendation for a
-            # user we know nothing about.
-            head = self.popularity[: max(k, RERANK_POOL)]
+            # The same pool depth as the warm path, for the same reason: the cold path
+            # is filtered too, and a user we know nothing about should not be the one
+            # who gets a short list. A closed restaurant is no better a recommendation
+            # for them than for anyone else.
+            head = self.popularity[: max(k, SERVING_POOL)]
             candidate_ids = [entry.business_id for entry in head]
             fallback_scores = [float(entry.pre_t_reviews) for entry in head]
         else:
-            ids, scores = self.index.search_scored(
-                np.asarray(vector, dtype=np.float32), self._pool_size(k)
-            )
+            with span("retrieval.index_search"):
+                ids, scores = self.index.search_scored(
+                    np.asarray(vector, dtype=np.float32), self._pool_size(k)
+                )
             candidate_ids = ids
             fallback_scores = [float(score) for score in scores]
         retrieval_done = time.perf_counter()
@@ -125,25 +130,35 @@ class OnlineALSRetriever:
             )
             feature_done = time.perf_counter()
 
-            columns = tuple(zip(*(row[1:] for row in rows), strict=True))
-            x = np.column_stack([to_float(np.asarray(column, dtype=object)) for column in columns])
+            with span("ranking.build_matrix"):
+                columns = tuple(zip(*(row[1:] for row in rows), strict=True))
+                x = np.column_stack(
+                    [to_float(np.asarray(column, dtype=object)) for column in columns]
+                )
             # num_threads=1 for the same reason the store pins DuckDB to one thread:
             # LightGBM defaults to every core, which multiplies against request
             # concurrency instead of adding to it (I31). Scoring 500 rows through a
             # shallow model is ~2.6ms single-threaded, so there is nothing to win.
-            ranker_scores = np.asarray(
-                self.model.predict(x, num_threads=RANKER_THREADS), dtype=np.float64
-            )
+            with span("ranking.predict"):
+                ranker_scores = np.asarray(
+                    self.model.predict(x, num_threads=RANKER_THREADS), dtype=np.float64
+                )
             # Stable, so ties fall back to the order retrieval supplied — which for
             # this personalized pool is ALS's own ranking. It matches
             # `reranked_candidate_lists`, the offline path that produced D27's
             # numbers: serving must not order candidates differently from the run
             # that decided the ranker lands.
-            # RERANK_POOL, not k: rerank drops candidates, so truncating to k here
-            # would leave it nothing to backfill from and the response would come back
-            # short exactly when the filters bite hardest.
-            order = np.argsort(-ranker_scores, kind="stable")[:RERANK_POOL]
-            chosen = [(candidate_ids[int(i)], float(ranker_scores[int(i)])) for i in order]
+            #
+            # Untruncated, so rerank filters the whole ranked pool. Slicing to a fixed
+            # 50 here is what made the response come back short "exactly when the
+            # filters bite hardest" — the failure the previous comment on this line
+            # predicted, and the constant beside it then guaranteed, silently, for
+            # every k above ~33 (D33). Rerank stops at k itself, and its inputs are
+            # per-generation dict lookups (D31), so handing it all 500 costs reads
+            # rather than another feature lookup or model run.
+            with span("ranking.order"):
+                order = np.argsort(-ranker_scores, kind="stable")
+                chosen = [(candidate_ids[int(i)], float(ranker_scores[int(i)])) for i in order]
             ranking_done = time.perf_counter()
             feature_ms = (feature_done - feature_started) * 1_000
             ranking_ms = (ranking_done - feature_done) * 1_000
@@ -152,22 +167,24 @@ class OnlineALSRetriever:
         # `lookup()`: `is_open` is legitimate online and unconstructible historically
         # (D13), so it must not be reachable as a feature. See D29.
         rerank_started = time.perf_counter()
-        inputs = self.store.rerank_inputs(
-            user_id, [business_id for business_id, _ in chosen], snapshot=snapshot
-        )
-        final = rerank(
-            [
-                Candidate(
-                    business_id=business_id,
-                    score=score,
-                    is_open=inputs.is_open.get(business_id, False),
-                    categories=inputs.categories.get(business_id, ()),
-                )
-                for business_id, score in chosen
-            ],
-            k,
-            inputs.reviewed,
-        )
+        with span("rerank.inputs"):
+            inputs = self.store.rerank_inputs(
+                user_id, [business_id for business_id, _ in chosen], snapshot=snapshot
+            )
+        with span("rerank.filter"):
+            final = rerank(
+                [
+                    Candidate(
+                        business_id=business_id,
+                        score=score,
+                        is_open=inputs.is_open.get(business_id, False),
+                        categories=inputs.categories.get(business_id, ()),
+                    )
+                    for business_id, score in chosen
+                ],
+                k,
+                inputs.reviewed,
+            )
         rerank_done = time.perf_counter()
 
         # `score` is whichever stage decided the order: the ranker's score for warm
@@ -199,6 +216,7 @@ class OnlineALSRetriever:
                 overhead_ms=overhead_ms,
                 total_ms=total_ms,
             ),
+            requested_k=k,
         )
 
 

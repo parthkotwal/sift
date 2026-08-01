@@ -36,12 +36,17 @@ from sift.offline.dim_business import DIM_BUSINESS
 from sift.offline.ingest import EVENTS_DIR, REVIEW_EVENT, events_glob
 from sift.ranking.rank import SERVING_POOL, reranked_candidate_lists
 from sift.ranking.train import ALS_RANKER_MODEL
-from sift.rerank.rerank import CATEGORY_CAP, RERANK_POOL, Candidate, rerank
+from sift.rerank.rerank import CATEGORY_CAP, Candidate, rerank
 from sift.retrieval.evaluate import ALSRetriever
 
-# Rerank cuts to 10 in serving; the harness reranks to RERANK_POOL so recall@50 stays
+# Rerank cuts to 10 in serving; the harness reranks to `max(EVAL_KS)` so recall@50 stays
 # meaningful. The head is identical either way — the walk is greedy and prefix-stable,
 # so the first 10 chosen do not depend on how many more were asked for.
+#
+# It reranks from the *whole* ranked list, like serving. It used to slice the top 50
+# first and then ask for 50, which the hard filters made unfillable by construction: the
+# recorded recall@50 was measured on lists of ~40. recall@10 is unaffected — 10 is never
+# short at either pool depth — so the ledger should move on recall@50 alone.
 EVAL_KS: tuple[int, ...] = (10, 50)
 
 
@@ -114,13 +119,13 @@ def reranked(
                 is_open=is_open.get(business_id, False),
                 categories=categories.get(business_id, ()),
             )
-            for position, business_id in enumerate(ordered[:RERANK_POOL])
+            for position, business_id in enumerate(ordered)
         ]
         out[user_id] = [
             candidate.business_id
             for candidate in rerank(
                 pool,
-                RERANK_POOL,
+                max(EVAL_KS),
                 reviewed.get(user_id, set()),
                 filter_closed=filter_closed,
                 category_cap=category_cap,
@@ -188,7 +193,11 @@ def main() -> None:
     # is not the one the slot arithmetic predicted.
     no_repeats: dict[str, set[str]] = {}
     all_open = dict.fromkeys(is_open, True)
-    no_cap = RERANK_POOL + 1
+    # Above the pool size, so the cap can never bind. It has to track the pool the
+    # harness actually reranks from — left at 51 while the pool grew to 500, "diversity
+    # off" would have quietly become "diversity on", and the ablation row for every
+    # other mechanism would carry the cap's cost as well as its own.
+    no_cap = SERVING_POOL + 1
     variants = (
         # Each row turns on exactly one mechanism. `no_cap` disables diversity, an
         # all-open catalog disables the closed filter, and an empty reviewed map
