@@ -113,6 +113,44 @@ resource "aws_vpc_security_group_ingress_rule" "alb_http" {
   to_port           = 80
 }
 
+resource "aws_security_group" "benchmark" {
+  name_prefix            = "${local.name_prefix}-benchmark-"
+  description            = "Short-lived Fargate benchmark client networking"
+  revoke_rules_on_delete = true
+  vpc_id                 = aws_vpc.this.id
+
+  tags = {
+    Name = "${local.name_prefix}-benchmark"
+  }
+}
+
+resource "aws_vpc_security_group_ingress_rule" "alb_from_benchmark" {
+  security_group_id            = aws_security_group.alb.id
+  referenced_security_group_id = aws_security_group.benchmark.id
+  description                  = "Controlled Fargate benchmark clients"
+  from_port                    = 80
+  ip_protocol                  = "tcp"
+  to_port                      = 80
+}
+
+resource "aws_vpc_security_group_egress_rule" "benchmark_to_alb" {
+  security_group_id            = aws_security_group.benchmark.id
+  referenced_security_group_id = aws_security_group.alb.id
+  description                  = "Benchmark clients to the Sift ALB"
+  from_port                    = 80
+  ip_protocol                  = "tcp"
+  to_port                      = 80
+}
+
+resource "aws_vpc_security_group_egress_rule" "benchmark_https" {
+  security_group_id = aws_security_group.benchmark.id
+  cidr_ipv4         = "0.0.0.0/0"
+  description       = "ECR and CloudWatch access for benchmark tasks"
+  from_port         = 443
+  ip_protocol       = "tcp"
+  to_port           = 443
+}
+
 resource "aws_security_group" "ecs_tasks" {
   name_prefix            = "${local.name_prefix}-ecs-"
   description            = "Fargate API and materialization task networking"

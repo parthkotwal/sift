@@ -57,6 +57,8 @@ has no default and must be set explicitly; use the authorized caller's public
 `/32` unless unrestricted publication has been separately approved:
 
 - the explicit caller CIDR input reaches only ALB port 80;
+- short-lived benchmark tasks use their own security group, which reaches only
+  ALB port 80 and public HTTPS endpoints needed for ECR and CloudWatch;
 - the ALB reaches only ECS task port 8000;
 - ECS tasks reach public HTTPS endpoints and Redis port 6379;
 - Redis accepts port 6379 only from the ECS task security group.
@@ -169,5 +171,6 @@ the one-task demo may cause brief downtime but does not run two paid API tasks.
 The 180-second ALB health grace covers artifact download and process startup;
 it does not hide the catalog initialization paid by the first recommendation.
 
-`ecs_cluster`, `ecs_deployment`, and `ecs_run_task_network` outputs expose the
-identifiers needed for deployment and the one-off `aws ecs run-task` call.
+`ecs_cluster`, `ecs_deployment`, `ecs_run_task_network`, and
+`benchmark_run_task_network` expose the identifiers needed for deployment,
+materialization, and reproducible short-lived benchmark clients.

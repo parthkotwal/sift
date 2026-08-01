@@ -36,9 +36,10 @@ output "private_subnet_ids" {
 output "security_group_ids" {
   description = "Security groups consumed by later ALB, ECS, and Redis resources."
   value = {
-    alb       = aws_security_group.alb.id
-    ecs_tasks = aws_security_group.ecs_tasks.id
-    redis     = aws_security_group.redis.id
+    alb              = aws_security_group.alb.id
+    benchmark_client = aws_security_group.benchmark.id
+    ecs_tasks        = aws_security_group.ecs_tasks.id
+    redis            = aws_security_group.redis.id
   }
 }
 
@@ -118,6 +119,17 @@ output "ecs_run_task_network" {
     assign_public_ip = true
     security_group_ids = [
       aws_security_group.ecs_tasks.id,
+    ]
+    subnet_ids = values(aws_subnet.public)[*].id
+  }
+}
+
+output "benchmark_run_task_network" {
+  description = "Network inputs for short-lived ECS benchmark clients that can reach only the ALB and AWS HTTPS endpoints."
+  value = {
+    assign_public_ip = true
+    security_group_ids = [
+      aws_security_group.benchmark.id,
     ]
     subnet_ids = values(aws_subnet.public)[*].id
   }
