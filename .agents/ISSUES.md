@@ -122,6 +122,66 @@ unreadable as a to-do list — they now move to *Fixed — kept because the fail
 recurs* as soon as they close, so anything appearing under this heading is genuinely open
 work rather than a record of finished work.
 
+### I38 — The concurrency ceiling is DuckDB, and it is not a lock   [open]
+
+Handed over from the AWS lane as "the concurrency-4 DuckDB/LightGBM bottleneck". Measured
+with D34's sub-stage timings, it is **DuckDB alone**. Local, one worker,
+`OPENBLAS_NUM_THREADS=1`, 200 requests per level, p50 ratios against concurrency 1:
+
+| span | c=1 | c=8 | ratio |
+| --- | ---: | ---: | ---: |
+| `feature.load_relations` | 2.26ms | 11.11ms | **4.92x** |
+| `feature.duckdb_query` | 5.09ms | 11.87ms | **2.33x** |
+| `ranking.predict` | 7.98ms | 11.26ms | 1.41x |
+| `feature.encode_rows` | 0.61ms | 0.66ms | 1.08x |
+| funnel total | 21.47ms | 44.40ms | 2.07x |
+
+**LightGBM is nearly concurrency-insensitive.** It is the single largest span at
+concurrency 1 and the *least* affected by load, so naming it beside DuckDB in the
+bottleneck overstates its role. Excluding it would have been guesswork before the
+sub-stage timings existed; that is what they were built for (D34).
+
+**Two hypotheses were tested and both are false**, which matters more than the one that
+survived:
+
+- *Contention on the shared DuckDB instance.* The store keeps one `duckdb.connect()` per
+  process with a `cursor()` per thread, so DDL taking a catalog lock was the obvious
+  suspect. Isolated: `CREATE OR REPLACE TEMP TABLE` at 8 threads is **0.887ms shared vs
+  0.846ms with a database per thread** — no difference. The same work inflates ~3.1x from
+  1 to 8 threads *either way*. It is not a shared-instance lock, so **more workers cannot
+  fix it** — which independently explains the AWS lane's finding that two workers
+  performed worse rather than better.
+- *JSON encoding on the way in.* `feature.encode_rows` is 0.61ms and inflates 1.08x. The
+  Python-side payload build is not the cost.
+
+What is left: DuckDB statement execution scales sub-linearly — 8 threads buy ~2.2x
+throughput while per-statement latency triples. The funnel issues **five** DuckDB
+statements per request, and three of them (`user_current`, `user_category`, `user_als`)
+build temp tables holding a *single user's* row, because a request has exactly one user.
+That is the cheapest place to look next: fewer statements per request, not more
+processes. It touches `store/read.py`, which owns the as-of join chokepoint, so it needs
+its own decision rather than an opportunistic edit.
+
+### I39 — `/health` reports ready before the process can serve   [open]
+
+The ALB health check passes as soon as the app is listening, but the first `/recommend`
+in a process pays the per-generation build. Measured locally on a fresh process:
+**364.2ms cold vs 20.5ms warm**, and the sub-stage breakdown puts **305.6ms in
+`feature.catalog_relations`** with a further **32.8ms in `rerank.inputs`** — 338 of the
+344ms of one-time cost is those two caches. So a target goes healthy, receives real
+traffic, and the first user pays 18x the steady-state latency.
+
+Known and noted in the AWS lane's plan ("report the first request separately"), but
+reporting it is not the same as fixing it, and the deployment compounds it: the service
+runs 0/100 deployment percentages, so every rollout has a window where the only task is
+one that has never served a request.
+
+**Deliberately not fixed yet, because the fix is a semantic choice**: a warmup operation
+that builds and validates the caches, a readiness condition distinct from cheap liveness,
+and startup that fails loudly when the generation or model is unusable. Making `/health`
+quietly do expensive initialization would change what the ALB's existing check means
+without anyone deciding that — and the health-check contract belongs to the deployment.
+
 ### I36 — `CATEGORY_CAP` is an absolute count, so its meaning drifts with k   [open]
 
 The diversity cap is 2 per primary category regardless of how many results were asked
