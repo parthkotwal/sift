@@ -21,19 +21,20 @@ What it is *not*: a model-experimentation project (no tuning sprints, no ablatio
 request: user_id, location
     │
     ▼
- RETRIEVAL    14.6K → ~500   exact search over ALS embeddings;   metric: recall@500
-                              ANN is the measured scale-up seam
-    │                        unioned with cheap heuristics
-    │                        (popular nearby, category match)
+ RETRIEVAL    14.6K → 500    exact search over ALS embeddings;   metric: recall@500
+    │                        ANN is the measured scale-up seam
     ▼
- RANKING      500 → 50       LightGBM over rich user×item         metric: NDCG@10
-    │                        features from the online store
+ RANKING      500 → 500      LightGBM over rich user×item         metric: NDCG@10
+    │         reordered,     features from the online store
+    │         not cut
     ▼
- RERANK       50 → 10        hard filters (open now, already      metric: recall@10,
+ RERANK       500 → k        hard filters (open now, already      metric: recall@10,
     │                        reviewed) + category diversity       reported both ways
     ▼
-response: 10 businesses      end-to-end p99 < 100ms
+response: exactly k          server p99 < 100ms at the measured envelope
 ```
+
+Two things this diagram states that earlier versions got wrong. **Retrieval is ALS alone** — the heuristic union (popular nearby, category match) was planned and never built, and no source rides for free without its marginal hit contribution measured. **Ranking narrows nothing**: it orders the full 500 and hands all of them to rerank, the only stage that removes anything. Cutting to a fixed 50 before the filters ran is what made a legal `k=50` return 33–40 results silently (D33, `ISSUES.md` I35).
 
 **Retrieval** narrows the full catalog to ~500 candidates by dot product over ALS
 user/item embeddings. The current Philadelphia catalog is 14,568 items, where
@@ -127,7 +128,9 @@ Each step ends with something that runs end to end; nothing lands without beatin
 
 ## Stack
 
-Python · PyTorch (two-tower, step 5b only) · LightGBM · `implicit` ALS · NumPy exact vector search (ANN only when scale earns it) · Redis (online features) · Postgres (metadata) · FastAPI · Parquet + DuckDB (offline, inspection) · Docker Compose. Deliberately small — every tool must be explainable out loud.
+Python · PyTorch (two-tower, step 5b only) · LightGBM · `implicit` ALS · NumPy exact vector search (ANN only when scale earns it) · Redis (online features) · FastAPI · Parquet + DuckDB (offline, inspection) · Docker Compose · Terraform + ECS/Fargate (the deployment, since destroyed). Deliberately small — every tool must be explainable out loud.
+
+Postgres was listed here as the metadata store through several revisions and **was never built**. Nothing needed it: the catalog is a per-generation Redis record plus a DuckDB relation (D31), and offline metadata lives in Parquet. It is removed rather than left as an aspiration, because a stack list that names tools the code does not use is a claim about the system that is not true.
 
 ## Scope
 

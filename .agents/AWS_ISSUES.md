@@ -8,7 +8,8 @@ diagnosis is likely to matter again. Application/model issues still belong in
 are historical application/deployment findings, not descriptions of a live
 endpoint.
 
-**Last updated:** 2026-08-01 on branch `aws`.
+**Last updated:** 2026-08-01. Merged to `main`; the `aws` branch is no longer the
+authority for this ledger.
 
 Format: `### AWS-I<n> — <title>   [open | fixed | accepted]`
 

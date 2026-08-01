@@ -8,7 +8,7 @@ A living study guide. Each entry: what the idea is, why Sift needs it, and the q
 
 **What:** The canonical industry recsys architecture. A cheap, fast model narrows the full catalog to hundreds of candidates (retrieval); an expensive, accurate model scores only those (ranking); business logic finishes (rerank). Exists because scoring the whole catalog with the good model is seconds-slow, and because the stages have different jobs: retrieval must not *miss* (recall), ranking must *order* (NDCG).
 
-**Here:** 150K → ~500 (ANN ∪ heuristics) → 50 (LightGBM) → 10 (filters + diversity), each stage with its own metric and latency budget.
+**Here:** 14.6K metro businesses → 500 (exact ALS) → 500 reordered (LightGBM) → k (filters + diversity), each stage with its own metric and latency budget. Note that ranking *reorders* rather than narrows: rerank is the only stage that removes candidates, and it sees the whole ranked pool so it can return exactly k (D33). Retrieval is ALS alone — the heuristic union was planned, never built, and would have to earn its place by measured marginal hits.
 
 **Own it:** *Why can't one model do this, and why do the stages get different metrics?*
 
@@ -198,9 +198,11 @@ measured before claiming process-per-core helps?*
 
 **What:** Production retrieval is rarely one model — it's a union of sources (embedding ANN, popularity, category/history heuristics), each catching what the others miss, deduplicated before ranking. Each source must justify itself by *marginal* contribution: hits that only it produced.
 
-**Here:** ANN ∪ popular-nearby ∪ category-match. Marginal contribution per source is a first-class eval output — a source with ~zero marginal hits gets removed.
+**Here:** **one source — exact ALS.** The planned `ANN ∪ popular-nearby ∪ category-match` union was never built, and this entry is kept as the concept rather than as a description of the code. The union stayed unbuilt for the reason the concept itself gives: marginal contribution is the bar, and nothing measured the marginal hits a second source would add. Adding sources because the pattern says "union" is how a source ends up riding for free.
 
-**Own it:** *Why measure marginal rather than standalone recall per source?*
+What *was* measured is the comparison one layer up: ALS against popularity, where the marginal-hit attribution is a first-class eval output. The seam for a second source is the same index interface ANN would use.
+
+**Own it:** *Why measure marginal rather than standalone recall per source — and what would a second source here have to prove before it lands?*
 
 ## When Spark (and when not)
 

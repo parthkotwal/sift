@@ -576,18 +576,24 @@ Then:
 - [ ] confirm artifact bucket is private
 - [ ] confirm no raw/derived data has been committed
 
-### Phase 8 — Destroy
+### Phase 8 — Destroy   ✅ COMPLETE (2026-08-01)
 
 After the showcase/evidence capture:
 
-- [ ] save only non-sensitive screenshots/log summaries needed for portfolio evidence
-- [ ] `terraform destroy`
-- [ ] confirm ECS service/tasks are gone
-- [ ] confirm ALB is gone
-- [ ] confirm ElastiCache is gone
-- [ ] confirm other paid/network resources are gone
-- [ ] decide whether to retain or delete the private S3 artifacts/ECR image
-- [ ] verify AWS billing/resource views for accidental leftovers
+- [x] save only non-sensitive screenshots/log summaries needed for portfolio evidence
+- [x] `terraform destroy`
+- [x] confirm ECS service/tasks are gone
+- [x] confirm ALB is gone
+- [x] confirm ElastiCache is gone
+- [x] confirm other paid/network resources are gone
+- [x] decide whether to retain or delete the private S3 artifacts/ECR image — deleted
+- [x] verify AWS billing/resource views for accidental leftovers
+
+Only the checkboxes are ticked; the plan's wording above is left exactly as authored so
+the record of what was *predicted* stays comparable against what was *found*. The
+outcomes, including where reality diverged from this plan, are in
+`AWS_DEPLOYMENT_STATUS.md` and `AWS_ISSUES.md`. Teardown was additionally re-verified
+from the application lane against every owning service API — see the status doc's header.
 
 ---
 

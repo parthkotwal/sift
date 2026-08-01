@@ -822,11 +822,14 @@ class OnlineFeatureStore:
     def _rerank_catalog(self, generation: str) -> dict[str, tuple[bool, tuple[str, ...]]]:
         """`business_id -> (is_open, categories)` for the whole catalog, once per process.
 
-        Rerank needs these for ~50 candidates per request. Querying the DuckDB relation
-        for them costs a scan of all 14,568 rows per request — measurably worse than the
+        Rerank needs these for every ranked candidate — the whole 500-candidate pool
+        since D33, not the 50 this once served. Querying the DuckDB relation for them
+        costs a scan of all 14,568 rows per request — measurably worse than the
         per-candidate Redis reads it replaced (2.9ms -> 5.0ms p50). A plain dict built
-        once from the same relation makes the stage ~50 hash lookups instead, and the
-        catalog is small enough that holding it twice is not worth a smarter join.
+        once from the same relation makes the stage a few hundred hash lookups instead,
+        and the catalog is small enough that holding it twice is not worth a smarter
+        join. That the pool grew 10x and this stage stayed cheap is the point: dict
+        lookups are what made widening it affordable.
         """
         cached = self._rerank_catalog_by_generation.get(generation)
         if cached is not None:

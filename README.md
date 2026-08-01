@@ -1,6 +1,8 @@
 # Sift
 
-A two-stage retrieval and ranking service over the Yelp Open Dataset: given a user, return ten businesses they'll like — chosen from every business in the metro — in under 100ms p99.
+A two-stage retrieval and ranking service over the Yelp Open Dataset: given a user, return businesses they'll like — chosen from every business in the metro — under a per-stage latency budget.
+
+The contract, stated with the envelope it was measured at, because a bare p99 is not a claim: **warm server-side p99 under 100 ms at 20 requests/second with persistent connections**, measured on the AWS deployment (since destroyed). Fresh TLS connections and concurrency 4 did *not* meet it, and a cold process's first request was ~673 ms. Those are documented boundaries of a one-task showcase, not open defects.
 
 Scoring 150K businesses with a good model takes seconds, so the work is split into a funnel of stages with different jobs and different metrics. The interesting parts are the internals: a hand-built feature store with point-in-time correctness, staged evaluation, and per-stage latency budgets — not the endpoint.
 
@@ -10,14 +12,21 @@ Scoring 150K businesses with a good model takes seconds, so the work is split in
 request: user_id, location
    │
    ▼
-retrieval   14.6K → ~500  exact ALS dot product (ANN at scale) recall@500
+retrieval   14.6K → 500   exact ALS dot product (ANN at scale) recall@500
    ▼
-ranking     500 → 50      LightGBM on user×item features     NDCG@10
+ranking     500 → 500     LightGBM on user×item features     NDCG@10
+   ▼          reordered, not cut
+rerank      500 → k       hard filters + diversity           recall@10, both ways
    ▼
-rerank      50 → 10       hard filters + diversity           recall@10, both ways
-   ▼
-response: 10 businesses   p99 < 100ms, budgeted per stage
+response: exactly k       server p99 < 100ms at the measured envelope
 ```
+
+**Ranking narrows nothing.** It orders all 500 and hands the whole pool to rerank, which
+is the only stage that removes anything. That is deliberate: ranking used to cut to a
+fixed 50 first, which made the hard filters unable to fill a large `k` — a legal `k=50`
+came back with 33–40 results and said nothing. Rerank now filters the full ranked pool and
+returns **exactly k whenever k eligible candidates exist**, which the retrieved pool
+always affords (D33).
 
 Offline, a batch job builds point-in-time-correct training examples from the review log, trains retrieval embeddings and candidate-conditioned rankers on a frozen temporal split, and materializes features to both stores. Exact vector search won the current index gate: at 14,568 metro businesses it is ~1ms p99 and lossless, while HNSW missed the required overlap and paid no useful rent. ANN remains the scale-up seam, not a dependency carried for appearances.
 
@@ -64,8 +73,8 @@ have already been with no error raised. Re-run `sift.store.online` after pulling
 
 `GET /recommend?user_id=<id>&k=10` reads the versioned user embedding from Redis,
 performs exact ALS retrieval over the full metro catalog to get 500 candidates, orders
-them with the ALS-conditioned LightGBM ranker, and reranks the top 50 down to 10 with
-hard filters and a category-diversity cap. Users absent from the ALS artifact fall back
+all of them with the ALS-conditioned LightGBM ranker, and reranks that whole ranked pool
+down to k with hard filters and a category-diversity cap. Users absent from the ALS artifact fall back
 to pre-T popularity — reranked the same way, since a closed restaurant is no better a
 recommendation for a user we know nothing about.
 
@@ -149,7 +158,11 @@ Set `SIFT_REDIS_URL` to use a non-default Redis endpoint.
 **Nothing is running.** The showcase was deployed to AWS, measured, and destroyed on
 2026-08-01 to control cost. `infra/terraform/` and the `Dockerfile` are kept so the
 deployment is reproducible, not because it is live — every URL in the deployment history
-is dead. Total spend was under $6.
+is dead. Spend was a **modeled conservative upper bound of $5.62**, not a settled bill —
+teardown-day charges post after billing-system delay, so the deterministic bound is the
+honest figure rather than a Cost Explorer total that had not yet arrived. It deliberately
+overstates, charging the full topology through the end of verification even though
+services were deleted progressively. Ceiling was $10.
 
 What ran: one 2-vCPU/4-GiB Fargate task behind an ALB, a private Valkey node, S3 for
 immutable artifact generations, ECR, and CloudFront as an IP-restricted HTTPS front door,
