@@ -40,7 +40,9 @@ Resources will be added in reviewable slices, not as one uninspectable apply:
 5. ALB (implemented, not applied) and ECS: public load balancer, target group,
    listener, cluster, task definitions, one-task service, and one-off
    materialization command support;
-6. GitHub OIDC: repository-scoped build/push/deploy role.
+6. GitHub OIDC: repository-scoped build/push/deploy role;
+7. restricted CloudFront HTTPS front door with viewer-IP enforcement and an
+   authenticated ALB origin.
 
 No NAT Gateway, autoscaling, Multi-AZ Redis, public Redis, EKS, CodePipeline, or
 other service outside the deployment plan should appear in these slices.
@@ -57,6 +59,8 @@ has no default and must be set explicitly; use the authorized caller's public
 `/32` unless unrestricted publication has been separately approved:
 
 - the explicit caller CIDR input reaches only ALB port 80;
+- CloudFront origin traffic reaches ALB port 80 only from AWS's managed
+  origin-facing prefix list, then must pass the listener's random-header check;
 - short-lived benchmark tasks use their own security group, which reaches only
   ALB port 80 and public HTTPS endpoints needed for ECR and CloudWatch;
 - the ALB reaches only ECS task port 8000;
@@ -119,11 +123,22 @@ the two planned task log groups. The application role can only call
 ElastiCache APIs because startup fetches exact artifact keys and cache access is
 network-level.
 
-## Load-balancer contract
+## Load-balancer and HTTPS contract
 
 The internet-facing IPv4 ALB spans only the two public subnets and attaches only
-the ALB security group. Its single HTTP port 80 listener forwards to an `ip`
+the ALB security group. Its single HTTP port 80 listener defaults to a fixed
+403. Explicit rules forward the authorized direct `/32`, restricted benchmark
+clients, or CloudFront requests carrying the random origin header to an `ip`
 target group on port 8000, which is required for Fargate's `awsvpc` tasks.
+
+CloudFront provides the user-facing HTTPS endpoint on its default certificate.
+IPv6 is disabled because the approved viewer identity is an IPv4 `/32`. A
+published viewer-request function turns `alb_ingress_cidrs` into an exact edge
+allowlist and returns 403 for any other viewer before origin processing.
+Caching is disabled and all API methods are forwarded. CloudFront reaches the
+ALB over HTTP, but only from AWS's origin-facing managed prefix list and with a
+random custom header whose value remains in protected local Terraform state.
+The ALB listener checks that header; never print or commit it.
 
 Target health uses `GET /health`, expects HTTP 200, checks every 15 seconds, and
 requires two successes or three failures. This deliberately leaves catalog
@@ -175,6 +190,7 @@ it does not hide the catalog initialization paid by the first recommendation.
 `ecs_cluster`, `ecs_deployment`, `ecs_run_task_network`, and
 `benchmark_run_task_network` expose the identifiers needed for deployment,
 materialization, and reproducible short-lived benchmark clients.
+`https_endpoint` exposes the restricted public URL.
 
 ## Inspected teardown procedure
 
@@ -197,7 +213,8 @@ take the showcase down.
 
 3. Inspect both the human plan and `terraform show -json destroy.tfplan`.
    Every managed action must be deletion-only. Confirm it includes the ECS
-   service/tasks, ALB/listener/target group, Valkey replication group, S3
+   service/tasks, CloudFront distribution/function, ALB/listener/target group,
+   Valkey replication group, S3
    bucket, ECR repository, log groups, public networking, IAM roles/policies,
    and GitHub OIDC provider. Stop on any create/update action or missing paid
    resource.
@@ -209,6 +226,7 @@ take the showcase down.
 
    - `terraform state list` is empty;
    - ECS lists no running or pending Sift tasks and no active Sift service;
+   - the CloudFront distribution and viewer-request function are absent;
    - the Sift ALB/target group and their network interfaces are absent;
    - the Valkey replication group is absent;
    - the S3 bucket and ECR repository are absent;

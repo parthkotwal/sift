@@ -6,7 +6,7 @@ diagnosis is likely to matter again. Application/model issues still belong in
 `ISSUES.md`; deployment execution evidence belongs in
 `AWS_DEPLOYMENT_STATUS.md`.
 
-**Last updated:** 2026-07-31 on branch `aws`.
+**Last updated:** 2026-08-01 on branch `aws`.
 
 Format: `### AWS-I<n> — <title>   [open | fixed | accepted]`
 
@@ -46,10 +46,11 @@ per-process evidence.
 concurrency-2 service, but the desktop concurrency-4 promise is not established
 on this Fargate size.
 
-**Next investigation:** the diagnostic 100-request `detail=true` sample places
-most median time in `feature.duckdb_query`, `feature.load_relations`, and
-`ranking.predict`. The application lane should use those sub-stages before any
-further resize or topology change.
+**Next investigation:** the application lane falsified both shared DuckDB
+connection locking and JSON encoding as explanations. `feature.encode_rows`
+is small and nearly load-insensitive; DuckDB statement execution is the
+load-sensitive ceiling. Reduce statements per request before revisiting worker
+or task counts.
 
 ### AWS-I2 — The first recommendation after rollout pays a large cold cost   [open]
 
@@ -67,6 +68,11 @@ latency even when target health and steady-state behavior are good.
 warmup operation, lifecycle hook, or a readiness distinction. Do not silently
 make `/health` initialize the store; that changes its current contract and may
 interact with the one-task rollout gap in AWS-I4.
+
+The latest HTTPS rollout reproduced the mechanism more precisely: the first
+request was 673.144 ms in the application, including 479.36 ms of
+`feature.catalog_relations` and 64.42 ms of `rerank.inputs`; the immediate warm
+request was 40.001 ms.
 
 ### AWS-I3 — The deployed base image has unresolved ECR scan findings   [open]
 
@@ -124,7 +130,26 @@ warning, keeping the workflow definition on `main` and `aws` synchronized. Rerun
 the complete manual workflow after the update; do not change a working deployment
 solely to suppress an annotation without that validation.
 
-### AWS-I15 — The restricted endpoint still uses plain HTTP   [accepted]
+### AWS-I17 — Fresh TLS connections amplify the CloudFront tail   [open]
+
+At a fixed 20.0 requests/s, 1,000 requests creating a new TLS connection each
+time held schedule but missed at 120.55 ms server p99, with 32/1000 requests
+over 100 ms. The same public CloudFront endpoint with connection reuse passed at
+95.41 ms server p99, with 8/1000 over 100 ms and no transport errors. A direct
+in-VPC Fargate control using the same immutable image, 100-user cycle, rate, and
+benchmark SG passed at 42.14 ms server p99 with 0/1000 over budget.
+
+**Impact:** ordinary connection-reusing clients meet the 20/s public contract;
+clients that create a fresh TLS connection per call do not. The image itself is
+not the regression. The remote client schedules connection starts at 20/s; the
+measured difference is consistent with variable TLS/edge transit reshaping when
+requests reach the single backend task.
+
+**Next investigation:** treat connection reuse as part of the public client
+contract. If a fresh-connection SLO is required, test CloudFront connection and
+origin behavior separately before changing application workers or Fargate size.
+
+### AWS-I15 — The CloudFront-to-ALB origin hop uses plain HTTP   [accepted]
 
 The unrestricted `0.0.0.0/0` listener rule was removed. Terraform now requires
 explicit ingress CIDRs, and the live caller rule is a single authorized `/32`.
@@ -132,14 +157,36 @@ Short-lived load clients use a separate security group that can reach only ALB
 port 80 and public HTTPS endpoints required for ECR and CloudWatch. Direct ECS
 port 8000 and Valkey remain private to their security-group relationships.
 
-The ALB listener is still HTTP because this one-day deployment has no approved
-domain or ACM certificate. Restricting ingress and lifetime materially reduces
-exposure, but it does not provide transport confidentiality and must not be
-described as production-ready HTTPS.
+The public endpoint is now HTTPS on CloudFront's default certificate. The ALB
+listener remains HTTP because this one-day deployment has no approved domain or
+ACM certificate. CloudFront origin traffic must come from AWS's managed
+origin-facing prefix list and present a random listener header held in protected
+Terraform state; the listener default is 403. This materially narrows the
+unencrypted hop but does not make it end-to-end TLS or production-ready.
 
 ---
 
 ## Fixed — retained because the failure mode can recur
+
+### AWS-I16 — Plain HTTP egress changed the authorized caller IP   [fixed]
+
+The ALB timed out externally even though its SG allowed the HTTPS-observed
+caller `/32`, the NACL was default allow-all, the ALB was active, and its target
+was healthy. A protocol comparison found that HTTPS left this environment as
+the authorized address while plain HTTP used relay addresses. A temporary
+reject-only VPC Flow Log recorded the controlled port-80 attempts reaching the
+ALB ENIs from those relay addresses and being rejected by the intended `/32`.
+The in-app browser independently blocked the HTTP URL client-side.
+
+Terraform now provides a restricted CloudFront HTTPS endpoint. A viewer-request
+function enforces the original `/32`; caching is disabled; the origin is
+protected by both the CloudFront prefix list and a random header checked by an
+ALB listener rule. The temporary flow log, log group, and IAM resources were
+removed after diagnosis, and the final Terraform plan reports no changes.
+
+**Lesson:** do not assume an IP-check result transfers across protocols or
+client surfaces. When a restricted ALB looks correct but times out, capture
+rejected flows before widening ingress.
 
 ### AWS-I7 — Uvicorn `httptools` truncated ALB responses for closing clients   [fixed]
 

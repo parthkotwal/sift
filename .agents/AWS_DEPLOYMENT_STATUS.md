@@ -9,7 +9,7 @@
 > **Issue ledger:** `.agents/AWS_ISSUES.md` records deployment failures, residual
 > risks, and operating traps that should survive the handoff.
 >
-> **Last updated:** 2026-07-31 on branch `aws`.
+> **Last updated:** 2026-08-01 on branch `aws`.
 
 ## Update rule
 
@@ -35,10 +35,11 @@ bundles, private endpoints, or credentials in this file.
 - There is no missing application interface blocking the AWS lane. The cloud
   concurrency-4 miss and cold-start behavior remain coding-agent follow-ups in
   `AWS_ISSUES.md` (AWS-I1 and AWS-I2).
-- Current `main` through `3e1ba04` is merged. The deployed image includes the
+- Current `main` through `2361293` is merged. The deployed image includes the
   exact-k response contract, corrected middleware `server_ms`, fixed-rate load
-  generation, and opt-in sub-stage timings. The merged branch passed 246 tests,
-  Ruff, strict mypy, Terraform validation, and a Linux AMD64 container build.
+  generation, opt-in sub-stage timings, and the separate
+  `feature.encode_rows` span. The merged branch passed 246 tests, Ruff, strict
+  mypy, Terraform validation, and the hosted Linux AMD64 container build.
 
 ## Fixed deployment decisions
 
@@ -50,7 +51,7 @@ bundles, private endpoints, or credentials in this file.
 | Environment lifetime | Short-lived showcase. Visible expiry: 2026-08-01 18:00 PDT, followed by user-authorized verified teardown. Hard lifetime ceiling `$10`; operational stop `$8` to reserve `$2` for billing lag. |
 | Runtime | One Linux container image for both the API and one-off Redis materialization commands. |
 | Compute | ECS on Fargate, one 2-vCPU / 4-GiB API task, one Uvicorn worker, and `OPENBLAS_NUM_THREADS=1`, selected by the controlled matrix rather than assumed. |
-| Network | ALB in public subnets with explicit `/32` caller ingress; dedicated restricted benchmark-client security group; ECS API tasks use public IPs for AWS egress; ElastiCache is private; no NAT Gateway. |
+| Network | Restricted CloudFront HTTPS endpoint in front of an ALB in public subnets. The viewer `/32` is enforced at the edge; CloudFront-to-ALB requests require both AWS's origin-facing prefix list and a random origin header. Direct ALB access retains the same `/32`; benchmark clients retain their restricted security group. ECS API tasks use public IPs for AWS egress; ElastiCache is private; no NAT Gateway. |
 | Durable artifacts | Private S3 immutable generation prefixes. Redis remains rebuildable and non-durable. |
 | Managed cache | One private Valkey 8 `cache.t4g.medium` node, using the Redis protocol over TLS. Schema-7 publication used 1.04 GiB locally, which ruled out the earlier micro and left too little headroom on small. No replica, Multi-AZ failover, or snapshots. |
 | Registry | Private ECR repository with Git-SHA image tags. |
@@ -646,7 +647,7 @@ respectively; peak memory was 5.79%, 6.29%, and 10.94%. These are useful
 one-minute service/task aggregates with one desired task, but they cannot show
 individual cores or processes.
 
-Corrected fixed-rate scheduling on the selected topology sustained 20.0
+Corrected direct-ALB fixed-rate scheduling on the selected topology sustained 20.0
 requests/s with 77.06 ms server p99 and a client that kept its schedule. At a
 requested 30/s, queueing grew into seconds and the bounded client eventually
 fell 500 ms behind, so it proves overload rather than a valid 30/s capacity.
@@ -659,11 +660,64 @@ regression path remained intact. All measured requests were decoded completely;
 there were no transport errors. The ALB's former `0.0.0.0/0` rule was replaced
 with one authorized `/32`, and Terraform now has no public default. A dedicated
 benchmark security group reaches only ALB port 80 and AWS HTTPS endpoints.
-Plain HTTP remains an explicitly accepted short-lived residual risk.
+The user-facing endpoint is now HTTPS; the authenticated CloudFront-to-ALB hop
+remains HTTP inside AWS and is an explicitly accepted short-lived residual risk.
 
-Terraform owns the selected image and topology at API task revision 12. The
+Terraform owns the selected image and topology at API task revision 14. The
 target is healthy, the runtime probe reports one worker and one BLAS thread, and
 a final refresh plan reports `No changes`.
+
+### Restricted HTTPS follow-up
+
+The original external timeout was not an unhealthy ALB or a missing route.
+Protocol-specific egress checks showed this environment leaving HTTPS as the
+authorized `/32` but plain HTTP through relay addresses. A short-lived,
+reject-only VPC Flow Log then recorded the controlled port-80 attempts arriving
+at the ALB nodes from those relay addresses and being rejected by the intended
+security-group rule. The diagnostic flow log, log group, and IAM role/policy
+were deleted immediately after the result; Terraform owns none of them now.
+
+Terraform now adds CloudFront distribution `E3AMJXNGP1HCIP` and the published
+viewer-request function `sift-showcase-viewer-allowlist`. The public endpoint is
+`https://d1q85kfkwjx9tf.cloudfront.net`. Caching is disabled, all API methods
+are allowed, IPv6 is disabled because the approved identity is an IPv4 `/32`,
+and the function returns 403 before origin processing for any other viewer IP.
+A live function test returned 403 for an unrelated test address and passed the
+authorized address through. The ALB security group admits CloudFront only via
+AWS's origin-facing managed prefix list, and its listener forwards those
+requests only when CloudFront supplies the random state-held origin header. The
+default listener response is 403; the existing direct `/32` and benchmark-SG
+paths have explicit forwarding rules.
+
+GitHub workflow run `30683908583` passed all 246 tests, Ruff, strict mypy, OIDC,
+the Linux AMD64 build/push, ECS stability, and target-health verification for
+immutable image `ab2c4cf80f40ce0a1007dc2f1f0e298bccb19f5c`, digest
+`sha256:89214309b3d05e6cb1e4e41c47abbc14eb4de725aba0a98bd3662ba6182ab7a1`.
+Terraform reconciliation registered API revision 14 and materialization
+revision 8. ECR scanning completed with the same 3 critical, 5 high, and 3
+medium findings already recorded in AWS-I3.
+
+The first `detail=true` request after reconciliation returned ten results at
+673.144 ms application time; 479.36 ms was catalog construction and 64.42 ms
+was rerank-input construction. The immediate warm request was 40.001 ms. A
+100-request warm diagnostic sample measured p50/p99 of 11.11/13.29 ms for
+`feature.duckdb_query`, 6.10/7.29 ms for `feature.load_relations`, 13.03/14.29
+ms for `ranking.predict`, and 1.63/2.07 ms for the new
+`feature.encode_rows`; one diagnostic keep-alive reset was excluded from those
+99 successful responses. The later 1,000-request connection-reuse gate had no
+transport errors. This confirms the coding agent's conclusion: encoding is
+small; DuckDB statement work is the load-sensitive ceiling.
+
+The public 20/s result depends on connection behavior. With 1,000 fresh TLS
+connections, CloudFront held 20.0/s but missed at 120.55 ms server p99 (32/1000
+over 100 ms). With connection reuse, the same endpoint passed at 95.41 ms
+server p99 (8/1000 over 100 ms) with zero transport errors. A direct in-VPC
+Fargate control using the same image, users, rate, and benchmark SG passed at
+42.14 ms server p99 with 0/1000 over budget. The one-off clients exited and
+their temporary task definitions were deregistered. The image is therefore not
+the regression. The measured difference isolates the public edge path and is
+consistent with fresh remote TLS connections reshaping arrivals before they
+reach the single task.
 
 ### Current one-day price envelope
 
@@ -683,12 +737,13 @@ Public on-demand prices were queried through the AWS Price List API on
 The billing/cost skill supplied the current-date, Price List, and deterministic
 calculation rules used here. Cost Explorer reported only `$0.00044065` of older
 S3 usage because current-day deployment charges had not landed. A conservative
-deterministic upper bound at 2026-07-31 19:07 PDT, including deliberately
-pessimistic duplicate-task allowance, benchmark clients, and three paid Cost
-Explorer API calls, is `$2.25`. That leaves `$5.75` before the operational `$8`
-stop and `$7.75` before the hard lifetime `$10` ceiling. Keeping the selected
-topology until the 2026-08-01 18:00 PDT expiry adds about `$4.31` of fixed-rate
-cost before variable LCU/log/storage/transfer charges. There is no AWS Budget;
+deterministic upper bound at 2026-08-01 12:00 PDT is `$5.48`. It advances the
+earlier `$2.25` upper bound by the exact elapsed fixed daily rate and adds a
+`$0.05` allowance for CloudFront requests/functions, brief flow logging, and
+the two diagnostic Fargate clients. That leaves `$2.52` before the operational
+`$8` stop and `$4.52` before the hard lifetime `$10` ceiling. Keeping the
+selected topology until the 2026-08-01 18:00 PDT expiry projects a conservative
+`$6.61` upper bound before unexpected variable usage. There is no AWS Budget;
 creating a notification requires an approved destination, and daily billing
 lag means it would be warning-only rather than enforcement.
 
@@ -698,19 +753,20 @@ The showcase is live and billable. Terraform local state and its backup exist
 under `infra/terraform/` and are gitignored. Preserve them until verified
 teardown succeeds.
 
-A final post-matrix state copy is stored outside the repository at
-`~/.codex/aws-state-backups/sift-showcase-20260731T1909PDT.tfstate`; its directory
+A final post-HTTPS state copy is stored outside the repository at
+`~/.codex/aws-state-backups/sift-showcase-20260801T1200PDT.tfstate`; its directory
 is mode 0700, the file is mode 0600, and its SHA-256 matches live state at
-`afed44d5c33e710caa95bd78bbf1e7243ca38d20bfa702863faeaad8e043beb6`.
+`a4b6d4658afd818417bd3477565c55a45ffa1c7a07ade6fad61b78825ba2206b`.
 
 Live resources include the Terraform-managed VPC/network rules, dedicated
 benchmark client security group, private S3
 bucket, private ECR repository, private Valkey node, two short-retention log
 groups, ECS cluster/task definitions/service, internet-facing ALB, ECS task and
-execution roles, GitHub OIDC provider, and GitHub deploy role. One 2-vCPU /
+execution roles, GitHub OIDC provider, GitHub deploy role, restricted CloudFront
+distribution, and CloudFront viewer-request function. One 2-vCPU /
 4-GiB API task with one Uvicorn worker and one OpenBLAS thread is continuously
-running. All one-off benchmark tasks have exited. The live ALB caller ingress is
-one explicit `/32`, not `0.0.0.0/0`. Do not destroy any resource until the user
+running. All one-off benchmark tasks have exited. The live viewer and direct-ALB
+caller ingress are one explicit `/32`, not `0.0.0.0/0`. Do not destroy any resource until the user
 explicitly asks to take the showcase down.
 
 ## Exact next action
