@@ -41,6 +41,15 @@ bundles, private endpoints, or credentials in this file.
   `feature.encode_rows` span. The merged branch passed 246 tests, Ruff, strict
   mypy, Terraform validation, and the hosted Linux AMD64 container build.
 
+## Final disposition
+
+The user-authorized teardown completed on 2026-08-01. The Sift showcase
+endpoint is no longer live, Terraform state is empty, and the owning AWS
+service APIs independently confirm that the runtime, data stores, public IPv4
+paths, networking, logs, and project IAM/OIDC resources are absent. This file
+retains the final deployment and benchmark evidence as a historical record; it
+does not describe a currently deployed environment.
+
 ## Fixed deployment decisions
 
 | Topic | Decision |
@@ -48,7 +57,7 @@ bundles, private endpoints, or credentials in this file.
 | AWS identity | Keep the existing identity: account `442042531996`, IAM user ARN `arn:aws:iam::442042531996:user/parth`. |
 | Region | `us-west-2`. |
 | Infrastructure as code | Terraform. Installed CLI: `v1.15.8` on `darwin_arm64`. The CLI has no usage charge; provisioned AWS resources do. |
-| Environment lifetime | Short-lived showcase. Visible expiry: 2026-08-01 18:00 PDT, followed by user-authorized verified teardown. Hard lifetime ceiling `$10`; operational stop `$8` to reserve `$2` for billing lag. |
+| Environment lifetime | Short-lived showcase. User-authorized verified teardown completed before the visible 2026-08-01 18:00 PDT expiry. Hard lifetime ceiling `$10`; operational stop `$8` reserved `$2` for billing lag. |
 | Runtime | One Linux container image for both the API and one-off Redis materialization commands. |
 | Compute | ECS on Fargate, one 2-vCPU / 4-GiB API task, one Uvicorn worker, and `OPENBLAS_NUM_THREADS=1`, selected by the controlled matrix rather than assumed. |
 | Network | Restricted CloudFront HTTPS endpoint in front of an ALB in public subnets. The viewer `/32` is enforced at the edge; CloudFront-to-ALB requests require both AWS's origin-facing prefix list and a random origin header. Direct ALB access retains the same `/32`; benchmark clients retain their restricted security group. ECS API tasks use public IPs for AWS egress; ElastiCache is private; no NAT Gateway. |
@@ -719,7 +728,7 @@ the regression. The measured difference isolates the public edge path and is
 consistent with fresh remote TLS connections reshaping arrivals before they
 reach the single task.
 
-### Current one-day price envelope
+### Final one-day price envelope
 
 Public on-demand prices were queried through the AWS Price List API on
 2026-07-31 for `us-west-2`, then calculated deterministically:
@@ -736,49 +745,79 @@ Public on-demand prices were queried through the AWS Price List API on
 
 The billing/cost skill supplied the current-date, Price List, and deterministic
 calculation rules used here. Cost Explorer reported only `$0.00044065` of older
-S3 usage because current-day deployment charges had not landed. A conservative
-deterministic upper bound at 2026-08-01 12:00 PDT is `$5.48`. It advances the
-earlier `$2.25` upper bound by the exact elapsed fixed daily rate and adds a
+S3 usage because current-day deployment charges had not landed. The final
+conservative upper bound through 2026-08-01 12:45:34 PDT is `$5.62`: the earlier
+`$2.25` upper bound plus `$3.32108` at the fixed `$4.51776` daily rate and a
 `$0.05` allowance for CloudFront requests/functions, brief flow logging, and
-the two diagnostic Fargate clients. That leaves `$2.52` before the operational
-`$8` stop and `$4.52` before the hard lifetime `$10` ceiling. Keeping the
-selected topology until the 2026-08-01 18:00 PDT expiry projects a conservative
-`$6.61` upper bound before unexpected variable usage. There is no AWS Budget;
-creating a notification requires an approved destination, and daily billing
-lag means it would be warning-only rather than enforcement.
+the two diagnostic Fargate clients. This deliberately overstates the last
+minutes by charging the full topology through the end of verification even
+though ECS stopped at 12:37 PDT and the other services deleted progressively.
+It remains below both the `$8` operational stop and `$10` hard ceiling.
 
-## AWS resource state
+Cost Explorer is not a final-cost oracle on teardown day: same-day usage and
+deletion effects arrive after billing-system delay. Its eventual posted total
+may differ from the conservative bound, and a missing or partial current-day
+number does not imply that resources remain live. No budget or automation was
+created.
 
-The showcase is live and billable. Terraform local state and its backup exist
-under `infra/terraform/` and are gitignored. Preserve them until verified
-teardown succeeds.
+## AWS resource state — teardown verified
 
-A final post-HTTPS state copy is stored outside the repository at
-`~/.codex/aws-state-backups/sift-showcase-20260801T1200PDT.tfstate`; its directory
-is mode 0700, the file is mode 0600, and its SHA-256 matches live state at
+Before deletion, the final selection was preserved as immutable image
+`ab2c4cf80f40ce0a1007dc2f1f0e298bccb19f5c`, digest
+`sha256:89214309b3d05e6cb1e4e41c47abbc14eb4de725aba0a98bd3662ba6182ab7a1`,
+API task revision 14, and materialization revision 8. The final CloudFront,
+direct in-VPC, cold/warm, and detailed-stage benchmark results remain recorded
+in Phase 7 above.
+
+The immediate pre-destroy state copy is stored outside the repository at
+`~/.codex/aws-state-backups/sift-showcase-20260801T1234PDT-pre-destroy.tfstate`.
+Its directory is mode 0700, the file is mode 0600, and its SHA-256 matches the
+pre-destroy local state at
 `a4b6d4658afd818417bd3477565c55a45ffa1c7a07ade6fad61b78825ba2206b`.
+The earlier 12:00 PDT protected copy has the same checksum.
 
-Live resources include the Terraform-managed VPC/network rules, dedicated
-benchmark client security group, private S3
-bucket, private ECR repository, private Valkey node, two short-retention log
-groups, ECS cluster/task definitions/service, internet-facing ALB, ECS task and
-execution roles, GitHub OIDC provider, GitHub deploy role, restricted CloudFront
-distribution, and CloudFront viewer-request function. One 2-vCPU /
-4-GiB API task with one Uvicorn worker and one OpenBLAS thread is continuously
-running. All one-off benchmark tasks have exited. The live viewer and direct-ALB
-caller ingress are one explicit `/32`, not `0.0.0.0/0`. Do not destroy any resource until the user
-explicitly asks to take the showcase down.
+The inspected initial plan contained 60 managed deletes and no other managed
+actions. Terraform removed the runtime, CloudFront, ALB, Valkey, logs,
+networking, and IAM/OIDC resources. S3 and ECR initially refused deletion
+because their force-delete flags were still false in prior state; a saved,
+targeted recovery plan changed only those two state-backed flags with zero
+creates, followed by a second deletion-only plan containing exactly the S3
+bucket and ECR repository. Both reproducible stores and their contents then
+deleted successfully. No infrastructure was recreated.
+
+Post-destroy evidence:
+
+- `terraform state list` is empty;
+- ECS lists no Sift cluster, service, running/pending task, or active/inactive
+  Sift task definition; the final stopped-task record confirms the service
+  scheduler stopped it at 12:37:17 PDT;
+- CloudFront returns `NoSuchDistribution` and `NoSuchFunctionExists`;
+- ELB returns `LoadBalancerNotFound`, `TargetGroupNotFound`, and
+  `ListenerNotFound`, and both the ALB-description and former-VPC ENI queries
+  are empty;
+- ElastiCache returns `ReplicationGroupNotFoundFault` and
+  `CacheSubnetGroupNotFoundFault`;
+- S3 returns 404 and ECR returns `RepositoryNotFoundException`;
+- both `/ecs/sift-showcase/` log groups are absent;
+- the former VPC ID returns `InvalidVpcID.NotFound`; project VPCs, subnets,
+  route tables, security groups, internet/NAT gateways, ENIs, and Elastic IPs
+  query empty;
+- all three project IAM roles return `NoSuchEntity`, and the GitHub OIDC
+  provider is absent from both direct lookup and provider listing.
+
+The Resource Groups Tagging API still returned cached ARNs on two post-delete
+checks, including the stopped task and deleted security-group rules. Direct
+queries to every owning service above prove those resources are absent; the tag
+index is eventually consistent and is not a billing or liveness signal.
 
 ## Exact next action
 
-Keep the showcase live for the user, but treat 2026-08-01 18:00 PDT as the
-teardown decision deadline. Preserve `infra/terraform/terraform.tfstate` and
-the checksum-verified mode-0600 backup outside the repository. Do not run
-destroy until the user explicitly asks to take the showcase down. When asked,
-follow the exact inspected destroy-plan and independent post-destroy checklist
-in `infra/terraform/README.md`.
+None in the AWS deployment lane. The endpoint is intentionally offline and the
+teardown stopping condition has been met. Preserve this historical record and
+the protected pre-destroy state backup; do not deploy or start a new AWS phase
+without a new, explicit user request.
 
 ## Remaining phases
 
-- Phase 8 only: after the user asks, preserve final evidence, destroy paid
-  resources, and verify teardown and billing views.
+- None. Phase 8 teardown is complete and independently verified. Cost
+  Explorer's eventual final posting will lag this operational closure.

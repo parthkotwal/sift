@@ -4,7 +4,9 @@ This is the deployment-specific companion to `ISSUES.md`. It records problems
 encountered while publishing Sift to AWS, including resolved failures whose
 diagnosis is likely to matter again. Application/model issues still belong in
 `ISSUES.md`; deployment execution evidence belongs in
-`AWS_DEPLOYMENT_STATUS.md`.
+`AWS_DEPLOYMENT_STATUS.md`. The showcase has been deleted; open entries below
+are historical application/deployment findings, not descriptions of a live
+endpoint.
 
 **Last updated:** 2026-08-01 on branch `aws`.
 
@@ -89,6 +91,10 @@ disappear.
 **Impact:** this is accepted residual risk for the short-lived showcase, not a
 clean security scan or a production-ready image assessment.
 
+Teardown deleted the ECR repository and image. The CVEs were not fixed; removal
+ended the live deployment exposure while preserving this finding as historical
+evidence.
+
 **Next investigation:** rebuild from a patched upstream image when available or
 evaluate a smaller compatible runtime image, then rerun package scanning and the
 complete container smoke before changing the deployment selection.
@@ -106,19 +112,6 @@ deployment behavior.
 
 **Production change:** use overlapping tasks (for example, minimum healthy 100
 and maximum 200), sufficient desired count, and then verify draining and rollback.
-
-### AWS-I5 — Teardown depends on preserving ignored local Terraform state   [open]
-
-Terraform state and its backup are local under `infra/terraform/` and are
-gitignored. They currently own the live showcase. Losing them would not delete
-AWS resources, but it would make the planned, verified teardown substantially
-harder and increase the risk of leaving billable resources behind.
-
-**Guardrail:** preserve `infra/terraform/terraform.tfstate` and the mode-0600
-checksum-verified backup outside the repository; never commit them. The visible
-expiry is 2026-08-01 18:00 PDT. Do not run `terraform destroy` until the user
-explicitly asks to take the showcase down. Before teardown, follow the exact
-destroy-plan and independent post-destroy checklist in `infra/terraform/README.md`.
 
 ### AWS-I6 — GitHub Actions currently emits a Node runtime deprecation warning   [open]
 
@@ -167,6 +160,36 @@ unencrypted hop but does not make it end-to-end TLS or production-ready.
 ---
 
 ## Fixed — retained because the failure mode can recur
+
+### AWS-I18 — Destroy-time asset opt-in did not update prior Terraform state   [fixed]
+
+The first audited destroy plan contained 60 deletes and no create or update
+actions, and it was generated with `allow_asset_deletion=true`. It removed the
+runtime and all dependent infrastructure, but S3 and ECR rejected their final
+deletions as non-empty. The provider used the `force_destroy=false` and
+`force_delete=false` values already stored in state rather than persisting the
+new deletion behavior from the destroy-only plan.
+
+Recovery used a saved targeted plan that changed only those two flags in place:
+0 additions, 2 changes, and 0 deletions. A new saved destroy plan then contained
+only the S3 bucket and ECR repository as deletion actions. Applying it removed
+both reproducible stores and their contents; Terraform state is empty.
+
+**Guardrail:** before producing the deletion-only plan, first apply a separately
+inspected plan that persists `allow_asset_deletion=true` while the full
+configuration is still converged. Do not assume passing the value only to
+`plan -destroy` changes an existing resource's stored force-delete behavior.
+
+### AWS-I5 — Teardown depended on preserving ignored local Terraform state   [fixed]
+
+Terraform state and its backup were local and gitignored. The protected
+mode-0600, checksum-verified pre-destroy copy allowed Terraform to remove the
+complete showcase in dependency order and diagnose the final S3/ECR flag issue
+without importing or deleting resources ad hoc. The live Terraform state is now
+empty; the historical protected backup remains outside the repository.
+
+**Guardrail:** for another short-lived local-state environment, make and verify
+an external protected backup before apply and again immediately before teardown.
 
 ### AWS-I16 — Plain HTTP egress changed the authorized caller IP   [fixed]
 
@@ -295,15 +318,14 @@ behavior.
 
 ## Operating invariants
 
-- The showcase is live and billable; keep it running until the user explicitly
-  requests teardown.
-- Treat `$8` as the operational stop point for the lifetime `$10` ceiling, leaving
-  at least `$2` for billing lag; do not use Cost Explorer's current-day silence as
-  proof that today's resources are free.
-- Deploy only immutable Git-SHA image tags and immutable S3 generations.
-- Preserve local Terraform state, delete saved plan files after review/use, and
-  require a clean refresh plan after any out-of-band workflow deployment.
+- The showcase is deleted and the endpoint is not live. Do not redeploy without
+  a new, explicit user request.
+- The final conservative cost upper bound is `$5.62`. Cost Explorer's delayed
+  final posting is not an operational teardown check.
+- Preserve the protected pre-destroy backup and the empty local Terraform state
+  as historical evidence; do not commit either state file.
+- Delete saved plan files after review/use.
 - Keep `src/sift/**` read-only in the AWS lane; hand application performance or
   lifecycle-interface changes to the coding agent.
-- A healthy target, a 200 status, and a completed workflow are separate checks:
-  validate target health, full response bodies, and Terraform convergence.
+- For any future deployment, a healthy target, a 200 status, and a completed
+  workflow remain separate checks.

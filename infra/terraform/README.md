@@ -3,6 +3,8 @@
 This directory is the Terraform root for the short-lived Sift AWS showcase.
 `.agents/AWS_DEPLOYMENT_PLAN.md` defines the architecture and
 `.agents/AWS_DEPLOYMENT_STATUS.md` records implementation status and evidence.
+The user-authorized teardown completed on 2026-08-01; the endpoint is no longer
+live and `terraform state list` is empty.
 
 ## Safety boundary
 
@@ -192,7 +194,7 @@ it does not hide the catalog initialization paid by the first recommendation.
 materialization, and reproducible short-lived benchmark clients.
 `https_endpoint` exposes the restricted public URL.
 
-## Inspected teardown procedure
+## Verified teardown procedure
 
 Teardown is user-authorized work. The expiry tag is a reminder, not permission
 for an automatic deletion script. Run these steps only after the user asks to
@@ -201,8 +203,23 @@ take the showcase down.
 1. Confirm the AWS caller is account `442042531996`, preserve final
    non-sensitive evidence, and make a new mode-0600 copy of
    `terraform.tfstate` outside the repository. Record and verify its SHA-256.
-2. Keep the ignored deployment selection intact. Generate the destroy plan with
-   deliberate deletion of the reproducible S3/ECR assets enabled:
+2. Keep the ignored deployment selection intact. First persist the deliberate
+   S3/ECR deletion opt-in in state while the configuration is still converged:
+
+   ```bash
+   terraform -chdir=infra/terraform plan \
+     -var='allow_asset_deletion=true' \
+     -out=asset-deletion.tfplan
+   ```
+
+   Inspect this plan before apply. It must contain only the in-place changes
+   `aws_s3_bucket.artifacts.force_destroy: false -> true` and
+   `aws_ecr_repository.api.force_delete: false -> true`: 0 additions, 2
+   changes, and 0 deletions. Apply that exact plan. Passing the variable only
+   to `plan -destroy` did not update the flags already stored in state during
+   the 2026-08-01 teardown, and both non-empty resources initially refused
+   deletion.
+3. Generate the deletion-only plan:
 
    ```bash
    terraform -chdir=infra/terraform plan \
@@ -211,17 +228,17 @@ take the showcase down.
      -out=destroy.tfplan
    ```
 
-3. Inspect both the human plan and `terraform show -json destroy.tfplan`.
+4. Inspect both the human plan and `terraform show -json destroy.tfplan`.
    Every managed action must be deletion-only. Confirm it includes the ECS
    service/tasks, CloudFront distribution/function, ALB/listener/target group,
    Valkey replication group, S3
    bucket, ECR repository, log groups, public networking, IAM roles/policies,
    and GitHub OIDC provider. Stop on any create/update action or missing paid
    resource.
-4. Apply that exact saved plan, then delete `destroy.tfplan`. Do not substitute
+5. Apply that exact saved plan, then delete both saved plans. Do not substitute
    ad-hoc AWS deletion commands; they would create Terraform drift and make a
    partial teardown harder to diagnose.
-5. Verify independently after provider completion and eventual-consistency
+6. Verify independently after provider completion and eventual-consistency
    settling:
 
    - `terraform state list` is empty;
@@ -234,8 +251,10 @@ take the showcase down.
    - no NAT Gateway exists and the showcase VPC/subnets/security groups are
      absent;
    - the Sift ECS/GitHub IAM roles and GitHub OIDC provider are absent;
-   - Resource Groups Tagging API returns no remaining resources tagged
-     `Project=sift` and `Environment=showcase` after a second check.
+   - query Resource Groups Tagging API twice for resources tagged
+     `Project=sift` and `Environment=showcase`. Its index can retain deleted
+     ARNs after every owning-service API reports absence, so record stale cache
+     entries but use direct service lookups as the teardown authority.
 
 Cost Explorer and AWS Budgets lag behind deletion, so a nonzero or missing
 same-day billing value is not a teardown verdict. Preserve the empty state and
