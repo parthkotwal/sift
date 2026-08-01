@@ -197,8 +197,3 @@ IP-restricted security posture rather than production hardening, HTTP on the int
 CloudFront-to-ALB hop, and accepted base-image CVEs in Debian's `perl-base`. Those were
 deliberate choices for a one-day showcase and are recorded as accepted limitations in
 `.agents/AWS_ISSUES.md`, not as unfinished work.
-
-## Agent workflow
-
-Claude Code and Codex review each other's commits automatically; see
-[scripts/README.md](scripts/README.md).
