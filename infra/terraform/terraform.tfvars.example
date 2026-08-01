@@ -6,6 +6,10 @@ project_name = "sift"
 environment  = "showcase"
 vpc_cidr     = "10.42.0.0/20"
 
+# Required: replace this documentation-only address with the caller's public /32.
+# Unrestricted 0.0.0.0/0 exposure is not a safe showcase default.
+alb_ingress_cidrs = ["203.0.113.10/32"]
+
 # Keep false until Phase 8 explicitly decides to delete deployment assets.
 allow_asset_deletion = false
 
@@ -14,7 +18,8 @@ elasticache_node_type          = "cache.t4g.medium"
 cloudwatch_log_retention_days  = 3
 
 additional_tags = {
-  Purpose = "portfolio-showcase"
+  Purpose   = "portfolio-showcase"
+  ExpiresAt = "2026-08-01T18:00:00-07:00"
 }
 
 # Leave both unset for the foundation-only plan. Activate task definitions and
@@ -24,6 +29,10 @@ additional_tags = {
 
 # Keep zero until the one-off materialization task and skew verification pass.
 # api_desired_count = 0
+# api_worker_count   = 1
+
+# Null is the observed-library baseline. Set exactly 1 for the controlled BLAS cells.
+# openblas_num_threads = 1
 
 # Initial measurement envelope; valid pairs and either architecture are configurable.
 # fargate_cpu              = 1024

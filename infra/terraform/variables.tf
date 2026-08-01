@@ -56,7 +56,6 @@ variable "vpc_cidr" {
 variable "alb_ingress_cidrs" {
   description = "IPv4 CIDRs allowed to call the public HTTP demo listener."
   type        = set(string)
-  default     = ["0.0.0.0/0"]
 
   validation {
     condition = (
@@ -185,14 +184,44 @@ variable "fargate_cpu_architecture" {
   }
 }
 
+variable "api_worker_count" {
+  description = "Uvicorn worker processes per API task; vary only in the controlled runtime matrix."
+  type        = number
+  default     = 1
+
+  validation {
+    condition     = contains([1, 2], var.api_worker_count)
+    error_message = "api_worker_count must be one or two for the controlled showcase matrix."
+  }
+}
+
+variable "openblas_num_threads" {
+  description = "Optional OpenBLAS thread cap; null preserves library auto-detection for the baseline."
+  type        = number
+  default     = null
+  nullable    = true
+
+  validation {
+    condition = (
+      var.openblas_num_threads == null
+      || (
+        var.openblas_num_threads >= 1
+        && var.openblas_num_threads <= 16
+        && floor(var.openblas_num_threads) == var.openblas_num_threads
+      )
+    )
+    error_message = "openblas_num_threads must be null or an integer from 1 through 16."
+  }
+}
+
 variable "api_desired_count" {
-  description = "API task count after activation; keep zero until materialization and skew verification pass."
+  description = "API task count after activation; two is reserved for the measured two-task matrix cell."
   type        = number
   default     = 0
 
   validation {
-    condition     = contains([0, 1], var.api_desired_count)
-    error_message = "api_desired_count must be zero or one; this showcase has no autoscaling."
+    condition     = contains([0, 1, 2], var.api_desired_count)
+    error_message = "api_desired_count must be zero, one, or two; this showcase has no autoscaling."
   }
 
   validation {

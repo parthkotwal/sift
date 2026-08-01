@@ -1210,6 +1210,7 @@ dependencies = [
     { name = "lightgbm" },
     { name = "numpy" },
     { name = "redis" },
+    { name = "threadpoolctl" },
     { name = "uvicorn", extra = ["standard"] },
 ]
 
@@ -1234,6 +1235,7 @@ requires-dist = [
     { name = "lightgbm", specifier = ">=4.7.0" },
     { name = "numpy", specifier = ">=2.5.1" },
     { name = "redis", specifier = ">=5.2" },
+    { name = "threadpoolctl", specifier = ">=3.6,<4" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.34" },
 ]
 

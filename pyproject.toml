@@ -16,6 +16,7 @@ dependencies = [
     "lightgbm>=4.7.0",
     "numpy>=2.5.1",
     "redis>=5.2",
+    "threadpoolctl>=3.6,<4",
     "uvicorn[standard]>=0.34",
 ]
 

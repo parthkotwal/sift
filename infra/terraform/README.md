@@ -52,9 +52,11 @@ The VPC defaults to `10.42.0.0/20`, divided into two public and two private
 internet route. Public subnets do not assign public IPs by default; the later
 ECS service must opt its Fargate ENIs into public IP assignment explicitly.
 
-Security-group relationships are deliberately directional:
+Security-group relationships are deliberately directional. `alb_ingress_cidrs`
+has no default and must be set explicitly; use the authorized caller's public
+`/32` unless unrestricted publication has been separately approved:
 
-- the public CIDR input reaches only ALB port 80;
+- the explicit caller CIDR input reaches only ALB port 80;
 - the ALB reaches only ECS task port 8000;
 - ECS tasks reach public HTTPS endpoints and Redis port 6379;
 - Redis accepts port 6379 only from the ECS task security group.
@@ -139,6 +141,14 @@ and TLS Redis environment contract. The API task pins one Uvicorn worker and
 writes to the API log group. The one-off materialization task runs publication
 and the 100-pair skew check in sequence and writes to its own log group.
 
+The runtime matrix may set `api_worker_count` to two and may pin
+`openblas_num_threads = 1`; neither is a default or an assumed improvement. A
+startup probe records the task-visible logical CPU count, the BLAS environment,
+and NumPy's runtime report. Access logs include the serving process ID so a
+multi-worker run can prove that every worker received discarded warmup traffic
+before its measured 1,000 requests. Keep the `h11` backend, 65-second keep-alive,
+and full-body closing-connection regression check in every cell.
+
 The initial measurement envelope is x86-64, 1 vCPU, and 2 GiB. Architecture,
 CPU, and memory remain validated inputs so the deployed task can match the CI
 image and be resized from cloud measurements. The API service uses public
@@ -151,7 +161,8 @@ Activation has three deliberate states:
 2. set both inputs with `api_desired_count = 0` to register the task definitions
    and service without starting the API;
 3. after the one-off task materializes Redis and its skew check passes, set
-   `api_desired_count = 1` to start exactly one API task.
+   `api_desired_count = 1` to start the baseline task. Two tasks are allowed only
+   for the controlled 1-vCPU / 2-GiB-per-task matrix cell.
 
 The service has no autoscaling. Deployment percentages are 0/100 so replacing
 the one-task demo may cause brief downtime but does not run two paid API tasks.

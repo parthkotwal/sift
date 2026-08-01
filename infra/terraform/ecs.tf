@@ -5,7 +5,7 @@ locals {
     "${data.aws_caller_identity.current.account_id}.dkr.ecr.${var.aws_region}.${data.aws_partition.current.dns_suffix}/${aws_ecr_repository.api.name}:${var.deployment_image_tag}"
   ) : null
   redis_url = "rediss://${aws_elasticache_replication_group.redis.primary_endpoint_address}:${aws_elasticache_replication_group.redis.port}/0"
-  task_environment = local.deployment_activated ? [
+  task_environment = local.deployment_activated ? concat([
     {
       name  = "SIFT_ARTIFACT_BUCKET"
       value = aws_s3_bucket.artifacts.id
@@ -18,7 +18,12 @@ locals {
       name  = "SIFT_REDIS_URL"
       value = local.redis_url
     },
-  ] : []
+    ], var.openblas_num_threads == null ? [] : [
+    {
+      name  = "OPENBLAS_NUM_THREADS"
+      value = tostring(var.openblas_num_threads)
+    },
+  ]) : []
 }
 
 resource "aws_ecs_cluster" "this" {
@@ -52,6 +57,10 @@ resource "aws_ecs_task_definition" "api" {
       image     = local.container_image
       essential = true
       command = [
+        "python",
+        "-m",
+        "scripts.runtime_probe",
+        "--",
         "uvicorn",
         "sift.api.main:app",
         "--host",
@@ -59,11 +68,13 @@ resource "aws_ecs_task_definition" "api" {
         "--port",
         "8000",
         "--workers",
-        "1",
+        tostring(var.api_worker_count),
         "--http",
         "h11",
         "--timeout-keep-alive",
         "65",
+        "--log-config",
+        "/app/scripts/uvicorn_log_config.json",
       ]
       environment = local.task_environment
       portMappings = [
