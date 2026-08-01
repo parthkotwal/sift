@@ -183,12 +183,18 @@ def _optional_int(state: Mapping[str, str], name: str) -> int | None:
 
 
 def _rows_json(columns: Sequence[str], rows: Sequence[tuple[object, ...]]) -> str:
-    """Encode a small relation as one parameter, avoiding row-wise DuckDB binding."""
-    return json.dumps(
-        [dict(zip(columns, row, strict=True)) for row in rows],
-        ensure_ascii=False,
-        default=_string,
-    )
+    """Encode a small relation as one parameter, avoiding row-wise DuckDB binding.
+
+    Spanned because this is pure Python holding the GIL — a dict per row plus
+    `json.dumps` — while the DuckDB call it feeds releases it. Under concurrency those
+    two behave nothing alike, and `feature.load_relations` bundles them.
+    """
+    with span("feature.encode_rows"):
+        return json.dumps(
+            [dict(zip(columns, row, strict=True)) for row in rows],
+            ensure_ascii=False,
+            default=_string,
+        )
 
 
 def _last_rows(relation: str, keys: str) -> str:
