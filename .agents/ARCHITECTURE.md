@@ -61,6 +61,8 @@ They are not required to sum, because per-stage p99s are not additive — each s
 
 Instrumented per stage from day one: an end-to-end number with no breakdown is a footgun (`AGENTS.md`), a per-stage number with no concurrency level is not a contract (the same code measured 18ms and 162ms p50 on offered load alone), and a p99 over too few samples on a loaded host is not a measurement (the same build gave 50ms and 99ms minutes apart at load 8.6 on 4 cores). `python -m sift.api.bench --check` is what verifies all three — it gates on ≥1,000 samples and refuses to gate on a contended host. See `ISSUES.md` I31.
 
+The contract is asserted on **`server_ms`** (the middleware's `app;dur`), not on the funnel's own `total_ms`, which starts after routing and threadpool queueing — a budget that does not cover the whole request is not a budget on the request (D34, `ISSUES.md` I37). `client_wall_ms` is reported and never asserted, because through an ALB it is mostly geography. Load is offered two ways and the report says which ran: closed-loop at a concurrency, where throughput is `concurrency / latency` by construction and is *not* capacity, and `--rate`, a fixed arrival schedule, which is what shows saturation. `?detail=true` returns opt-in sub-stage timings for locating a cost the five stages are too coarse to explain; they are diagnostic and deliberately not budgeted.
+
 ## Offline path
 
 A batch job (plain scheduled scripts — no orchestrator, a deliberate cut, `DECISIONS.md` D10) that:

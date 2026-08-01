@@ -19,6 +19,7 @@ from sift.api.bench import (
     deterministic_users,
     quiet_host_threshold,
     run_benchmark,
+    server_timing_ms,
 )
 
 
@@ -217,3 +218,131 @@ def test_an_unreadable_load_average_does_not_block_measurement() -> None:
     )
     assert report.host_was_quiet
     assert "host load" not in report.render()
+
+
+# --- three clocks, and which one the verdict uses --------------------------------
+
+
+def _timed(
+    total: float, server: float | None = None, client: float | None = None
+) -> dict[str, float]:
+    row = _sample(total)
+    row["client_wall_ms"] = client if client is not None else total + 1.0
+    if server is not None:
+        row["server_ms"] = server
+    return row
+
+
+def test_server_timing_is_parsed_and_a_missing_metric_is_none_not_zero() -> None:
+    """Absent must not read as zero: "the server did not say" and "the server said it
+    took no time" lead to opposite conclusions."""
+    header = "retrieval;dur=2.500, features;dur=20.000, app;dur=31.250"
+    assert server_timing_ms(header, "app") == 31.25
+    assert server_timing_ms(header, "retrieval") == 2.5
+    assert server_timing_ms(header, "rerank") is None
+    assert server_timing_ms(None, "app") is None
+    assert server_timing_ms("app;dur=notanumber", "app") is None
+
+
+def test_the_verdict_uses_the_server_clock_not_the_funnel() -> None:
+    """The point of the rework. A funnel comfortably inside the budget must still MISS
+    when the framework time outside its timer pushes the real request over — otherwise a
+    change could pass by relocating delay rather than removing it."""
+    fetch, _ = _fetch([_timed(total=60.0, server=END_TO_END_P99_MS + 20.0)])
+    report = run_benchmark(fetch, ["u1", "u2"], concurrency=1)
+
+    assert report.contract_clock == "server_ms"
+    assert report.measures_server_clock
+    assert not report.ok, "a funnel under budget hid a server request over it"
+    assert report.over_contract == 2
+    assert "<- contract" in report.render()
+
+
+def test_the_gaps_between_clocks_get_their_own_lines() -> None:
+    """A cost in no stage still has to land somewhere nameable."""
+    fetch, _ = _fetch([_timed(total=60.0, server=75.0, client=200.0)])
+    report = run_benchmark(fetch, ["u1"], concurrency=1)
+    by_name = {stage.name: stage for stage in report.stages}
+    assert by_name["framework_ms"].p50 == 15.0, "server minus funnel"
+    assert by_name["transport_ms"].p50 == 125.0, "client minus server"
+    # Reported, never asserted: transport is mostly geography and framework has no line.
+    assert by_name["framework_ms"].budget_ms is None
+    assert by_name["transport_ms"].budget_ms is None
+
+
+def test_a_run_without_app_dur_falls_back_and_says_so() -> None:
+    """An endpoint too old to report `app;dur` still measures, but the report must not
+    let that pass as a verified end-to-end promise."""
+    fetch, _ = _fetch([_timed(total=30.0)])  # no server_ms
+    report = run_benchmark(fetch, ["u1", "u2"], concurrency=1)
+    assert report.contract_clock == "total_ms"
+    assert not report.measures_server_clock
+    assert "did not report app;dur" in report.render()
+    assert "unmeasured" in report.render()
+
+
+def test_a_clock_over_budget_does_not_fail_the_run_when_it_is_not_the_contract() -> None:
+    """`client_wall_ms` through an ALB is dominated by network distance. Failing a run on
+    it would make every remote benchmark red for a reason the service cannot fix."""
+    fetch, _ = _fetch([_timed(total=30.0, server=35.0, client=END_TO_END_P99_MS * 5)])
+    report = run_benchmark(fetch, ["u1", "u2"], concurrency=1)
+    assert report.ok
+    assert report.over_contract == 0
+
+
+# --- load models -----------------------------------------------------------------
+
+
+def test_closed_loop_says_its_throughput_is_not_capacity() -> None:
+    """The trap this warning exists for: 4 threads / 260ms round trip is 15.4 req/s, and
+    reading that as the server's ceiling is a statement about the load generator."""
+    fetch, _ = _fetch([_timed(total=30.0, server=31.0)])
+    rendered = run_benchmark(fetch, ["u1", "u2"], concurrency=4).render()
+    assert "closed loop" in rendered
+    assert "not the server's capacity" in rendered
+    assert "req/s" in rendered
+
+
+def test_a_fixed_rate_run_reports_offered_against_achieved() -> None:
+    fetch, _ = _fetch([_timed(total=1.0, server=1.5)])
+    report = run_benchmark(fetch, [f"u{i}" for i in range(20)], concurrency=4, rate=500.0)
+    assert report.offered_rate == 500.0
+    assert report.achieved_rate is not None
+    assert report.client_kept_up, "an instant fetcher must not fall behind"
+    assert "fixed rate" in report.render()
+    assert "offered 500.0/s" in report.render()
+
+
+def test_a_client_that_cannot_keep_up_is_reported_rather_than_absorbed() -> None:
+    """With only one slot and a slow fetcher, the client cannot offer the requested rate.
+    That has to surface: otherwise the run silently describes the load generator while
+    looking like a clean measurement of the server."""
+    import time as _time
+
+    def slow(user_id: str) -> dict[str, float]:
+        _time.sleep(0.02)
+        return _timed(total=20.0, server=21.0)
+
+    report = run_benchmark(
+        slow, [f"u{i}" for i in range(8)], concurrency=1, rate=200.0, max_inflight=1
+    )
+    assert not report.client_kept_up
+    assert report.schedule_lag_ms is not None and report.schedule_lag_ms > 5.0
+    assert "fell" in report.render() and "behind its own schedule" in report.render()
+    assert "measures the load generator" in report.render()
+
+
+def test_rejects_a_nonpositive_rate() -> None:
+    fetch, _ = _fetch([_timed(total=30.0, server=31.0)])
+    with pytest.raises(ValueError, match="rate"):
+        run_benchmark(fetch, ["u1"], concurrency=1, rate=0.0)
+
+
+def test_the_connection_model_is_stated_in_the_report() -> None:
+    """The two modes measure different things — a fresh TCP handshake per request is most
+    of `transport_ms` through an ALB — so a reader must not have to guess which ran."""
+    fetch, _ = _fetch([_timed(total=30.0, server=31.0)])
+    assert "new connection per request" in run_benchmark(fetch, ["u1"], concurrency=1).render()
+    fetch, _ = _fetch([_timed(total=30.0, server=31.0)])
+    reused = run_benchmark(fetch, ["u1"], concurrency=1, keep_alive=True).render()
+    assert "connection reuse" in reused

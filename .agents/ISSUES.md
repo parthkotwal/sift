@@ -151,6 +151,36 @@ and would need its own argument.
 
 ## Fixed — kept because the failure mode recurs
 
+### I37 — The latency contract was asserted on a clock that excluded queueing   [fixed → D34]
+
+`bench.py` gated on `total_ms`, which starts on the first line of
+`OnlineALSRetriever.recommend` — after routing, dependency resolution and waiting for an
+AnyIO threadpool slot, and before response serialization. The middleware already
+measured the wider region as `app;dur`, and the benchmark read the response body but not
+the header. Raised in review of the Fargate investigation.
+
+**Why it matters more than the size of the gap.** Measured against the live task the gap
+is 1.3ms p50 at concurrency 1 and 16.7ms p99 at concurrency 4 — not large. The defect is
+that the gap was *unbounded and unwatched*: a change could have met the contract by
+moving work from inside the timer to outside it, and the run would have gone greener.
+A budget that does not cover the whole request is not a budget on the request.
+
+**Fixed** by asserting `server_ms` (`app;dur`), reporting `total_ms` and
+`client_wall_ms` beside it, and naming the two differences (`framework_ms`,
+`transport_ms`) so a cost in neither stage nor network still lands on a line. `--check`
+refuses to gate when the endpoint reports no `app;dur` rather than falling back quietly.
+
+**Kept because the shape recurs: an instrument that measures a subset of what it
+promises reads exactly like one that measures all of it.** The five-stage breakdown was
+never wrong — `overhead_ms` even existed to catch unattributed time — but it was
+computed *inside* the region it was meant to bound, so framework cost could not appear
+in it by construction. The related trap is one level down and was fixed in the same
+change: the benchmark's closed-loop throughput is `concurrency / latency` by
+construction, and reading it as server capacity produced a confident, wrong conclusion
+about the Fargate task serializing (`15.2 req/s` was `4 threads / 260ms round trip`).
+**Before trusting a number, ask what it would read if the thing it claims to measure
+were absent.** Both of these read "fine".
+
 ### I35 — The API returned fewer results than requested, silently   [fixed → D33]
 
 `/recommend` advertises `k` up to 50 (`Query(ge=1, le=50)`) and returned 33–40 for

@@ -109,3 +109,17 @@ def test_a_short_response_says_so_in_the_body(client: TestClient) -> None:
     assert "3 of 10" in body["shortfall"]
     # It must name the reason, not just the arithmetic the client could do itself.
     assert "already reviewed" in body["shortfall"]
+
+
+def test_sub_stage_detail_is_absent_unless_asked_for(client: TestClient) -> None:
+    """The five-stage shape is the contract's; these numbers are diagnostic and free to
+    change, so they must not appear in every response and drift into a budget."""
+    assert client.get("/recommend", params={"user_id": "u1"}).json()["detail"] is None
+
+
+def test_sub_stage_detail_is_returned_when_requested(client: TestClient) -> None:
+    body = client.get("/recommend", params={"user_id": "u1", "detail": "true"}).json()
+    assert isinstance(body["detail"], dict)
+    # The fake retriever records no spans of its own; what matters here is that asking
+    # turns collection on and returns a mapping rather than null.
+    assert body["results"], "detail must not change what the endpoint returns"

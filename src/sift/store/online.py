@@ -44,6 +44,7 @@ from sift.offline.dim_business import DIM_BUSINESS
 from sift.offline.ingest import EVENTS_DIR, REVIEW_EVENT, events_glob
 from sift.store.materialize import HISTORICAL_DIR, state_path
 from sift.store.read import attach_store, read_current_features
+from sift.timing import span
 
 DEFAULT_REDIS_URL = "redis://localhost:6379/0"
 KEY_PREFIX = "sift:online"
@@ -697,7 +698,8 @@ class OnlineFeatureStore:
             keys.append(_key(generation, "user_category", user_id))
             keys.append(_key(generation, "user_als", user_id))
         try:
-            responses = self.client.mget(keys)
+            with span("feature.redis_mget"):
+                responses = self.client.mget(keys)
         except RedisError as exc:
             raise OnlineStoreUnavailable(f"cannot read Redis: {exc}") from exc
 
@@ -705,22 +707,28 @@ class OnlineFeatureStore:
         user_state: dict[str, dict[str, str]] = {}
         user_categories: dict[str, dict[str, str]] = {}
         user_als: dict[str, dict[str, str]] = {}
-        for user_id in users:
-            user_state[user_id] = _decode_record(responses[cursor])
-            user_categories[user_id] = _decode_record(responses[cursor + 1])
-            user_als[user_id] = _decode_record(responses[cursor + 2])
-            cursor += 3
+        with span("feature.decode_records"):
+            for user_id in users:
+                user_state[user_id] = _decode_record(responses[cursor])
+                user_categories[user_id] = _decode_record(responses[cursor + 1])
+                user_als[user_id] = _decode_record(responses[cursor + 2])
+                cursor += 3
 
         con = self._connection()
-        catalog = self._catalog_relations(generation)
-        self._load_relations(con, queries, manifest.as_of, user_state, user_categories, user_als)
-        return read_current_features(
-            con,
-            features,
-            item_state=catalog["item"],
-            dim=catalog["business"],
-            item_als_state=catalog["item_als"],
-        )
+        with span("feature.catalog_relations"):
+            catalog = self._catalog_relations(generation)
+        with span("feature.load_relations"):
+            self._load_relations(
+                con, queries, manifest.as_of, user_state, user_categories, user_als
+            )
+        with span("feature.duckdb_query"):
+            return read_current_features(
+                con,
+                features,
+                item_state=catalog["item"],
+                dim=catalog["business"],
+                item_als_state=catalog["item_als"],
+            )
 
     # The catalog-wide groups, and the SQL that projects each Redis record into a
     # relation. All three share one property that makes them cacheable: they are facts
