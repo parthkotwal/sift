@@ -117,18 +117,78 @@ requirement next to `uv sync`.
 
 ## Open
 
-Nothing outstanding. Resolved entries used to accumulate here marked `[fixed]`, which
-made the section unreadable as a to-do list — they now move to *Fixed — kept because the
-failure mode recurs* as soon as they close, so anything appearing under this heading is
-genuinely open work rather than a record of finished work.
+Resolved entries used to accumulate here marked `[fixed]`, which made the section
+unreadable as a to-do list — they now move to *Fixed — kept because the failure mode
+recurs* as soon as they close, so anything appearing under this heading is genuinely open
+work rather than a record of finished work.
 
-An empty section is the honest state, not a claim of perfection: the traps below still
-recur, and the things this project has deliberately not built (multi-metro, ANN, a
-two-tower that wins) are scope in `ARCHITECTURE.md`, not defects.
+### I36 — `CATEGORY_CAP` is an absolute count, so its meaning drifts with k   [open]
+
+The diversity cap is 2 per primary category regardless of how many results were asked
+for. At k=10 that is 20% of the list and forces at least 5 distinct categories; at k=50
+it is 4% and forces at least 25. The constraint the constant expresses therefore changes
+character across the range the API advertises, and nobody chose the k=50 behaviour — it
+fell out of a number picked for k=10.
+
+**Surfaced by D33, not caused by it.** Before that decision the cap could not bind at
+k=50: reranking 50 candidates to 50 meant it only ever reordered the list, never excluded
+anything, so its recorded `recall@50` was bit-identical to no-rerank. Now that the stage
+filters the whole ranked pool the cap is a real constraint at every k, and its measured
+cost at k=50 is `recall@50` 0.0880 → 0.0804.
+
+**Deliberately left open rather than folded into D33.** Whether a 50-item list should
+allow 2, 10, or `ceil(0.2 * k)` per category is a product judgment about what a diverse
+list looks like, not a correctness fix — and the serving default is k=10, where the
+current value is the one that was actually chosen and measured. Deciding it quietly while
+fixing something adjacent is how `RERANK_POOL` acquired its meaning in the first place.
+
+**What would settle it:** the cap's cost measured at several k against a share-based
+alternative, on the frozen holdout, with the k=10 numbers required to come back
+bit-identical — a share-based cap that changes k=10 has changed the thing D29 measured
+and would need its own argument.
 
 ---
 
 ## Fixed — kept because the failure mode recurs
+
+### I35 — The API returned fewer results than requested, silently   [fixed → D33]
+
+`/recommend` advertises `k` up to 50 (`Query(ge=1, le=50)`) and returned 33–40 for
+`k=50`, with nothing in the response saying it had come up short. Found against the live
+AWS deployment while verifying an unrelated fix; it reproduces locally and is a serving
+defect, not a deployment one.
+
+**Cause.** The ranker truncated to a constant `RERANK_POOL = 50` *before* rerank's hard
+filters ran. The closed-business and already-reviewed filters then removed candidates
+with nothing left to draw from, so at `k=50` the headroom was exactly zero by
+construction. Measured over 2,000 holdout users, slicing first was short for **100%** of
+them at k=50, **49.9%** at k=40, 1.3% at k=25, and never at k=10 — which is why every
+test and every eval, all written at k=10, passed while it was broken.
+
+**Fix.** Rerank filters the whole ranked pool. The retrieved pool holds a *minimum* of
+181 eligible candidates (median 360), so the ceiling never binds and "exactly k" is a
+promise the funnel can actually keep: short for 0% of users at every k the API allows.
+The response now carries `requested_k`, `returned_k`, and a `shortfall` string that names
+the reason when the pool genuinely runs out. Closed and already-reviewed businesses are
+never restored to pad the list — that would defeat the only stage that can say no.
+
+**The same defect was in the offline harness**, which sliced to 50 and then asked for
+50, so the ledger's `recall@50` for the rerank rows was measured on lists of ~40. It also
+had a latent second-order version: `no_cap = RERANK_POOL + 1` disables the diversity cap
+by exceeding the pool size, so widening the pool without moving that line would have
+quietly turned "diversity off" back on and charged every other ablation row for the cap's
+cost as well as its own — I32 with the pool as the variable.
+
+**Why it is kept: a constant that silently caps a contract is invisible until someone
+asks for the top of the range.** `RERANK_POOL = 50` and `le=50` were set in different
+files for different reasons and were never compared. Nothing was wrong with either
+number alone; the defect only existed in their relationship, which no single file
+reviewed. The comment sitting on the truncating line even described this exact failure
+("the response would come back short exactly when the filters bite hardest") as the
+reason for the constant — it had diagnosed the bug and then implemented it, because at
+k=10 the argument was true and at k=50 the same line caused what it warned about. **A
+comment that argues for a bound is not a check that the bound is big enough.** The tests
+now assert the guarantee at the top of the range, where it is falsifiable.
 
 ### I6 — Tie-breaking in the ranker is arbitrary   [fixed → D32]
 

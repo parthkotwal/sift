@@ -34,7 +34,7 @@ from sift.ranking.online import (
 )
 from sift.ranking.rank import SERVING_POOL
 from sift.ranking.train import ALS_RANKER_MODEL, to_float
-from sift.rerank.rerank import RERANK_POOL, Candidate, rerank
+from sift.rerank.rerank import Candidate, rerank
 from sift.retrieval.index import ExactItemIndex
 from sift.store.online import LOOKUP_THREADS, FeatureQuery, OnlineFeatureStore
 
@@ -96,10 +96,11 @@ class OnlineALSRetriever:
         vector = self.store.lookup_user_embedding(user_id, snapshot=snapshot)
         cold = vector is None
         if cold:
-            # RERANK_POOL, not k: the cold path is filtered too, so it needs slack to
-            # backfill from. A closed restaurant is no better a recommendation for a
-            # user we know nothing about.
-            head = self.popularity[: max(k, RERANK_POOL)]
+            # The same pool depth as the warm path, for the same reason: the cold path
+            # is filtered too, and a user we know nothing about should not be the one
+            # who gets a short list. A closed restaurant is no better a recommendation
+            # for them than for anyone else.
+            head = self.popularity[: max(k, SERVING_POOL)]
             candidate_ids = [entry.business_id for entry in head]
             fallback_scores = [float(entry.pre_t_reviews) for entry in head]
         else:
@@ -139,10 +140,15 @@ class OnlineALSRetriever:
             # `reranked_candidate_lists`, the offline path that produced D27's
             # numbers: serving must not order candidates differently from the run
             # that decided the ranker lands.
-            # RERANK_POOL, not k: rerank drops candidates, so truncating to k here
-            # would leave it nothing to backfill from and the response would come back
-            # short exactly when the filters bite hardest.
-            order = np.argsort(-ranker_scores, kind="stable")[:RERANK_POOL]
+            #
+            # Untruncated, so rerank filters the whole ranked pool. Slicing to a fixed
+            # 50 here is what made the response come back short "exactly when the
+            # filters bite hardest" — the failure the previous comment on this line
+            # predicted, and the constant beside it then guaranteed, silently, for
+            # every k above ~33 (D33). Rerank stops at k itself, and its inputs are
+            # per-generation dict lookups (D31), so handing it all 500 costs reads
+            # rather than another feature lookup or model run.
+            order = np.argsort(-ranker_scores, kind="stable")
             chosen = [(candidate_ids[int(i)], float(ranker_scores[int(i)])) for i in order]
             ranking_done = time.perf_counter()
             feature_ms = (feature_done - feature_started) * 1_000
@@ -199,6 +205,7 @@ class OnlineALSRetriever:
                 overhead_ms=overhead_ms,
                 total_ms=total_ms,
             ),
+            requested_k=k,
         )
 
 

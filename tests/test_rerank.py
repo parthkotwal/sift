@@ -164,3 +164,73 @@ def test_pre_t_reviewed_history_is_right_exclusive(tmp_path: Path) -> None:
     is_open, categories = load_catalog_attributes(dim)
     assert is_open == {"b1": True, "b2": False}
     assert categories["b1"] == ("Restaurants",)
+
+
+# --- the k contract -------------------------------------------------------------
+#
+# Every test below was written against a stage that returned 33-40 results for a legal
+# k=50 and said nothing about it. The cause was upstream — callers sliced the ranked
+# pool to a fixed 50 before filtering — but the guarantee belongs here, because this is
+# the stage that decides how many results exist.
+
+
+def test_exactly_k_when_the_pool_holds_k_eligible_candidates() -> None:
+    """The contract: k means k, not "up to k", whenever the pool can pay for it.
+
+    Filtering is heavy here — 30 closed and 20 already reviewed out of 100 — leaving
+    exactly 50 eligible for a k=50 request. The old fixed 50-candidate slice could not
+    have filled this even in principle.
+    """
+    candidates = _pool(100)
+    closed = {f"b{i}" for i in range(30)}
+    reviewed = {f"b{i}" for i in range(30, 50)}
+    candidates = [
+        _candidate(
+            c.business_id, c.score, is_open=c.business_id not in closed, categories=c.categories
+        )
+        for c in candidates
+    ]
+
+    kept = rerank(candidates, 50, reviewed)
+
+    assert len(kept) == 50
+    assert not {c.business_id for c in kept} & (closed | reviewed)
+
+
+def test_a_short_list_means_the_pool_ran_out_not_that_the_stage_gave_up() -> None:
+    """Coming up short is legal only when eligibility, not slicing, is the constraint.
+
+    The stage must not pad: restoring a closed or already-reviewed business to reach k
+    would defeat the only stage that can say no, which is worse than a short list.
+    """
+    candidates = _pool(60)
+    closed = {f"b{i}" for i in range(20)}
+    candidates = [
+        _candidate(
+            c.business_id, c.score, is_open=c.business_id not in closed, categories=c.categories
+        )
+        for c in candidates
+    ]
+    reviewed = {f"b{i}" for i in range(20, 30)}
+
+    kept = rerank(candidates, 50, reviewed)
+
+    assert len(kept) == 30, "60 candidates, 20 closed and 10 reviewed, leaves 30"
+    assert not {c.business_id for c in kept} & (closed | reviewed)
+
+
+def test_a_fully_ineligible_pool_returns_nothing_rather_than_anything() -> None:
+    """The degenerate end of the same rule. Returning a closed business here would be
+    the stage inventing a result, which is the one thing it exists to prevent."""
+    candidates = [_candidate(f"b{i}", float(10 - i), is_open=False) for i in range(10)]
+    assert rerank(candidates, 10) == []
+    assert rerank(_pool(5), 5, {f"b{i}" for i in range(5)}) == []
+
+
+def test_diversity_still_never_shortens_the_list_at_large_k() -> None:
+    """The docstring's rule — a monotonous 10 beats a silent 7 — has to hold at the top
+    of the k range too, where the cap defers far more than it admits."""
+    candidates = _pool(60, category_of=dict.fromkeys(range(60), "Pizza"))
+    kept = rerank(candidates, 50, category_cap=2)
+    assert len(kept) == 50
+    assert len({c.business_id for c in kept}) == 50, "backfill must not duplicate"

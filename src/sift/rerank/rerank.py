@@ -1,4 +1,4 @@
-"""Build step 6: hard filters and a diversity pass, 50 -> 10.
+"""Build step 6: hard filters and a diversity pass, over the whole ranked pool.
 
 The last stage, and the only one whose inputs are *deliberately* absent from
 training. `is_open` is the cleanest example the project has of a signal that is
@@ -34,6 +34,23 @@ final list may share a primary category. It never shortens the list — capped
 candidates are deferred, not discarded, and backfill in score order if the list would
 otherwise come up short. A diversity pass that silently returns 7 results instead of
 10 is a worse failure than a monotonous 10.
+
+**The stage sees every ranked candidate, not a fixed slice of them.** It used to
+receive the ranker's top 50, which made the same failure the diversity rule above
+forbids unavoidable for the hard filters: at k=50 the slice left zero headroom, so a
+request the API advertises as legal came back with 33–40 results and said nothing.
+Measured over 2,000 holdout users, slicing to 50 first was short for 100% of them at
+k=50 and 49.9% at k=40. Filtering the whole ranked pool instead is short for none, at
+any k the API allows — the retrieved pool holds a *minimum* of 181 eligible candidates
+(median 360), so the ceiling never binds. The slice was never buying anything either:
+the stage's inputs are one Redis key plus per-generation dict lookups (D31), so
+widening 50 -> 500 costs dictionary reads, not another feature lookup or model run.
+
+The guarantee this stage now makes, and the tests pin: **exactly k results whenever k
+eligible candidates exist among those it was given.** Coming up short is possible only
+when the pool genuinely runs out, and callers are expected to report that rather than
+pad the list — restoring a closed or already-reviewed business to fill space would
+defeat the only stage that can say no.
 """
 
 from __future__ import annotations
@@ -41,7 +58,6 @@ from __future__ import annotations
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 
-RERANK_POOL = 50  # the ranker cuts 500 -> 50; this stage cuts 50 -> k
 CATEGORY_CAP = 2  # at most this many of the final list share a primary category
 
 
